@@ -39,6 +39,8 @@
 
 #include "lld/Common/ErrorHandler.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/Support/LEB128.h"
 #include <optional>
@@ -301,12 +303,13 @@ public:
              const TrieEntryCallback &callback)
       : fileName(fileName), start(buf), end(start + size), callback(callback) {}
 
-  void parse(const uint8_t *buf, const Twine &cumulativeString,
+  void parse(const uint8_t *buf, SmallString<0> &cumulativeString,
              DenseSet<size_t> &visited);
 
   void parse() {
     DenseSet<size_t> visited;
-    parse(start, "", visited);
+    SmallString<0> cumulativeString;
+    parse(start, cumulativeString, visited);
   }
 
   const std::string fileName;
@@ -317,7 +320,7 @@ public:
 
 } // namespace
 
-void TrieParser::parse(const uint8_t *buf, const Twine &cumulativeString,
+void TrieParser::parse(const uint8_t *buf, SmallString<0> &cumulativeString,
                        DenseSet<size_t> &visited) {
   if (buf >= end)
     fatal(fileName + ": export trie node offset points outside export section");
@@ -344,7 +347,11 @@ void TrieParser::parse(const uint8_t *buf, const Twine &cumulativeString,
     buf += ulebSize;
     if (visited.find(offset) != visited.end())
       fatal(fileName + ": export trie child node infinite loop");
-    parse(start + offset, cumulativeString + substring, visited);
+    size_t oldSize = cumulativeString.size();
+    cumulativeString += substring;
+    scope_exit restorePrefix(
+        [&] { cumulativeString.resize_for_overwrite(oldSize); });
+    parse(start + offset, cumulativeString, visited);
   }
 
   visited.erase(currentOffset);

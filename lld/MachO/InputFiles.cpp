@@ -1913,7 +1913,7 @@ void DylibFile::parseExportedSymbols(uint32_t offset, uint32_t size) {
   std::vector<TrieEntry> entries;
   // Find all the $ld$* symbols to process first.
   parseTrie(toString(this), buf + offset, size,
-            [&](const Twine &name, uint64_t flags) {
+            [&](StringRef name, uint64_t flags) {
               StringRef savedName = saver().save(name);
               if (handleLDSymbol(savedName))
                 return;

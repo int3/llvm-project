@@ -11,6 +11,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringRef.h"
 
 #include <vector>
 
@@ -39,7 +40,7 @@ private:
 };
 
 using TrieEntryCallback =
-    llvm::function_ref<void(const llvm::Twine & /*name*/, uint64_t /*flags*/)>;
+    llvm::function_ref<void(llvm::StringRef /*name*/, uint64_t /*flags*/)>;
 
 void parseTrie(const std::string &fileName, const uint8_t *buf, size_t size,
                const TrieEntryCallback &);

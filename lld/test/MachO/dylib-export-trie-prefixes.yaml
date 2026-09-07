@@ -1,0 +1,175 @@
+# REQUIRES: x86
+# RUN: rm -rf %t; split-file %s %t
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-macos %t/test.s -o %t/test.o
+# RUN: yaml2obj %t/dylib.yaml -o %t/libtrie.dylib
+# RUN: %lld -platform_version macos 12.0 12.0 -no_fixup_chains -lSystem %t/test.o %t/libtrie.dylib -o %t/test
+# RUN: llvm-objdump --macho --lazy-bind %t/test | FileCheck %s --check-prefix=BINDS
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-macos %t/hidden.s -o %t/hidden.o
+# RUN: not %lld -platform_version macos 12.0 12.0 -no_fixup_chains -lSystem %t/hidden.o %t/libtrie.dylib -o %t/hidden 2>&1 | FileCheck %s --check-prefix=HIDDEN
+
+## The root has a terminal prefix, sibling edges, a long edge, and two edges
+## with the same child offset. The latter is a valid shared child rather than
+## a cycle because it is no longer in the active path when the second edge is
+## visited.
+# BINDS-DAG: _prefix{{$}}
+# BINDS-DAG: _prefix_child{{$}}
+# BINDS-DAG: _prefix_sibling{{$}}
+# BINDS-DAG: _shared_one{{$}}
+# BINDS-DAG: _shared_two{{$}}
+# BINDS-DAG: _aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa{{$}}
+# HIDDEN: error: undefined symbol: _hidden
+
+#--- test.s
+.globl _main
+_main:
+  callq _prefix
+  callq _prefix_child
+  callq _prefix_sibling
+  callq _shared_one
+  callq _shared_two
+  callq _aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  retq
+
+#--- hidden.s
+.globl _main
+_main:
+  callq _hidden
+  retq
+
+#--- dylib.yaml
+--- !mach-o
+FileHeader:
+  magic:           0xFEEDFACF
+  cputype:         0x01000007
+  cpusubtype:      0x00000003
+  filetype:        0x00000006
+  ncmds:           4
+  sizeofcmds:      312
+  flags:           0x00100085
+  reserved:        0x00000000
+LoadCommands:
+  - cmd:             LC_SEGMENT_64
+    cmdsize:         152
+    segname:         __TEXT
+    vmaddr:          0
+    vmsize:          16384
+    fileoff:         0
+    filesize:        16384
+    maxprot:         5
+    initprot:        5
+    nsects:          1
+    flags:           0
+    Sections:
+      - sectname:        __text
+        segname:         __TEXT
+        addr:            0x0000000000000000
+        size:            0
+        offset:          0x00004000
+        align:           0
+        reloff:          0x00000000
+        nreloc:          0
+        flags:           0x80000400
+        reserved1:       0x00000000
+        reserved2:       0x00000000
+        reserved3:       0x00000000
+        content:         ''
+  - cmd:             LC_SEGMENT_64
+    cmdsize:         72
+    segname:         __LINKEDIT
+    vmaddr:          16384
+    vmsize:          16384
+    fileoff:         16384
+    filesize:         1024
+    maxprot:         1
+    initprot:         1
+    nsects:          0
+    flags:           0
+  - cmd:             LC_ID_DYLIB
+    cmdsize:         40
+    dylib:
+      name:            24
+      timestamp:       1
+      current_version: 0
+      compatibility_version: 0
+    Content:         libtrie.dylib
+    ZeroPadBytes:    2
+  - cmd:             LC_DYLD_INFO_ONLY
+    cmdsize:         48
+    rebase_off:      0
+    rebase_size:     0
+    bind_off:        0
+    bind_size:       0
+    weak_bind_off:   0
+    weak_bind_size:  0
+    lazy_bind_off:   0
+    lazy_bind_size:  0
+    export_off:      16384
+    export_size:     184
+LinkEditData:
+  ExportTrie:
+    TerminalSize:    0
+    NodeOffset:      0
+    Name:            ''
+    Flags:           0x0
+    Address:         0x0
+    Other:           0x0
+    ImportName:      ''
+    Children:
+      - TerminalSize:    2
+        NodeOffset:      132
+        Name:            _prefix
+        Flags:           0x0
+        Address:         0x0
+        Other:           0x0
+        ImportName:      ''
+        Children:
+          - TerminalSize:    2
+            NodeOffset:      156
+            Name:            _child
+            Flags:           0x0
+            Address:         0x0
+            Other:           0x0
+            ImportName:      ''
+          - TerminalSize:    2
+            NodeOffset:      160
+            Name:            _sibling
+            Flags:           0x0
+            Address:         0x0
+            Other:           0x0
+            ImportName:      ''
+      - TerminalSize:    2
+        NodeOffset:      164
+        Name:            _shared_one
+        Flags:           0x0
+        Address:         0x0
+        Other:           0x0
+        ImportName:      ''
+      - TerminalSize:    2
+        NodeOffset:      164
+        Name:            _shared_two
+        Flags:           0x0
+        Address:         0x0
+        Other:           0x0
+        ImportName:      ''
+      - TerminalSize:    2
+        NodeOffset:      172
+        Name:            _aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        Flags:           0x0
+        Address:         0x0
+        Other:           0x0
+        ImportName:      ''
+      - TerminalSize:    2
+        NodeOffset:      176
+        Name:            _hidden
+        Flags:           0x0
+        Address:         0x0
+        Other:           0x0
+        ImportName:      ''
+      - TerminalSize:    2
+        NodeOffset:      180
+        Name:            '$ld$hide$_hidden'
+        Flags:           0x0
+        Address:         0x0
+        Other:           0x0
+        ImportName:      ''
+...
