@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Support/YAMLParser.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -34,6 +35,18 @@ static void ExpectParseError(StringRef Message, StringRef Input) {
   SM.setDiagHandler(SuppressDiagnosticsOutput);
   EXPECT_FALSE(Stream.validate()) << Message << ": " << Input;
   EXPECT_TRUE(Stream.failed()) << Message << ": " << Input;
+}
+
+static void ExpectParseErrorWithDiagnostic(StringRef Message, StringRef Input,
+                                           StringRef ExpectedDiagnostic) {
+  SourceMgr SM;
+  SMDiagnostic Diagnostic;
+  SM.setDiagHandler(CollectDiagnosticsOutput, &Diagnostic);
+  yaml::Stream Stream(Input, SM);
+  EXPECT_FALSE(Stream.validate()) << Message << ": " << Input;
+  EXPECT_TRUE(Stream.failed()) << Message << ": " << Input;
+  EXPECT_EQ(ExpectedDiagnostic, Diagnostic.getMessage())
+      << Message << ": " << Input;
 }
 
 // Checks that the given input can be parsed without error.
@@ -175,6 +188,156 @@ TEST(YAMLParser, ParsesPlainScalars) {
   // accepted by any other implementation I can find.
   ExpectParseSuccess("Multi-line plain scalar in block key", "a\nb: c");
   ExpectParseSuccess("Multi-line plain scalar in flow key", "{\na\nb: c\n}");
+}
+
+TEST(YAMLParser, PlainSafeNonBlankFlowIndicators) {
+  // This flow sequence reaches comma, [, ], {, and } while retaining the
+  // scalar values on both sides of those delimiters.
+  SourceMgr SM;
+  yaml::Stream Stream("[ plain, [ next ], { key: value } ]", SM);
+  yaml::Document &Doc = *Stream.begin();
+  auto *Outer = dyn_cast<yaml::SequenceNode>(Doc.getRoot());
+  ASSERT_NE(Outer, nullptr);
+  auto OuterIt = Outer->begin();
+  ASSERT_NE(OuterIt, Outer->end());
+  auto *Plain = dyn_cast<yaml::ScalarNode>(static_cast<yaml::Node *>(OuterIt));
+  ASSERT_NE(Plain, nullptr);
+  SmallVector<char> Storage;
+  EXPECT_EQ("plain", Plain->getValue(Storage));
+  ++OuterIt;
+  ASSERT_NE(OuterIt, Outer->end());
+  auto *NestedSequence =
+      dyn_cast<yaml::SequenceNode>(static_cast<yaml::Node *>(OuterIt));
+  ASSERT_NE(NestedSequence, nullptr);
+  auto NestedIt = NestedSequence->begin();
+  ASSERT_NE(NestedIt, NestedSequence->end());
+  auto *Next =
+      dyn_cast<yaml::ScalarNode>(static_cast<yaml::Node *>(NestedIt));
+  ASSERT_NE(Next, nullptr);
+  EXPECT_EQ("next", Next->getValue(Storage));
+  ++NestedIt;
+  EXPECT_EQ(NestedIt, NestedSequence->end());
+  ++OuterIt;
+  ASSERT_NE(OuterIt, Outer->end());
+  auto *NestedMapping =
+      dyn_cast<yaml::MappingNode>(static_cast<yaml::Node *>(OuterIt));
+  ASSERT_NE(NestedMapping, nullptr);
+  auto MappingIt = NestedMapping->begin();
+  ASSERT_NE(MappingIt, NestedMapping->end());
+  auto *Pair = static_cast<yaml::KeyValueNode *>(MappingIt);
+  auto *Key = dyn_cast<yaml::ScalarNode>(Pair->getKey());
+  auto *Value = dyn_cast<yaml::ScalarNode>(Pair->getValue());
+  ASSERT_NE(Key, nullptr);
+  ASSERT_NE(Value, nullptr);
+  EXPECT_EQ("key", Key->getValue(Storage));
+  EXPECT_EQ("value", Value->getValue(Storage));
+  ++MappingIt;
+  EXPECT_EQ(MappingIt, NestedMapping->end());
+  ++OuterIt;
+  EXPECT_EQ(OuterIt, Outer->end());
+  Doc.skip();
+  EXPECT_FALSE(Stream.failed());
+
+  // Outside flow, the same punctuation remains a plain scalar value.
+  SourceMgr BlockSM;
+  yaml::Stream BlockStream("plain,[]{}", BlockSM);
+  yaml::Document &BlockDoc = *BlockStream.begin();
+  auto *Block = dyn_cast<yaml::ScalarNode>(BlockDoc.getRoot());
+  ASSERT_NE(Block, nullptr);
+  EXPECT_EQ("plain,[]{}", Block->getValue(Storage));
+  BlockDoc.skip();
+  EXPECT_FALSE(BlockStream.failed());
+
+  // UTF-8 remains a plain scalar in flow context.
+  SourceMgr UTF8SM;
+  yaml::Stream UTF8Stream("[ caf\xC3\xA9 ]", UTF8SM);
+  yaml::Document &UTF8Doc = *UTF8Stream.begin();
+  auto *UTF8Sequence = dyn_cast<yaml::SequenceNode>(UTF8Doc.getRoot());
+  ASSERT_NE(UTF8Sequence, nullptr);
+  auto UTF8It = UTF8Sequence->begin();
+  ASSERT_NE(UTF8It, UTF8Sequence->end());
+  auto *UTF8Scalar =
+      dyn_cast<yaml::ScalarNode>(static_cast<yaml::Node *>(UTF8It));
+  ASSERT_NE(UTF8Scalar, nullptr);
+  EXPECT_EQ("caf\xC3\xA9", UTF8Scalar->getValue(Storage));
+  ++UTF8It;
+  EXPECT_EQ(UTF8It, UTF8Sequence->end());
+  UTF8Doc.skip();
+  EXPECT_FALSE(UTF8Stream.failed());
+
+  // Colon look-ahead remains distinct: a colon directly before comma, [, {,
+  // or } creates a mapping delimiter, while a following plain byte remains in
+  // the scalar value.
+  SourceMgr ColonSM;
+  yaml::Stream ColonStream(
+      "{comma:,sequence:[],mapping:{},scalar: value:part,end:}", ColonSM);
+  yaml::Document &ColonDoc = *ColonStream.begin();
+  auto *ColonMapping = dyn_cast<yaml::MappingNode>(ColonDoc.getRoot());
+  ASSERT_NE(ColonMapping, nullptr);
+  auto ColonIt = ColonMapping->begin();
+  auto CheckNull = [&](StringRef ExpectedKey) {
+    ASSERT_NE(ColonIt, ColonMapping->end());
+    auto *Entry = static_cast<yaml::KeyValueNode *>(ColonIt);
+    auto *EntryKey = dyn_cast<yaml::ScalarNode>(Entry->getKey());
+    ASSERT_NE(EntryKey, nullptr);
+    EXPECT_EQ(ExpectedKey, EntryKey->getValue(Storage));
+    EXPECT_TRUE(isa<yaml::NullNode>(Entry->getValue()));
+    ++ColonIt;
+  };
+  CheckNull("comma");
+  ASSERT_NE(ColonIt, ColonMapping->end());
+  auto *SequenceEntry = static_cast<yaml::KeyValueNode *>(ColonIt);
+  auto *SequenceKey = dyn_cast<yaml::ScalarNode>(SequenceEntry->getKey());
+  ASSERT_NE(SequenceKey, nullptr);
+  EXPECT_EQ("sequence", SequenceKey->getValue(Storage));
+  auto *EmptySequence = dyn_cast<yaml::SequenceNode>(SequenceEntry->getValue());
+  ASSERT_NE(EmptySequence, nullptr);
+  EXPECT_EQ(EmptySequence->begin(), EmptySequence->end());
+  ++ColonIt;
+  ASSERT_NE(ColonIt, ColonMapping->end());
+  auto *MappingEntry = static_cast<yaml::KeyValueNode *>(ColonIt);
+  auto *MappingKey = dyn_cast<yaml::ScalarNode>(MappingEntry->getKey());
+  ASSERT_NE(MappingKey, nullptr);
+  EXPECT_EQ("mapping", MappingKey->getValue(Storage));
+  auto *EmptyMapping = dyn_cast<yaml::MappingNode>(MappingEntry->getValue());
+  ASSERT_NE(EmptyMapping, nullptr);
+  EXPECT_EQ(EmptyMapping->begin(), EmptyMapping->end());
+  ++ColonIt;
+  ASSERT_NE(ColonIt, ColonMapping->end());
+  auto *ScalarEntry = static_cast<yaml::KeyValueNode *>(ColonIt);
+  auto *ScalarKey = dyn_cast<yaml::ScalarNode>(ScalarEntry->getKey());
+  auto *ScalarValue = dyn_cast<yaml::ScalarNode>(ScalarEntry->getValue());
+  ASSERT_NE(ScalarKey, nullptr);
+  ASSERT_NE(ScalarValue, nullptr);
+  EXPECT_EQ("scalar", ScalarKey->getValue(Storage));
+  EXPECT_EQ("value:part", ScalarValue->getValue(Storage));
+  ++ColonIt;
+  CheckNull("end");
+  EXPECT_EQ(ColonIt, ColonMapping->end());
+  ColonDoc.skip();
+  EXPECT_FALSE(ColonStream.failed());
+
+  SourceMgr BlockColonSM;
+  yaml::Stream BlockColonStream("key:", BlockColonSM);
+  yaml::Document &BlockColonDoc = *BlockColonStream.begin();
+  auto *BlockColonMapping =
+      dyn_cast<yaml::MappingNode>(BlockColonDoc.getRoot());
+  ASSERT_NE(BlockColonMapping, nullptr);
+  auto BlockColonIt = BlockColonMapping->begin();
+  ASSERT_NE(BlockColonIt, BlockColonMapping->end());
+  auto *BlockColonEntry = static_cast<yaml::KeyValueNode *>(BlockColonIt);
+  auto *BlockColonKey = dyn_cast<yaml::ScalarNode>(BlockColonEntry->getKey());
+  ASSERT_NE(BlockColonKey, nullptr);
+  EXPECT_EQ("key", BlockColonKey->getValue(Storage));
+  EXPECT_TRUE(isa<yaml::NullNode>(BlockColonEntry->getValue()));
+  ++BlockColonIt;
+  EXPECT_EQ(BlockColonIt, BlockColonMapping->end());
+  BlockColonDoc.skip();
+  EXPECT_FALSE(BlockColonStream.failed());
+
+  ExpectParseErrorWithDiagnostic("Malformed nested flow sequence",
+                                 "[ plain[ next ]",
+                                 "Expected , between entries!");
 }
 
 TEST(YAMLParser, ParsesBlockLiteralScalars) {

@@ -1060,9 +1060,18 @@ bool Scanner::isBlankOrBreak(StringRef::iterator Position) {
 bool Scanner::isPlainSafeNonBlank(StringRef::iterator Position) {
   if (Position == End || isBlankOrBreak(Position))
     return false;
-  if (FlowLevel &&
-      StringRef(Position, 1).find_first_of(",[]{}") != StringRef::npos)
-    return false;
+  if (FlowLevel) {
+    switch (*Position) {
+    case ',':
+    case '[':
+    case ']':
+    case '{':
+    case '}':
+      return false;
+    default:
+      break;
+    }
+  }
   return true;
 }
 
