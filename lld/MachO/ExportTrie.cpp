@@ -226,6 +226,25 @@ tailcall:
   if (vec.empty())
     return;
 
+  // Once a subtree contains one symbol, the remaining suffix is one edge and
+  // a terminal node. Avoid partitioning it one byte at a time. charAt() uses
+  // -1 as its end sentinel, which aliases a signed 0xff character; retain the
+  // existing path for that unusual spelling.
+  if (vec.size() == 1) {
+    const Symbol *sym = vec.front();
+    StringRef name = sym->getName();
+    StringRef suffix = name.drop_front(lastPos);
+    if (!suffix.contains(static_cast<char>(0xff))) {
+      if (!suffix.empty()) {
+        TrieNode *newNode = makeNode();
+        node->edges.emplace_back(suffix, newNode);
+        node = newNode;
+      }
+      node->info = ExportInfo(*sym, imageBase);
+      return;
+    }
+  }
+
   // Partition items so that items in [0, i) are less than the pivot,
   // [i, j) are the same as the pivot, and [j, vec.size()) are greater than
   // the pivot.
