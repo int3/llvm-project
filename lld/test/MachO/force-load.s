@@ -73,8 +73,8 @@
 _foo:
 _bar:
 
-## Exercise object-local C-string splitting and relocations in the eager
-## preparation path. Publication remains ordered by the archive member list.
+## Exercise object-local C-string splitting in the eager preparation path and
+## ordinary relocations after ordered publication.
 .section __TEXT,__cstring,cstring_literals
 L_archive_string:
   .asciz "archive string"

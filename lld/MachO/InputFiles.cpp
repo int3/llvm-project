@@ -326,19 +326,9 @@ static std::optional<size_t> getRecordSize(StringRef segname, StringRef name) {
 
 class ObjFile::Prepared {
 public:
-  struct Relocation {
-    relocation_info info;
-    std::optional<int64_t> embeddedAddend;
-  };
-
   struct Section {
     std::vector<StringPiece> literalPieces;
     bool literalPiecesPrepared = false;
-    // Fixed-size records can be split without creating InputSections. The
-    // publication thread creates those sections in input order below.
-    std::vector<std::pair<uint64_t, uint64_t>> recordSubsections;
-    bool recordSubsectionsPrepared = false;
-    std::vector<Relocation> relocations;
   };
 
   std::vector<Section> sections;
@@ -422,36 +412,7 @@ prepareObjectForPublication(MemoryBufferRef mb) {
           offset += size;
         }
         section.literalPiecesPrepared = complete;
-      } else if (auto recordSize = getRecordSize(segname, name)) {
-        section.recordSubsectionsPrepared = true;
-        for (uint64_t offset = 0; offset < data.size(); offset += *recordSize)
-          section.recordSubsections.emplace_back(
-              offset, std::min<uint64_t>(data.size() - offset, *recordSize));
       }
-    }
-
-    uint64_t relocationBytes = uint64_t(sec.nreloc) * sizeof(relocation_info);
-    if (!sec.nreloc || !inBuffer(sec.reloff, relocationBytes))
-      continue;
-    ArrayRef<relocation_info> relocs(
-        reinterpret_cast<const relocation_info *>(buf + sec.reloff),
-        sec.nreloc);
-    section.relocations.reserve(relocs.size());
-    for (const relocation_info &reloc : relocs) {
-      ObjFile::Prepared::Relocation &preparedReloc =
-          section.relocations.emplace_back();
-      preparedReloc.info = reloc;
-      // Embedded addends only read object-local instruction bytes. Retain the
-      // original serial validation/diagnostics for malformed relocations.
-      if (reloc.r_type < target->relocAttrs.size() &&
-          !(reloc.r_address & R_SCATTERED) && reloc.r_address >= 0 &&
-          (reloc.r_length == 2 || reloc.r_length == 3) &&
-          sec.offset <= mb.getBufferSize() &&
-          uint64_t(reloc.r_address) <= mb.getBufferSize() - sec.offset &&
-          (uint64_t{1} << reloc.r_length) <=
-              mb.getBufferSize() - sec.offset - uint64_t(reloc.r_address))
-        preparedReloc.embeddedAddend =
-            target->getEmbeddedAddend(mb, sec.offset, reloc);
     }
   }
   return prepared;
@@ -484,13 +445,13 @@ static Error parseCallGraph(ArrayRef<uint8_t> data,
 // Split each section into subsections.
 template <class SectionHeader>
 void ObjFile::parseSections(ArrayRef<SectionHeader> sectionHeaders,
-                            const Prepared *prepared) {
+                            Prepared *prepared) {
   sections.reserve(sectionHeaders.size());
   auto *buf = reinterpret_cast<const uint8_t *>(mb.getBufferStart());
 
   for (size_t index = 0; index != sectionHeaders.size(); ++index) {
     const SectionHeader &sec = sectionHeaders[index];
-    const Prepared::Section *preparedSection =
+    Prepared::Section *preparedSection =
         prepared && index < prepared->sections.size()
             ? &prepared->sections[index]
             : nullptr;
@@ -514,21 +475,13 @@ void ObjFile::parseSections(ArrayRef<SectionHeader> sectionHeaders,
       if (data.empty())
         return;
       Subsections &subsections = section.subsections;
-      if (preparedSection && preparedSection->recordSubsectionsPrepared)
-        subsections.reserve(preparedSection->recordSubsections.size());
-      else
-        subsections.reserve(data.size() / recordSize);
-      auto add = [&](uint64_t off, uint64_t size) {
+      subsections.reserve(data.size() / recordSize);
+      for (uint64_t off = 0; off < data.size(); off += recordSize) {
         auto *isec = make<ConcatInputSection>(
-            section, data.slice(off, size), align);
+            section,
+            data.slice(off, std::min<uint64_t>(data.size() - off, recordSize)),
+            align);
         subsections.push_back({off, isec});
-      };
-      if (preparedSection && preparedSection->recordSubsectionsPrepared) {
-        for (auto [off, size] : preparedSection->recordSubsections)
-          add(off, size);
-      } else {
-        for (uint64_t off = 0; off < data.size(); off += recordSize)
-          add(off, std::min<uint64_t>(data.size() - off, recordSize));
       }
       section.doneSplitting = true;
     };
@@ -543,7 +496,7 @@ void ObjFile::parseSections(ArrayRef<SectionHeader> sectionHeaders,
           make<CStringInputSection>(section, data, align, dedupLiterals);
       auto *cstring = cast<CStringInputSection>(isec);
       if (preparedSection && preparedSection->literalPiecesPrepared)
-        cstring->setPreparedPieces(preparedSection->literalPieces);
+        cstring->setPreparedPieces(std::move(preparedSection->literalPieces));
       else
         cstring->splitIntoPieces();
       section.subsections.push_back({0, isec});
@@ -699,31 +652,14 @@ static bool validateRelocationInfo(InputFile *file, const SectionHeader &sec,
 
 template <class SectionHeader>
 void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
-                               const SectionHeader &sec, Section &section,
-                               size_t sectionIndex, const Prepared *prepared) {
+                               const SectionHeader &sec, Section &section) {
   auto *buf = reinterpret_cast<const uint8_t *>(mb.getBufferStart());
-  ArrayRef<relocation_info> rawRelocs(
+  ArrayRef<relocation_info> relocs(
       reinterpret_cast<const relocation_info *>(buf + sec.reloff), sec.nreloc);
-  const std::vector<Prepared::Relocation> *preparedRelocs = nullptr;
-  if (prepared && sectionIndex < prepared->sections.size() &&
-      prepared->sections[sectionIndex].relocations.size() == sec.nreloc)
-    preparedRelocs = &prepared->sections[sectionIndex].relocations;
-  size_t relocCount = preparedRelocs ? preparedRelocs->size() : rawRelocs.size();
-  auto relocationAt = [&](size_t index) -> relocation_info {
-    return preparedRelocs ? (*preparedRelocs)[index].info : rawRelocs[index];
-  };
-  auto embeddedAddendAt = [&](size_t index, relocation_info reloc) {
-    if (preparedRelocs) {
-      if (std::optional<int64_t> addend =
-              (*preparedRelocs)[index].embeddedAddend)
-        return *addend;
-    }
-    return target->getEmbeddedAddend(mb, sec.offset, reloc);
-  };
 
   Subsections &subsections = section.subsections;
   auto subsecIt = subsections.rbegin();
-  for (size_t i = 0; i < relocCount; i++) {
+  for (size_t i = 0; i < relocs.size(); i++) {
     // Paired relocations serve as Mach-O's method for attaching a
     // supplemental datum to a primary relocation record. ELF does not
     // need them because the *_RELOC_RELA records contain the extra
@@ -748,21 +684,21 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
     // insert them. Storing addends in the instruction stream is possible, but
     // inconvenient and more costly at link time.
 
-    relocation_info relInfo = relocationAt(i);
+    relocation_info relInfo = relocs[i];
     bool isSubtrahend =
         target->hasAttr(relInfo.r_type, RelocAttrBits::SUBTRAHEND);
     int64_t pairedAddend = 0;
     if (target->hasAttr(relInfo.r_type, RelocAttrBits::ADDEND)) {
       pairedAddend = SignExtend64<24>(relInfo.r_symbolnum);
-      relInfo = relocationAt(++i);
+      relInfo = relocs[++i];
     }
-    assert(i < relocCount);
+    assert(i < relocs.size());
     if (!validateRelocationInfo(this, sec, relInfo))
       continue;
     if (relInfo.r_address & R_SCATTERED)
       fatal("TODO: Scattered relocations not supported");
 
-    int64_t embeddedAddend = embeddedAddendAt(i, relInfo);
+    int64_t embeddedAddend = target->getEmbeddedAddend(mb, sec.offset, relInfo);
     assert(!(embeddedAddend && pairedAddend));
     int64_t totalAddend = pairedAddend + embeddedAddend;
     Relocation r;
@@ -818,7 +754,7 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
     subsec->relocs.push_back(r);
 
     if (isSubtrahend) {
-      relocation_info minuendInfo = relocationAt(++i);
+      relocation_info minuendInfo = relocs[++i];
       // SUBTRACTOR relocations should always be followed by an UNSIGNED one
       // attached to the same address.
       assert(target->hasAttr(minuendInfo.r_type, RelocAttrBits::UNSIGNED) &&
@@ -1223,7 +1159,7 @@ ObjFile::ObjFile(MemoryBufferRef mb, uint32_t modTime, StringRef archiveName,
   }
 }
 
-template <class LP> void ObjFile::parse(const Prepared *prepared) {
+template <class LP> void ObjFile::parse(Prepared *prepared) {
   using Header = typename LP::mach_header;
   using SegmentCommand = typename LP::segment_command;
   using SectionHeader = typename LP::section;
@@ -1265,12 +1201,13 @@ template <class LP> void ObjFile::parse(const Prepared *prepared) {
     parseSymbols<LP>(sectionHeaders, nList, strtab, subsectionsViaSymbols);
   }
 
-  // The relocations may refer to the symbols, so we parse them after we have
-  // parsed all the symbols.
+  // Compact unwind and EH frame registration below consumes relocations while
+  // creating local unwind symbols. Parse those here after symbols publish.
   for (size_t i = 0, n = sections.size(); i < n; ++i)
-    if (!sections[i]->subsections.empty())
-      parseRelocations(sectionHeaders, sectionHeaders[i], *sections[i], i,
-                       prepared);
+    if (!sections[i]->subsections.empty() &&
+        (sections[i]->name == section_names::compactUnwind ||
+         sections[i]->name == section_names::ehFrame))
+      parseRelocations(sectionHeaders, sectionHeaders[i], *sections[i]);
 
   parseDebugInfo();
 
@@ -1291,6 +1228,35 @@ template <class LP> void ObjFile::parse(const Prepared *prepared) {
 }
 
 template <class LP> void ObjFile::parse() { parse<LP>(nullptr); }
+
+void ObjFile::parseRegularRelocations() {
+  if (lazy || !compatArch)
+    return;
+  if (target->wordSize == 8)
+    parseRegularRelocations<LP64>();
+  else
+    parseRegularRelocations<ILP32>();
+}
+
+template <class LP> void ObjFile::parseRegularRelocations() {
+  using Header = typename LP::mach_header;
+  using SegmentCommand = typename LP::segment_command;
+  using SectionHeader = typename LP::section;
+
+  auto *hdr = reinterpret_cast<const Header *>(mb.getBufferStart());
+  const load_command *cmd = findCommand(hdr, LP::segmentLCType);
+  if (!cmd)
+    return;
+  auto *segment = reinterpret_cast<const SegmentCommand *>(cmd);
+  ArrayRef<SectionHeader> sectionHeaders{
+      reinterpret_cast<const SectionHeader *>(segment + 1), segment->nsects};
+
+  for (size_t i = 0, n = sections.size(); i < n; ++i)
+    if (!sections[i]->subsections.empty() &&
+        sections[i]->name != section_names::compactUnwind &&
+        sections[i]->name != section_names::ehFrame)
+      parseRelocations(sectionHeaders, sectionHeaders[i], *sections[i]);
+}
 
 template <class LP> void ObjFile::parseLazy() {
   using Header = typename LP::mach_header;

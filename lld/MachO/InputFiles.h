@@ -116,6 +116,7 @@ public:
   virtual ~InputFile() = default;
   Kind kind() const { return fileKind; }
   StringRef getName() const { return name; }
+  bool isCompatible() const { return compatArch; }
   static void resetIdCount() { idCount = 0; }
 
   MemoryBufferRef mb;
@@ -171,6 +172,7 @@ public:
   // Collects object-local data that can be parsed before this object publishes
   // sections, symbols, or diagnostics to linker-global state.
   static std::unique_ptr<Prepared> prepare(MemoryBufferRef mb);
+  void parseRegularRelocations();
   ArrayRef<llvm::MachO::data_in_code_entry> getDataInCode() const;
   ArrayRef<uint8_t> getOptimizationHints() const;
   template <class LP> void parse();
@@ -197,10 +199,11 @@ public:
 
 private:
   llvm::once_flag initDwarf;
-  template <class LP> void parse(const Prepared *prepared);
+  template <class LP> void parse(Prepared *prepared);
+  template <class LP> void parseRegularRelocations();
   template <class LP> void parseLazy();
   template <class SectionHeader>
-  void parseSections(ArrayRef<SectionHeader>, const Prepared *prepared);
+  void parseSections(ArrayRef<SectionHeader>, Prepared *prepared);
   template <class LP>
   void parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
                     ArrayRef<typename LP::nlist> nList, const char *strtab,
@@ -209,8 +212,7 @@ private:
   Symbol *parseNonSectionSymbol(const NList &sym, const char *strtab);
   template <class SectionHeader>
   void parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
-                        const SectionHeader &, Section &, size_t sectionIndex,
-                        const Prepared *prepared);
+                        const SectionHeader &, Section &);
   void parseDebugInfo();
   void splitEhFrames(ArrayRef<uint8_t> dataArr, Section &ehFrameSection);
   void registerCompactUnwind(Section &compactUnwindSection);

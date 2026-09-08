@@ -2481,6 +2481,12 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
       inputFiles.insert(make<OpaqueFile>(MemoryBufferRef(), segName, sectName));
     }
 
+    parallelForEach(inputFiles.getArrayRef(), [](InputFile *file) {
+      if (auto *obj = dyn_cast<ObjFile>(file);
+          obj && !obj->lazy && obj->isCompatible())
+        obj->parseRegularRelocations();
+    });
+
     gatherInputSections();
 
     if (!config->codegenDataGeneratePath.empty())
