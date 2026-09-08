@@ -102,35 +102,35 @@ Lcomp_dir:
 
 .section __DWARF,__debug_abbrev,regular,debug
 Lsection_abbrev:
-  .byte 1                       ## Abbreviation Code
-  .byte 17                      ## DW_TAG_compile_unit
-  .byte 1                       ## DW_CHILDREN_yes
-  .byte 3                       ## DW_AT_name
-  .byte 14                      ## DW_FORM_strp
-  .byte 27                      ## DW_AT_comp_dir
-  .byte 14                      ## DW_FORM_strp
-  .byte 17                      ## DW_AT_low_pc
-  .byte 1                       ## DW_FORM_addr
-  .byte 18                      ## DW_AT_high_pc
-  .byte 6                       ## DW_FORM_data4
-  .byte 0                       ## EOM(1)
-  .byte 0                       ## EOM(2)
-  .byte 0                       ## EOM(3)
+  .byte 1                       // Abbreviation Code
+  .byte 17                      // DW_TAG_compile_unit
+  .byte 1                       // DW_CHILDREN_yes
+  .byte 3                       // DW_AT_name
+  .byte 14                      // DW_FORM_strp
+  .byte 27                      // DW_AT_comp_dir
+  .byte 14                      // DW_FORM_strp
+  .byte 17                      // DW_AT_low_pc
+  .byte 1                       // DW_FORM_addr
+  .byte 18                      // DW_AT_high_pc
+  .byte 6                       // DW_FORM_data4
+  .byte 0                       // EOM(1)
+  .byte 0                       // EOM(2)
+  .byte 0                       // EOM(3)
 
 .section __DWARF,__debug_info,regular,debug
 .set Lunit_length, Ldebug_info_end-Ldebug_info_start
   .long Lunit_length
 Ldebug_info_start:
-  .short 4                      ## DWARF version number
+  .short 4                      // DWARF version number
   .long Lsection_abbrev-Lsection_abbrev
-  .byte 8                       ## Address size
-  .byte 1                       ## Abbrev [1]
-  .long Lsource_name-Ldebug_str ## DW_AT_name
-  .long Lcomp_dir-Ldebug_str    ## DW_AT_comp_dir
-  .quad Lfunc_begin0            ## DW_AT_low_pc
+  .byte 8                       // Address size
+  .byte 1                       // Abbrev [1]
+  .long Lsource_name-Ldebug_str // DW_AT_name
+  .long Lcomp_dir-Ldebug_str    // DW_AT_comp_dir
+  .quad Lfunc_begin0            // DW_AT_low_pc
 .set Lhigh_pc, Lfunc_end0-Lfunc_begin0
-  .long Lhigh_pc                ## DW_AT_high_pc
-  .byte 0                       ## End of children
+  .long Lhigh_pc                // DW_AT_high_pc
+  .byte 0                       // End of children
 Ldebug_info_end:
 
 .subsections_via_symbols
