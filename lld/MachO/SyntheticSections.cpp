@@ -1138,10 +1138,28 @@ FunctionStartsSection::FunctionStartsSection()
 void FunctionStartsSection::finalizeContents() {
   raw_svector_ostream os{contents};
   std::vector<uint64_t> addrs;
+  // A resolved external symbol is present in every referring ObjFile. In
+  // alias-free links, only its original ObjFile should contribute it; this is
+  // intentionally not the canonical section owner, which may differ after
+  // LTO or ICF. Aliases retain the historical full traversal.
+  bool canSkipResolvedSymbols = config->aliasedSymbols.empty();
+  if (canSkipResolvedSymbols)
+    for (const InputFile *file : inputFiles)
+      if (const auto *objFile = dyn_cast<ObjFile>(file))
+        if (!objFile->aliases.empty()) {
+          canSkipResolvedSymbols = false;
+          break;
+        }
+
   for (const InputFile *file : inputFiles) {
     if (auto *objFile = dyn_cast<ObjFile>(file)) {
       for (const Symbol *sym : objFile->symbols) {
         if (const auto *defined = dyn_cast_or_null<Defined>(sym)) {
+          if (canSkipResolvedSymbols && defined->isExternal()) {
+            const ObjFile *owner = defined->getObjectFile();
+            if (owner && owner != objFile)
+              continue;
+          }
           if (!defined->isec() || !isCodeSection(defined->isec()) ||
               !defined->isLive())
             continue;

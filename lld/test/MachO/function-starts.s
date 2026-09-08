@@ -56,6 +56,23 @@
 # LOCAL:       [[#F2]]
 # LOCAL:       [[#F3]]
 
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/owner.s -o %t/owner.o
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/caller1.s -o %t/caller1.o
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/caller2.s -o %t/caller2.o
+# RUN: %lld -lSystem %t/owner.o %t/caller1.o %t/caller2.o -o %t/manycallers
+# RUN: llvm-objdump --syms %t/manycallers > %t/objdump
+# RUN: llvm-objdump --macho --function-starts %t/manycallers >> %t/objdump
+# RUN: FileCheck %s --check-prefix=MANYCALLERS < %t/objdump
+
+# MANYCALLERS-LABEL: SYMBOL TABLE:
+# MANYCALLERS-NEXT:  [[#%x,MAIN:]] g F __TEXT,__text _main
+# MANYCALLERS-NEXT:  [[#%x,OWNER:]] g F __TEXT,__text _owner
+# MANYCALLERS-NEXT:  [[#%x,CALLER2:]] g F __TEXT,__text _caller2
+# MANYCALLERS-LABEL: manycallers:
+# MANYCALLERS:       [[#OWNER]]
+# MANYCALLERS:       [[#MAIN]]
+# MANYCALLERS:       [[#CALLER2]]
+
 #--- basic.s
 .section  __TEXT,__text,regular,pure_instructions
 .globl  _f1
@@ -88,4 +105,25 @@ _foo:
 
 .globl _main
 _main:
+  retq
+
+
+#--- owner.s
+.section __TEXT,__text,regular,pure_instructions
+.globl _owner
+_owner:
+  retq
+
+#--- caller1.s
+.section __TEXT,__text,regular,pure_instructions
+.globl _main
+_main:
+  callq _owner
+  retq
+
+#--- caller2.s
+.section __TEXT,__text,regular,pure_instructions
+.globl _caller2
+_caller2:
+  callq _owner
   retq
