@@ -26,6 +26,14 @@
 #include "llvm/Support/SwapByteOrder.h"
 #include <string.h>
 
+#if LLVM_IS_X86 && (defined(__clang__) || defined(__GNUC__))
+#include <immintrin.h>
+#define LLVM_SHA256_HAS_SHA_NI 1
+#define LLVM_SHA256_TARGET_SHA_NI __attribute__((target("sha,sse2")))
+#else
+#define LLVM_SHA256_HAS_SHA_NI 0
+#endif
+
 namespace llvm {
 
 #define SHR(x, c) ((x) >> (c))
@@ -48,6 +56,73 @@ namespace llvm {
     M1 += SIGMA_2(M2) + M3 + SIGMA_3(M4);                                      \
   } while (0);
 
+#if LLVM_SHA256_HAS_SHA_NI
+namespace {
+
+// Buffer.L already holds host-order SHA words. Keep this helper private so
+// callers without SHA-NI continue to use the scalar implementation below.
+LLVM_SHA256_TARGET_SHA_NI static void hashBlockSHA(uint32_t *State,
+                                                   const uint32_t *Words) {
+  static constexpr uint32_t K[] = {
+      0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+      0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+      0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+      0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+      0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+      0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+      0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+      0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+      0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+      0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+      0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+  static_assert(sizeof(K) / sizeof(K[0]) == 64);
+
+  __m128i StateABCD = _mm_loadu_si128(reinterpret_cast<const __m128i *>(State));
+  __m128i StateEFGH =
+      _mm_loadu_si128(reinterpret_cast<const __m128i *>(State + 4));
+  StateABCD = _mm_shuffle_epi32(StateABCD, 0xb1);
+  StateEFGH = _mm_shuffle_epi32(StateEFGH, 0xb1);
+  __m128i State0 = _mm_unpacklo_epi64(StateEFGH, StateABCD);
+  __m128i State1 = _mm_unpackhi_epi64(StateEFGH, StateABCD);
+
+  const __m128i State0Save = State0;
+  const __m128i State1Save = State1;
+  __m128i Msg0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(Words + 0));
+  __m128i Msg1 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(Words + 4));
+  __m128i Msg2 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(Words + 8));
+  __m128i Msg3 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(Words + 12));
+  for (unsigned I = 0; I != 16; ++I) {
+    __m128i Message = Msg0;
+    __m128i Rounds = _mm_add_epi32(
+        Message, _mm_loadu_si128(reinterpret_cast<const __m128i *>(K + I * 4)));
+    State1 = _mm_sha256rnds2_epu32(State1, State0, Rounds);
+    State0 =
+        _mm_sha256rnds2_epu32(State0, State1, _mm_shuffle_epi32(Rounds, 0x0e));
+
+    if (I == 15)
+      break;
+
+    __m128i Next = _mm_sha256msg1_epu32(Msg0, Msg1);
+    Next = _mm_add_epi32(
+        Next, _mm_or_si128(_mm_srli_si128(Msg2, 4), _mm_slli_si128(Msg3, 12)));
+    Next = _mm_sha256msg2_epu32(Next, Msg3);
+    Msg0 = Msg1;
+    Msg1 = Msg2;
+    Msg2 = Msg3;
+    Msg3 = Next;
+  }
+
+  State0 = _mm_add_epi32(State0, State0Save);
+  State1 = _mm_add_epi32(State1, State1Save);
+  StateABCD = _mm_shuffle_epi32(_mm_unpackhi_epi64(State0, State1), 0xb1);
+  StateEFGH = _mm_shuffle_epi32(_mm_unpacklo_epi64(State0, State1), 0xb1);
+  _mm_storeu_si128(reinterpret_cast<__m128i *>(State), StateABCD);
+  _mm_storeu_si128(reinterpret_cast<__m128i *>(State + 4), StateEFGH);
+}
+
+} // namespace
+#endif
+
 void SHA256::init() {
   InternalState.State[0] = 0x6A09E667;
   InternalState.State[1] = 0xBB67AE85;
@@ -62,6 +137,15 @@ void SHA256::init() {
 }
 
 void SHA256::hashBlock() {
+#if LLVM_SHA256_HAS_SHA_NI
+  static const bool HasSHA =
+      LLVM_CPU_SUPPORTS("sha") && LLVM_CPU_SUPPORTS("sse2");
+  if (HasSHA) {
+    hashBlockSHA(InternalState.State, InternalState.Buffer.L);
+    return;
+  }
+#endif
+
   uint32_t A = InternalState.State[0];
   uint32_t B = InternalState.State[1];
   uint32_t C = InternalState.State[2];
