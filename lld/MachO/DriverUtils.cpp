@@ -382,7 +382,10 @@ DylibFile *macho::loadDylib(MemoryBufferRef mbref, DylibFile *umbrella,
   return newFile;
 }
 
-void macho::resetLoadedDylibs() { loadedDylibs.clear(); }
+void macho::resetLoadedDylibs() {
+  loadedDylibs.clear();
+  preparedTapiFiles.clear();
+}
 
 std::optional<StringRef>
 macho::findPathCombination(const Twine &name,

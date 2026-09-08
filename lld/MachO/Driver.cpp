@@ -588,12 +588,13 @@ static void deferFile(StringRef path, bool isLazy, DeferredFiles &deferred,
                       LoadType loadType = LoadType::CommandLine,
                       bool isNeeded = false, bool isWeak = false,
                       bool isReexport = false, bool isHidden = false,
-                      bool isExplicit = true) {
+                      bool isExplicit = true, bool forceDefer = false) {
   std::optional<MemoryBufferRef> buffer = readFile(path);
   if (!buffer)
     return;
-  if (config->readWorkers)
-    deferred.push_back({path, isLazy, *buffer, loadType, isNeeded, isWeak,
+  MemoryBufferRef mbref = *buffer;
+  if (config->readWorkers || forceDefer)
+    deferred.push_back({path, isLazy, mbref, loadType, isNeeded, isWeak,
                         isReexport, isHidden, isExplicit});
   else {
     if (loadedObjectFrameworks.contains(path))
@@ -628,10 +629,11 @@ static void prepareTapiFiles(const DeferredFiles &deferred,
 static std::vector<StringRef> missingAutolinkWarnings;
 static void addLibrary(StringRef name, bool isNeeded, bool isWeak,
                        bool isReexport, bool isHidden, bool isExplicit,
-                       LoadType loadType, DeferredFiles &deferred) {
+                       LoadType loadType, DeferredFiles &deferred,
+                       bool forceDefer = false) {
   if (std::optional<StringRef> path = findLibrary(name)) {
     deferFile(*path, /*isLazy=*/false, deferred, loadType, isNeeded, isWeak,
-              isReexport, isHidden, isExplicit);
+              isReexport, isHidden, isExplicit, forceDefer);
     return;
   }
   if (loadType == LoadType::LCLinkerOption) {
@@ -644,13 +646,13 @@ static void addLibrary(StringRef name, bool isNeeded, bool isWeak,
 
 static void addFramework(StringRef name, bool isNeeded, bool isWeak,
                          bool isReexport, bool isExplicit, LoadType loadType,
-                         DeferredFiles &deferred) {
+                         DeferredFiles &deferred, bool forceDefer = false) {
   if (std::optional<StringRef> path = findFramework(name)) {
     if (loadedObjectFrameworks.contains(*path))
       return;
 
     deferFile(*path, /*isLazy=*/false, deferred, loadType, isNeeded, isWeak,
-              isReexport, /*isHidden=*/false, isExplicit);
+              isReexport, /*isHidden=*/false, isExplicit, forceDefer);
     return;
   }
   if (loadType == LoadType::LCLinkerOption) {
@@ -729,13 +731,14 @@ void macho::resolveLCLinkerOptions() {
     for (const StringRef framework : frameworks) {
       addFramework(framework, /*isNeeded=*/false, /*isWeak=*/false,
                    /*isReexport=*/false, /*isExplicit=*/false,
-                   LoadType::LCLinkerOption, deferred);
+                   LoadType::LCLinkerOption, deferred, /*forceDefer=*/true);
     }
 
     for (const StringRef library : libraries) {
       addLibrary(library, /*isNeeded=*/false, /*isWeak=*/false,
                  /*isReexport=*/false, /*isHidden=*/false,
-                 /*isExplicit=*/false, LoadType::LCLinkerOption, deferred);
+                 /*isExplicit=*/false, LoadType::LCLinkerOption, deferred,
+                 /*forceDefer=*/true);
     }
 
     std::vector<PreparedTapiFile> preparedTapiFiles;
