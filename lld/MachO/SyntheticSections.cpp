@@ -1219,7 +1219,7 @@ void SymtabSection::emitStabs() {
   }
 
   // Cache the file ID for each symbol in an std::pair for faster sorting.
-  using SortingPair = std::pair<Defined *, int>;
+  using SortingPair = std::pair<const SymtabEntry *, int>;
   std::vector<SortingPair> symbolsNeedingStabs;
   for (const SymtabEntry &entry :
        concat<SymtabEntry>(localSymbols, externalSymbols)) {
@@ -1245,7 +1245,7 @@ void SymtabSection::emitStabs() {
       // We use the symbol's original InputSection to get the file id,
       // even for ICF folded symbols, to ensure STABS entries point to the
       // correct object file where the symbol was originally defined
-      symbolsNeedingStabs.emplace_back(defined,
+      symbolsNeedingStabs.emplace_back(&entry,
                                        defined->originalIsec->getFile()->id);
     }
   }
@@ -1265,7 +1265,8 @@ void SymtabSection::emitStabs() {
   // originated.
   InputFile *lastFile = nullptr;
   for (SortingPair &pair : symbolsNeedingStabs) {
-    Defined *defined = pair.first;
+    const SymtabEntry &entry = *pair.first;
+    Defined *defined = cast<Defined>(entry.sym);
     // When emitting STABS entries for a symbol, always use the original
     // InputSection of the defined symbol, not the section of the function body
     // (which might be a different function entirely if ICF folded this
@@ -1285,7 +1286,9 @@ void SymtabSection::emitStabs() {
 
     StabsEntry symStab;
     symStab.sect = isec->parent->index;
-    symStab.strx = stringTableSection.addString(defined->getName());
+    symStab.strx = config->dedupSymbolStrings
+                       ? entry.strx
+                       : stringTableSection.addString(defined->getName());
 
     // When using --keep-icf-stabs, we need to use the VA of the actual function
     // body that the linker will place in the binary. This is the function that
