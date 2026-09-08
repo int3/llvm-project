@@ -12,6 +12,12 @@
 # RUN: env ZERO_AR_DATE=0 %lld -lSystem %t/test.o %t/foo.o %t/no-debug.o -o %t/test
 # RUN: llvm-objdump --section-headers %t/test > %t.out
 # RUN: dsymutil -s %t/test >> %t.out
+# RUN: env ZERO_AR_DATE=0 %lld -lSystem %t/test.o %t/foo.o %t/no-debug.o \
+# RUN:     --threads=1 -no_uuid -o %t/stabs-threads-1
+# RUN: env ZERO_AR_DATE=0 %lld -lSystem %t/test.o %t/foo.o %t/no-debug.o \
+# RUN:     --threads=4 -no_uuid -o %t/stabs-threads-4
+# RUN: cmp %t/stabs-threads-1 %t/stabs-threads-4
+
 # RUN: FileCheck %s -DDIR=%t -DFOO_PATH=%t/foo.o \
 # RUN:   -D#TEST_TIME=0x10 -D#FOO_TIME=0x20 --input-file %t.out
 

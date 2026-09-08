@@ -1252,18 +1252,30 @@ void SymtabSection::emitStabs() {
 
   llvm::stable_sort(symbolsNeedingStabs, llvm::less_second());
 
-  llvm::MapVector<ObjFile *, std::string> stabFiles;
-  for (const auto &[defined, fileId] : symbolsNeedingStabs) {
+  // Decode each contributing object source path before serial STABS
+  // publication. sourceFile() only consults DWARF data owned by that object,
+  // so these independent decodes can run concurrently while preserving the
+  // existing sorted file order for emission.
+  struct SourceFile {
+    ObjFile *file;
+    std::string path;
+  };
+  std::vector<SourceFile> sourceFiles;
+  for (const SortingPair &pair : symbolsNeedingStabs) {
+    Defined *defined = cast<Defined>(pair.first->sym);
     ObjFile *file = cast<ObjFile>(defined->originalIsec->getFile());
-    stabFiles[file] = "";
+    if (sourceFiles.empty() || sourceFiles.back().file != file)
+      sourceFiles.push_back({file, {}});
   }
-  parallelForEach(stabFiles,
-                  [&](auto &it) { it.second = it.first->sourceFile(); });
+  parallelForEach(sourceFiles, [](SourceFile &sourceFile) {
+    sourceFile.path = sourceFile.file->sourceFile();
+  });
 
   // Emit STABS symbols so that dsymutil and/or the debugger can map address
   // regions in the final binary to the source and object files from which they
   // originated.
   InputFile *lastFile = nullptr;
+  size_t sourceFileIndex = 0;
   for (SortingPair &pair : symbolsNeedingStabs) {
     const SymtabEntry &entry = *pair.first;
     Defined *defined = cast<Defined>(entry.sym);
@@ -1280,7 +1292,7 @@ void SymtabSection::emitStabs() {
         emitEndSourceStab();
       lastFile = file;
 
-      emitBeginSourceStab(stabFiles[file]);
+      emitBeginSourceStab(sourceFiles[sourceFileIndex++].path);
       emitObjectFileStab(file);
     }
 
@@ -1318,6 +1330,8 @@ void SymtabSection::emitStabs() {
       stabs.emplace_back(std::move(symStab));
     }
   }
+
+  assert(sourceFileIndex == sourceFiles.size());
 
   if (!stabs.empty())
     emitEndSourceStab();
