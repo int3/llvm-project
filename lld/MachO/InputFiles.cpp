@@ -60,7 +60,13 @@
 #include "lld/Common/DWARF.h"
 #include "lld/Common/Reproduce.h"
 #include "llvm/ADT/iterator.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/BinaryFormat/MachO.h"
+#include "llvm/DebugInfo/DWARF/DWARFContext.h"
+#include "llvm/DebugInfo/DWARF/DWARFDataExtractor.h"
+#include "llvm/DebugInfo/DWARF/DWARFFormValue.h"
+#include "llvm/DebugInfo/DWARF/DWARFUnit.h"
 #include "llvm/LTO/LTO.h"
 #include "llvm/Support/BinaryStreamReader.h"
 #include "llvm/Support/Endian.h"
@@ -1643,8 +1649,304 @@ void ObjFile::registerEhFrames(Section &ehFrameSection) {
   ehFrameSection.flags &= ~S_ATTR_LIVE_SUPPORT;
 }
 
-std::string ObjFile::sourceFile() const {
-  const char *unitName = compileUnit->getUnitDIE().getShortName();
+namespace {
+
+// Keep this deliberately narrower than DWARFUnit's regular DIE parser. This
+// is a lazy fast path for the common STABS case only; any unsupported or
+// malformed input falls through to the normal parser below.
+struct StabsSourceFile {
+  StringRef name;
+  StringRef dir;
+};
+
+struct FastAbbrevAttribute {
+  dwarf::Attribute attr;
+  dwarf::Form form;
+};
+
+struct FastAbbrev {
+  dwarf::Tag tag = dwarf::DW_TAG_null;
+  SmallVector<FastAbbrevAttribute, 8> attributes;
+};
+
+static bool validCursor(DataExtractor::Cursor &cursor) {
+  if (cursor)
+    return true;
+  consumeError(cursor.takeError());
+  return false;
+}
+
+static std::optional<StringRef> getStringAt(DataExtractor &data,
+                                            uint64_t offset) {
+  DataExtractor::Cursor cursor(offset);
+  StringRef value = data.getCStrRef(cursor);
+  if (!validCursor(cursor))
+    return std::nullopt;
+  return value;
+}
+
+// This scans the whole selected abbreviation set for the same structural
+// errors as DWARFAbbreviationDeclarationSet::extract(), but retains only the
+// declaration selected by the root DIE. In particular, a malformed unused
+// declaration after the selected one still causes the lazy path to fall back.
+static std::optional<FastAbbrev>
+findAndValidateAbbrev(const DWARFUnit &unit, uint64_t code,
+                      bool isLittleEndian) {
+  DataExtractor data(unit.getContext().getDWARFObj().getAbbrevSection(),
+                     isLittleEndian);
+  DataExtractor::Cursor cursor(unit.getAbbreviationsOffset());
+  std::optional<FastAbbrev> selected;
+  while (true) {
+    uint64_t declarationCode = data.getULEB128(cursor);
+    if (!validCursor(cursor))
+      return std::nullopt;
+    if (declarationCode == 0)
+      return selected;
+    if (declarationCode > UINT32_MAX)
+      return std::nullopt;
+
+    uint64_t tagValue = data.getULEB128(cursor);
+    (void)data.getU8(cursor);
+    if (!validCursor(cursor) || tagValue == dwarf::DW_TAG_null)
+      return std::nullopt;
+    FastAbbrev candidate;
+    candidate.tag = static_cast<dwarf::Tag>(tagValue);
+    while (true) {
+      uint64_t attrValue = data.getULEB128(cursor);
+      uint64_t formValue = data.getULEB128(cursor);
+      if (!validCursor(cursor))
+        return std::nullopt;
+      if (attrValue == 0 && formValue == 0)
+        break;
+      if (attrValue == 0 || formValue == 0)
+        return std::nullopt;
+      dwarf::Form form = static_cast<dwarf::Form>(formValue);
+      if (form == dwarf::DW_FORM_implicit_const) {
+        (void)data.getSLEB128(cursor);
+        if (!validCursor(cursor))
+          return std::nullopt;
+      }
+      if (declarationCode == code)
+        candidate.attributes.push_back(
+            {static_cast<dwarf::Attribute>(attrValue), form});
+    }
+    if (declarationCode == code) {
+      if (selected)
+        return std::nullopt;
+      selected = std::move(candidate);
+    }
+  }
+}
+
+// Read an attribute only when it is one the STABS source-file path needs. The
+// caller still skips every other declared root attribute through LLVM's checked
+// form skipper, so a malformed unused root attribute cannot be hidden here.
+static bool readStabsAttributeValue(const DWARFUnit &unit,
+                                    DWARFDataExtractor &info,
+                                    dwarf::Form form,
+                                    DataExtractor::Cursor &cursor,
+                                    std::optional<StringRef> &string,
+                                    std::optional<uint64_t> &index,
+                                    std::optional<uint64_t> &offset) {
+  switch (form) {
+  case dwarf::DW_FORM_string:
+    string = info.getCStrRef(cursor);
+    return validCursor(cursor);
+  case dwarf::DW_FORM_strp:
+    offset = info.getRelocatedValue(cursor, unit.getDwarfOffsetByteSize());
+    return validCursor(cursor);
+  case dwarf::DW_FORM_strx:
+    index = info.getULEB128(cursor);
+    return validCursor(cursor);
+  case dwarf::DW_FORM_strx1:
+    index = info.getU8(cursor);
+    return validCursor(cursor);
+  case dwarf::DW_FORM_strx2:
+    index = info.getU16(cursor);
+    return validCursor(cursor);
+  case dwarf::DW_FORM_strx3:
+    index = info.getU24(cursor);
+    return validCursor(cursor);
+  case dwarf::DW_FORM_strx4:
+    index = info.getU32(cursor);
+    return validCursor(cursor);
+  case dwarf::DW_FORM_sec_offset:
+    offset = info.getRelocatedValue(cursor, unit.getDwarfOffsetByteSize());
+    return validCursor(cursor);
+  default:
+    return false;
+  }
+}
+
+static std::optional<StrOffsetsContributionDescriptor>
+getStringOffsetsContribution(const DWARFUnit &unit, DWARFDataExtractor &data,
+                             uint64_t base) {
+  uint64_t headerOffset;
+  switch (unit.getFormat()) {
+  case dwarf::DwarfFormat::DWARF32:
+    if (base < 8)
+      return std::nullopt;
+    headerOffset = base - 8;
+    break;
+  case dwarf::DwarfFormat::DWARF64:
+    if (base < 16)
+      return std::nullopt;
+    headerOffset = base - 16;
+    break;
+  }
+
+  DataExtractor::Cursor cursor(headerOffset);
+  uint64_t size;
+  if (unit.getFormat() == dwarf::DwarfFormat::DWARF32) {
+    size = data.getU32(cursor);
+    if (!validCursor(cursor) || size >= dwarf::DW_LENGTH_lo_reserved)
+      return std::nullopt;
+  } else {
+    uint32_t marker = data.getU32(cursor);
+    if (!validCursor(cursor) || marker != dwarf::DW_LENGTH_DWARF64)
+      return std::nullopt;
+    size = data.getU64(cursor);
+  }
+  uint16_t encodedVersion = data.getU16(cursor);
+  (void)data.getU16(cursor);
+  if (!validCursor(cursor) || encodedVersion > UINT8_MAX || size < 4)
+    return std::nullopt;
+
+  StrOffsetsContributionDescriptor contribution(
+      base, size - 4, static_cast<uint8_t>(encodedVersion), unit.getFormat());
+  auto checked = contribution.validateContributionSize(data);
+  if (!checked) {
+    consumeError(checked.takeError());
+    return std::nullopt;
+  }
+  return *checked;
+}
+
+static std::optional<StringRef>
+resolveStrx(const DWARFUnit &unit, DWARFDataExtractor &strOffsets,
+            const StrOffsetsContributionDescriptor &contribution,
+            uint64_t index) {
+  uint8_t entrySize = contribution.getDwarfOffsetByteSize();
+  if (entrySize == 0 || index >= contribution.Size / entrySize)
+    return std::nullopt;
+  uint64_t entryOffset = contribution.Base + index * entrySize;
+  if (entryOffset < contribution.Base)
+    return std::nullopt;
+  DataExtractor::Cursor cursor(entryOffset);
+  uint64_t stringOffset = strOffsets.getRelocatedValue(cursor, entrySize);
+  if (!validCursor(cursor))
+    return std::nullopt;
+  DataExtractor strings(unit.getStringSection(), strOffsets.isLittleEndian());
+  return getStringAt(strings, stringOffset);
+}
+
+static std::optional<StabsSourceFile>
+tryGetStabsSourceFile(const DWARFUnit &unit) {
+  if ((unit.getVersion() != 4 && unit.getVersion() != 5) ||
+      unit.isDWOUnit() || unit.getUnitType() != dwarf::DW_UT_compile ||
+      unit.getOffset() != 0 ||
+      unit.getNextUnitOffset() != unit.getDebugInfoExtractor().size())
+    return std::nullopt;
+
+  DWARFDataExtractor info = unit.getDebugInfoExtractor();
+  DataExtractor::Cursor cursor(unit.getOffset() + unit.getHeaderSize());
+  uint64_t abbrevCode = info.getULEB128(cursor);
+  if (!validCursor(cursor) || abbrevCode == 0 || abbrevCode > UINT32_MAX)
+    return std::nullopt;
+
+  std::optional<FastAbbrev> abbrev =
+      findAndValidateAbbrev(unit, abbrevCode, info.isLittleEndian());
+  if (!abbrev || abbrev->tag != dwarf::DW_TAG_compile_unit)
+    return std::nullopt;
+
+  std::optional<StringRef> name;
+  std::optional<StringRef> dir;
+  std::optional<uint64_t> nameIndex;
+  std::optional<uint64_t> dirIndex;
+  std::optional<uint64_t> strOffsetsBase;
+  bool sawName = false;
+  bool sawDir = false;
+  bool sawStrOffsetsBase = false;
+  for (const FastAbbrevAttribute &attr : abbrev->attributes) {
+    if (attr.form == dwarf::DW_FORM_indirect)
+      return std::nullopt;
+
+    uint64_t valueOffset = cursor.tell();
+    uint64_t skippedOffset = valueOffset;
+    if (!DWARFFormValue::skipValue(attr.form, info, &skippedOffset,
+                                   unit.getFormParams()) ||
+        skippedOffset < valueOffset || skippedOffset > unit.getNextUnitOffset())
+      return std::nullopt;
+    if (attr.attr == dwarf::DW_AT_name ||
+        attr.attr == dwarf::DW_AT_comp_dir ||
+        attr.attr == dwarf::DW_AT_str_offsets_base) {
+      bool *seen = attr.attr == dwarf::DW_AT_name
+                       ? &sawName
+                       : attr.attr == dwarf::DW_AT_comp_dir
+                             ? &sawDir
+                             : &sawStrOffsetsBase;
+      if (*seen)
+        return std::nullopt;
+      *seen = true;
+      cursor.seek(valueOffset);
+      std::optional<StringRef> string;
+      std::optional<uint64_t> index;
+      std::optional<uint64_t> offset;
+      if (!readStabsAttributeValue(unit, info, attr.form, cursor, string, index,
+                                   offset) ||
+          cursor.tell() != skippedOffset)
+        return std::nullopt;
+      if (attr.attr == dwarf::DW_AT_name) {
+        if (string)
+          name = string;
+        else if (offset) {
+          DataExtractor strings(unit.getStringSection(), info.isLittleEndian());
+          name = getStringAt(strings, *offset);
+        }
+        nameIndex = index;
+      } else if (attr.attr == dwarf::DW_AT_comp_dir) {
+        if (string)
+          dir = string;
+        else if (offset) {
+          DataExtractor strings(unit.getStringSection(), info.isLittleEndian());
+          dir = getStringAt(strings, *offset);
+        }
+        dirIndex = index;
+      } else {
+        if (attr.form != dwarf::DW_FORM_sec_offset || !offset)
+          return std::nullopt;
+        strOffsetsBase = *offset;
+      }
+    }
+    cursor.seek(skippedOffset);
+  }
+
+  DWARFDataExtractor strOffsets(unit.getContext().getDWARFObj(),
+                                unit.getStringOffsetSection(),
+                                info.isLittleEndian(), 0);
+  std::optional<StrOffsetsContributionDescriptor> contribution;
+  if (unit.getVersion() >= 5 && strOffsetsBase) {
+    contribution = getStringOffsetsContribution(unit, strOffsets,
+                                                 *strOffsetsBase);
+    if (!contribution)
+      return std::nullopt;
+  }
+  auto resolve = [&](std::optional<StringRef> direct,
+                     std::optional<uint64_t> index) -> std::optional<StringRef> {
+    if (direct)
+      return direct;
+    if (index && contribution)
+      return resolveStrx(unit, strOffsets, *contribution, *index);
+    return std::nullopt;
+  };
+  name = resolve(name, nameIndex);
+  dir = resolve(dir, dirIndex);
+  if (!name)
+    return std::nullopt;
+  return StabsSourceFile{*name, dir.value_or("")};
+}
+
+static std::string joinSourceFilePath(StringRef unitName, StringRef compDir) {
   // DWARF allows DW_AT_name to be absolute, in which case nothing should be
   // prepended. As for the styles, debug info can contain paths from any OS, not
   // necessarily an OS we're currently running on. Moreover different
@@ -1652,14 +1954,24 @@ std::string ObjFile::sourceFile() const {
   // together later.
   if (sys::path::is_absolute(unitName, llvm::sys::path::Style::posix) ||
       sys::path::is_absolute(unitName, llvm::sys::path::Style::windows))
-    return unitName;
-  SmallString<261> dir(compileUnit->getCompilationDir());
+    return unitName.str();
+  SmallString<261> dir(compDir);
   StringRef sep = sys::path::get_separator();
   // We don't use `path::append` here because we want an empty `dir` to result
   // in an absolute path. `append` would give us a relative path for that case.
   if (!dir.ends_with(sep))
     dir += sep;
   return (dir + unitName).str();
+}
+
+} // namespace
+
+std::string ObjFile::sourceFile() const {
+  if (std::optional<StabsSourceFile> source =
+          tryGetStabsSourceFile(*compileUnit))
+    return joinSourceFilePath(source->name, source->dir);
+  return joinSourceFilePath(compileUnit->getUnitDIE().getShortName(),
+                            compileUnit->getCompilationDir());
 }
 
 lld::DWARFCache *ObjFile::getDwarf() {
