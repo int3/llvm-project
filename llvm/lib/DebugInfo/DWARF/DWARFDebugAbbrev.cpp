@@ -40,9 +40,9 @@ Error DWARFAbbreviationDeclarationSet::extract(DataExtractor Data,
   clear();
   const uint64_t BeginOffset = *OffsetPtr;
   Offset = BeginOffset;
-  DWARFAbbreviationDeclaration AbbrDecl;
   uint32_t PrevAbbrCode = 0;
   while (true) {
+    DWARFAbbreviationDeclaration AbbrDecl;
     Expected<DWARFAbbreviationDeclaration::ExtractState> ES =
         AbbrDecl.extract(Data, OffsetPtr);
     if (!ES)

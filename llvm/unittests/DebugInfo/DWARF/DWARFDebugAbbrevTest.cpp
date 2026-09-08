@@ -7,9 +7,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/DebugInfo/DWARF/DWARFDebugAbbrev.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/DebugInfo/DWARF/DWARFAbbreviationDeclaration.h"
 #include "llvm/Support/DataExtractor.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/LEB128.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Testing/Support/Error.h"
@@ -50,6 +52,34 @@ void writeULEB128LargerThan64Bits(raw_ostream &OS) {
   static constexpr llvm::StringRef LargeULEB128 =
       "\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x01";
   OS << LargeULEB128;
+}
+
+struct AbbreviationAttribute {
+  dwarf::Attribute Name;
+  dwarf::Form Form;
+  std::optional<int64_t> ImplicitConst;
+};
+
+struct AbbreviationDeclaration {
+  uint32_t Code;
+  dwarf::Tag Tag;
+  uint8_t Children;
+  ArrayRef<AbbreviationAttribute> Attributes;
+};
+
+void writeAbbreviationDeclaration(raw_ostream &OS,
+                                  const AbbreviationDeclaration &Declaration) {
+  encodeULEB128(Declaration.Code, OS);
+  encodeULEB128(Declaration.Tag, OS);
+  OS << Declaration.Children;
+  for (const AbbreviationAttribute &Attribute : Declaration.Attributes) {
+    encodeULEB128(Attribute.Name, OS);
+    encodeULEB128(Attribute.Form, OS);
+    if (Attribute.ImplicitConst)
+      encodeSLEB128(*Attribute.ImplicitConst, OS);
+  }
+  encodeULEB128(0, OS);
+  encodeULEB128(0, OS);
 }
 
 TEST(DWARFDebugAbbrevTest, DWARFAbbrevDeclSetExtractSuccess) {
@@ -111,6 +141,115 @@ TEST(DWARFDebugAbbrevTest, DWARFAbbrevDeclSetExtractSuccessOutOfOrder) {
   EXPECT_EQ(Abbrev1->getTag(), DW_TAG_subprogram);
   EXPECT_FALSE(Abbrev1->hasChildren());
   EXPECT_EQ(Abbrev1->getNumAttributes(), 1u);
+}
+
+TEST(DWARFDebugAbbrevTest,
+     DWARFAbbrevDeclSetExtractMixedAttributeCountsAndFollowingError) {
+  static const AbbreviationAttribute CompileUnitAttributes[] = {
+      {DW_AT_name, DW_FORM_strp, std::nullopt},
+      {DW_AT_language, DW_FORM_data2, std::nullopt},
+      {DW_AT_stmt_list, DW_FORM_sec_offset, std::nullopt},
+      {DW_AT_low_pc, DW_FORM_addr, std::nullopt},
+      {DW_AT_high_pc, DW_FORM_data4, std::nullopt},
+      {DW_AT_producer, DW_FORM_strp, std::nullopt},
+      {DW_AT_comp_dir, DW_FORM_strp, std::nullopt},
+      {DW_AT_const_value, DW_FORM_implicit_const, -17},
+      {DW_AT_ranges, DW_FORM_sec_offset, std::nullopt},
+  };
+  static const AbbreviationAttribute SubprogramAttributes[] = {
+      {DW_AT_name, DW_FORM_strp, std::nullopt},
+  };
+  static const AbbreviationAttribute InlinedSubroutineAttributes[] = {
+      {DW_AT_call_file, DW_FORM_data4, std::nullopt},
+      {DW_AT_call_line, DW_FORM_data4, std::nullopt},
+      {DW_AT_abstract_origin, DW_FORM_ref4, std::nullopt},
+      {DW_AT_low_pc, DW_FORM_addr, std::nullopt},
+      {DW_AT_high_pc, DW_FORM_data4, std::nullopt},
+      {DW_AT_ranges, DW_FORM_sec_offset, std::nullopt},
+      {DW_AT_decl_file, DW_FORM_data4, std::nullopt},
+      {DW_AT_const_value, DW_FORM_implicit_const, 123},
+  };
+  static const AbbreviationAttribute BaseTypeAttributes[] = {
+      {DW_AT_name, DW_FORM_strp, std::nullopt},
+      {DW_AT_byte_size, DW_FORM_data1, std::nullopt},
+      {DW_AT_encoding, DW_FORM_data1, std::nullopt},
+      {DW_AT_decl_file, DW_FORM_data4, std::nullopt},
+      {DW_AT_decl_line, DW_FORM_data4, std::nullopt},
+      {DW_AT_type, DW_FORM_ref4, std::nullopt},
+      {DW_AT_artificial, DW_FORM_flag_present, std::nullopt},
+      {DW_AT_const_value, DW_FORM_implicit_const, -9},
+      {DW_AT_alignment, DW_FORM_udata, std::nullopt},
+  };
+  const AbbreviationDeclaration Declarations[] = {
+      {1, DW_TAG_compile_unit, DW_CHILDREN_yes, CompileUnitAttributes},
+      {2, DW_TAG_subprogram, DW_CHILDREN_no, SubprogramAttributes},
+      {3, DW_TAG_inlined_subroutine, DW_CHILDREN_yes,
+       InlinedSubroutineAttributes},
+      {4, DW_TAG_base_type, DW_CHILDREN_no, BaseTypeAttributes},
+  };
+
+  SmallString<256> RawData;
+  raw_svector_ostream OS(RawData);
+  for (const AbbreviationDeclaration &Declaration : Declarations)
+    writeAbbreviationDeclaration(OS, Declaration);
+  encodeULEB128(0, OS);
+  const uint64_t FirstSetEndOffset = RawData.size();
+  writeMalformedULEB128Value(OS);
+
+  DataExtractor Data(RawData, sys::IsLittleEndianHost);
+  uint64_t Offset = 0;
+  DWARFAbbreviationDeclarationSet AbbrevSet;
+  ASSERT_THAT_ERROR(AbbrevSet.extract(Data, &Offset), Succeeded());
+  EXPECT_EQ(Offset, FirstSetEndOffset);
+  EXPECT_EQ(AbbrevSet.getFirstAbbrCode(), 1u);
+
+  for (const AbbreviationDeclaration &Expected : Declarations) {
+    const DWARFAbbreviationDeclaration *Actual =
+        AbbrevSet.getAbbreviationDeclaration(Expected.Code);
+    ASSERT_TRUE(Actual);
+    EXPECT_EQ(Actual->getTag(), Expected.Tag);
+    EXPECT_EQ(Actual->hasChildren(), Expected.Children == DW_CHILDREN_yes);
+    ASSERT_EQ(Actual->getNumAttributes(), Expected.Attributes.size());
+    for (size_t Index = 0; Index != Expected.Attributes.size(); ++Index) {
+      const AbbreviationAttribute &Attribute = Expected.Attributes[Index];
+      EXPECT_EQ(Actual->getAttrByIndex(Index), Attribute.Name);
+      EXPECT_EQ(Actual->getFormByIndex(Index), Attribute.Form);
+      EXPECT_EQ(Actual->getAttrIsImplicitConstByIndex(Index),
+                Attribute.ImplicitConst.has_value());
+      if (Attribute.ImplicitConst)
+        EXPECT_EQ(Actual->getAttrImplicitConstValueByIndex(Index),
+                  *Attribute.ImplicitConst);
+    }
+  }
+
+  DWARFDebugAbbrev DebugAbbrev(Data);
+  Error Err = DebugAbbrev.parse();
+  ASSERT_TRUE(bool(Err));
+  const std::string ErrorMessage = toString(std::move(Err));
+  EXPECT_THAT(
+      ErrorMessage,
+      testing::HasSubstr(formatv("offset {0:x8}", FirstSetEndOffset).str()));
+  EXPECT_THAT(ErrorMessage,
+              testing::HasSubstr("malformed uleb128, extends past end"));
+
+  SmallString<256> MalformedSetData;
+  raw_svector_ostream MalformedSetOS(MalformedSetData);
+  for (const AbbreviationDeclaration &Declaration : Declarations)
+    writeAbbreviationDeclaration(MalformedSetOS, Declaration);
+  const uint64_t MalformedDeclarationOffset = MalformedSetData.size();
+  writeMalformedULEB128Value(MalformedSetOS);
+
+  DataExtractor MalformedSetExtractor(MalformedSetData,
+                                      sys::IsLittleEndianHost);
+  Offset = 0;
+  DWARFAbbreviationDeclarationSet MalformedSet;
+  EXPECT_THAT_ERROR(
+      MalformedSet.extract(MalformedSetExtractor, &Offset),
+      FailedWithMessage(formatv("unable to decode LEB128 at offset {0:x8}: "
+                                "malformed uleb128, extends past end",
+                                MalformedDeclarationOffset)
+                            .str()));
+  EXPECT_EQ(Offset, MalformedDeclarationOffset);
 }
 
 TEST(DWARFDebugAbbrevTest, DWARFAbbreviationDeclSetCodeExtractionError) {
