@@ -2,9 +2,9 @@
 
 # RUN: rm -rf %t && mkdir -p %t
 # RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin %s -o %t/input.o
-# RUN: %lld -arch arm64 -dylib -oso_prefix %t/ %t/input.o -o %t/default.dylib
+# RUN: %no-lsystem-lld -arch arm64 -dylib -oso_prefix %t/ %t/input.o -o %t/default.dylib
 # RUN: obj2yaml %t/default.dylib | FileCheck %s --check-prefix=DEFAULT
-# RUN: %lld -arch arm64 -dylib -oso_prefix %t/ -no-deduplicate-symbol-strings %t/input.o -o %t/nodedup.dylib
+# RUN: %no-lsystem-lld -arch arm64 -dylib -oso_prefix %t/ -no-deduplicate-symbol-strings %t/input.o -o %t/nodedup.dylib
 # RUN: obj2yaml %t/nodedup.dylib | FileCheck %s --check-prefix=NONDEDUP
 
 ## With the default string-table policy, STABS should use the offsets already
@@ -36,7 +36,7 @@
 # DEFAULT-NEXT:     - _local_data
 # DEFAULT-NEXT:     - _external_function
 # DEFAULT-NEXT:     - _external_data
-# DEFAULT-NEXT:     - /tmp{{[/\\]}}stabs-symbol-string-offsets.s
+# DEFAULT-NEXT:     - {{'?}}/tmp{{[/\\]}}stabs-symbol-string-offsets.s{{'?}}
 # DEFAULT-NEXT:     - input.o
 
 ## Without deduplication, the ordinary symbols retain their original entries
@@ -68,7 +68,7 @@
 # NONDEDUP-NEXT:     - _local_data
 # NONDEDUP-NEXT:     - _external_function
 # NONDEDUP-NEXT:     - _external_data
-# NONDEDUP-NEXT:     - /tmp{{[/\\]}}stabs-symbol-string-offsets.s
+# NONDEDUP-NEXT:     - {{'?}}/tmp{{[/\\]}}stabs-symbol-string-offsets.s{{'?}}
 # NONDEDUP-NEXT:     - input.o
 # NONDEDUP-NEXT:     - _local_function
 # NONDEDUP-NEXT:     - _local_data

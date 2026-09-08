@@ -1,11 +1,11 @@
 # REQUIRES: x86
 # RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %s -o %t.o
-# RUN: %lld -lSystem %t.o -o %t 2>&1 | FileCheck %s
+# RUN: not %lld %t.o -o %t 2>&1 | FileCheck %s
 
 ## The second abbreviation is not used by the root DIE, but a malformed
 ## declaration still invalidates the selected abbreviation set. The lazy STABS
 ## reader must therefore fall back to DWARFUnit and retain its diagnostic.
-# CHECK: warning: {{.*}}malformed abbreviation declaration attribute
+# CHECK: error: {{.*}}invalid abbreviation set offset 0x0
 
 .text
 .globl _main
