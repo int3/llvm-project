@@ -15,7 +15,10 @@
 #include "Target.h"
 #include "lld/Common/CommonLinkerContext.h"
 #include "llvm/BinaryFormat/MachO.h"
+#include "llvm/Support/Parallel.h"
+
 #include <deque>
+#include <limits>
 
 using namespace llvm;
 using namespace llvm::MachO;
@@ -366,7 +369,98 @@ void ConcatOutputSection::writeTo(uint8_t *buf) const {
     isec->writeTo(buf + isec->outSecOff);
 }
 
+static std::optional<uint64_t>
+getArm64RelocationWriteSize(const Relocation &reloc) {
+  switch (reloc.type) {
+  case ARM64_RELOC_UNSIGNED:
+    if (config->emitChainedFixups)
+      return 8;
+    [[fallthrough]];
+  case ARM64_RELOC_SUBTRACTOR:
+  case ARM64_RELOC_POINTER_TO_GOT:
+    if (reloc.length == 2)
+      return 4;
+    if (reloc.length == 3)
+      return 8;
+    return std::nullopt;
+  case ARM64_RELOC_BRANCH26:
+  case ARM64_RELOC_PAGE21:
+  case ARM64_RELOC_GOT_LOAD_PAGE21:
+  case ARM64_RELOC_TLVP_LOAD_PAGE21:
+  case ARM64_RELOC_PAGEOFF12:
+  case ARM64_RELOC_GOT_LOAD_PAGEOFF12:
+  case ARM64_RELOC_TLVP_LOAD_PAGEOFF12:
+    return 4;
+  default:
+    return std::nullopt;
+  }
+}
+
+static bool canWriteTextInputsInParallel(
+    ArrayRef<ConcatInputSection *> inputs,
+    ArrayRef<ConcatInputSection *> thunks, uint64_t outputFileSize) {
+  if (config->arch() != AK_arm64 && config->arch() != AK_arm64e)
+    return false;
+
+  uint64_t previousEnd = 0;
+  auto checkSpan = [&](const ConcatInputSection *isec) {
+    uint64_t fileSize = isec->getFileSize();
+    if (isec->outSecOff < previousEnd ||
+        isec->outSecOff > outputFileSize ||
+        fileSize > outputFileSize - isec->outSecOff)
+      return false;
+    previousEnd = isec->outSecOff + fileSize;
+    return true;
+  };
+
+  size_t i = 0, ie = inputs.size();
+  size_t t = 0, te = thunks.size();
+  while (i < ie || t < te) {
+    if (i < ie && (t == te || inputs[i]->empty() ||
+                   inputs[i]->outSecOff < thunks[t]->outSecOff)) {
+      const ConcatInputSection *isec = inputs[i++];
+      if (!checkSpan(isec))
+        return false;
+
+      for (size_t relocIndex = 0; relocIndex < isec->relocs.size();
+           ++relocIndex) {
+        const Relocation &reloc = isec->relocs[relocIndex];
+        if (target->hasAttr(reloc.type, RelocAttrBits::SUBTRAHEND)) {
+          if (++relocIndex == isec->relocs.size())
+            return false;
+          const Relocation &minuend = isec->relocs[relocIndex];
+          if (!target->hasAttr(minuend.type, RelocAttrBits::UNSIGNED) ||
+              minuend.offset != reloc.offset)
+            return false;
+        }
+
+        uint64_t fileSize = isec->getFileSize();
+        std::optional<uint64_t> writeSize =
+            getArm64RelocationWriteSize(reloc);
+        if (!writeSize || reloc.offset > fileSize ||
+            *writeSize > fileSize - reloc.offset)
+          return false;
+      }
+      continue;
+    }
+
+    if (!checkSpan(thunks[t++]))
+      return false;
+  }
+
+  return true;
+}
+
 void TextOutputSection::writeTo(uint8_t *buf) const {
+  if (canWriteTextInputsInParallel(inputs, thunks, getFileSize())) {
+    parallelForEach(inputs, [buf](ConcatInputSection *isec) {
+      isec->writeTo(buf + isec->outSecOff);
+    });
+    for (ConcatInputSection *thunk : thunks)
+      thunk->writeTo(buf + thunk->outSecOff);
+    return;
+  }
+
   // Merge input sections from thunk & ordinary vectors
   size_t i = 0, ie = inputs.size();
   size_t t = 0, te = thunks.size();
