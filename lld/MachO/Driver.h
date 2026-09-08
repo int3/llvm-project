@@ -16,10 +16,19 @@
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/Option/OptTable.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include <memory>
 #include <optional>
 
 #include <set>
+#include <string>
 #include <type_traits>
+#include <vector>
+
+namespace llvm {
+namespace MachO {
+class InterfaceFile;
+}
+}// namespace llvm
 
 namespace lld {
 class CommonLinkerContext;
@@ -61,6 +70,27 @@ std::optional<StringRef> resolveDylibPath(llvm::StringRef path);
 DylibFile *loadDylib(llvm::MemoryBufferRef mbref, DylibFile *umbrella = nullptr,
                      bool isBundleLoader = false,
                      bool explicitlyLinked = false);
+
+struct PreparedTapiFile {
+  explicit PreparedTapiFile(llvm::MemoryBufferRef buffer);
+  PreparedTapiFile(PreparedTapiFile &&);
+  PreparedTapiFile &operator=(PreparedTapiFile &&);
+  ~PreparedTapiFile();
+  PreparedTapiFile(const PreparedTapiFile &) = delete;
+  PreparedTapiFile &operator=(const PreparedTapiFile &) = delete;
+
+  llvm::MemoryBufferRef buffer;
+  llvm::StringRef path;
+  std::unique_ptr<llvm::MachO::InterfaceFile> interfaceFile;
+  std::optional<std::string> error;
+};
+
+void prepareTapiFiles(llvm::ArrayRef<llvm::MemoryBufferRef> buffers,
+                      std::vector<PreparedTapiFile> &preparedTapiFiles);
+void setPreparedTapiFiles(
+    llvm::ArrayRef<PreparedTapiFile *> preparedTapiFiles);
+void clearPreparedTapiFiles();
+
 void resetLoadedDylibs();
 
 // Search for all possible combinations of `{root}/{name}.{extension}`.

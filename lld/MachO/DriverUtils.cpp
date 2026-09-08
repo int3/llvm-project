@@ -21,6 +21,7 @@
 #include "llvm/Option/Option.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Parallel.h"
 #include "llvm/Support/Path.h"
 #include "llvm/TextAPI/InterfaceFile.h"
 #include "llvm/TextAPI/TextAPIReader.h"
@@ -223,6 +224,46 @@ std::optional<StringRef> macho::resolveDylibPath(StringRef dylibPath) {
 // especially if it's a commonly re-exported core library.
 static DenseMap<CachedHashStringRef, DylibFile *> loadedDylibs;
 
+static DenseMap<CachedHashStringRef, PreparedTapiFile *> preparedTapiFiles;
+
+macho::PreparedTapiFile::PreparedTapiFile(MemoryBufferRef buffer)
+    : buffer(buffer), path(buffer.getBufferIdentifier()) {}
+macho::PreparedTapiFile::PreparedTapiFile(PreparedTapiFile &&) = default;
+macho::PreparedTapiFile &
+macho::PreparedTapiFile::operator=(PreparedTapiFile &&) = default;
+macho::PreparedTapiFile::~PreparedTapiFile() = default;
+
+static void prepareTapiFile(PreparedTapiFile *file) {
+  Expected<std::unique_ptr<InterfaceFile>> result =
+      TextAPIReader::get(file->buffer);
+  if (result)
+    file->interfaceFile = std::move(*result);
+  else
+    file->error = toString(result.takeError());
+}
+
+void macho::prepareTapiFiles(ArrayRef<MemoryBufferRef> buffers,
+                             std::vector<PreparedTapiFile> &prepared) {
+  prepared.reserve(buffers.size());
+  for (MemoryBufferRef buffer : buffers)
+    prepared.emplace_back(buffer);
+
+  SmallVector<PreparedTapiFile *> files;
+  for (PreparedTapiFile &file : prepared)
+    files.push_back(&file);
+  llvm::parallelForEach(files, prepareTapiFile);
+}
+
+void macho::setPreparedTapiFiles(
+    ArrayRef<PreparedTapiFile *> preparedTapiFiles) {
+  assert(::preparedTapiFiles.empty());
+  for (PreparedTapiFile *file : preparedTapiFiles)
+    ::preparedTapiFiles.insert(
+        std::make_pair(CachedHashStringRef(file->path), file));
+}
+
+void macho::clearPreparedTapiFiles() { ::preparedTapiFiles.clear(); }
+
 static StringRef realPathIfDifferent(StringRef path) {
   SmallString<128> realPathBuf;
   if (fs::real_path(path, realPathBuf))
@@ -264,14 +305,34 @@ DylibFile *macho::loadDylib(MemoryBufferRef mbref, DylibFile *umbrella,
   DylibFile *newFile;
   file_magic magic = identify_magic(mbref.getBuffer());
   if (magic == file_magic::tapi_file) {
-    Expected<std::unique_ptr<InterfaceFile>> result = TextAPIReader::get(mbref);
-    if (!result) {
+    std::unique_ptr<InterfaceFile> interfaceFile;
+    auto it = preparedTapiFiles.find(path);
+    if (it != preparedTapiFiles.end()) {
+      PreparedTapiFile *prepared = it->second;
+      preparedTapiFiles.erase(it);
+      if (prepared->error) {
+        error("could not load TAPI file at " + mbref.getBufferIdentifier() +
+              ": " + *prepared->error);
+        return nullptr;
+      }
+      interfaceFile = std::move(prepared->interfaceFile);
+    } else {
+      Expected<std::unique_ptr<InterfaceFile>> result = TextAPIReader::get(mbref);
+      if (!result) {
+        error("could not load TAPI file at " + mbref.getBufferIdentifier() +
+              ": " + toString(result.takeError()));
+        return nullptr;
+      }
+      interfaceFile = std::move(*result);
+    }
+    if (!interfaceFile) {
       error("could not load TAPI file at " + mbref.getBufferIdentifier() +
-            ": " + toString(result.takeError()));
+            ": empty prepared TAPI file");
       return nullptr;
     }
     file =
-        make<DylibFile>(**result, umbrella, isBundleLoader, explicitlyLinked);
+        make<DylibFile>(*interfaceFile, umbrella, isBundleLoader,
+                        explicitlyLinked);
 
     // parseReexports() can recursively call loadDylib(). That's fine since
     // we wrote the DylibFile we just loaded to the loadDylib cache via the
@@ -280,7 +341,7 @@ DylibFile *macho::loadDylib(MemoryBufferRef mbref, DylibFile *umbrella,
     // the pointer it refers to before continuing.
     newFile = file;
     if (newFile->exportingFile)
-      newFile->parseReexports(**result);
+      newFile->parseReexports(*interfaceFile);
   } else {
     assert(magic == file_magic::macho_dynamically_linked_shared_lib ||
            magic == file_magic::macho_dynamically_linked_shared_lib_stub ||

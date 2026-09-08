@@ -607,6 +607,24 @@ static void deferFile(StringRef path, bool isLazy, DeferredFiles &deferred,
   }
 }
 
+static void prepareTapiFiles(const DeferredFiles &deferred,
+                             std::vector<PreparedTapiFile> &prepared) {
+  DenseSet<StringRef> paths;
+  SmallVector<MemoryBufferRef> buffers;
+  for (const DeferredFile &file : deferred) {
+    if (identify_magic(file.buffer.getBuffer()) != file_magic::tapi_file ||
+        !paths.insert(file.buffer.getBufferIdentifier()).second)
+      continue;
+    buffers.push_back(file.buffer);
+  }
+  macho::prepareTapiFiles(buffers, prepared);
+
+  SmallVector<PreparedTapiFile *> filesToConsume;
+  for (PreparedTapiFile &file : prepared)
+    filesToConsume.push_back(&file);
+  setPreparedTapiFiles(filesToConsume);
+}
+
 static std::vector<StringRef> missingAutolinkWarnings;
 static void addLibrary(StringRef name, bool isNeeded, bool isWeak,
                        bool isReexport, bool isHidden, bool isExplicit,
@@ -720,6 +738,8 @@ void macho::resolveLCLinkerOptions() {
                  /*isExplicit=*/false, LoadType::LCLinkerOption, deferred);
     }
 
+    std::vector<PreparedTapiFile> preparedTapiFiles;
+    prepareTapiFiles(deferred, preparedTapiFiles);
     for (auto &file : deferred) {
       if (loadedObjectFrameworks.contains(file.path))
         continue;
@@ -731,6 +751,7 @@ void macho::resolveLCLinkerOptions() {
                          file.isReexport);
       checkAndCacheFramework(inputFile, file.path);
     }
+    clearPreparedTapiFiles();
   }
 }
 
