@@ -41,7 +41,8 @@ int macho::inputSectionsOrder = 0;
 // Call this function to add a new InputSection and have it routed to the
 // appropriate container. Depending on its type and current config, it will
 // either be added to 'inputSections' vector or to a synthetic section.
-void lld::macho::addInputSection(InputSection *inputSection) {
+static void addInputSectionImpl(InputSection *inputSection,
+                                ConcatOutputSection **cachedOsec) {
   if (auto *isec = dyn_cast<ConcatInputSection>(inputSection)) {
     if (isec->isCoalescedWeak())
       return;
@@ -59,7 +60,11 @@ void lld::macho::addInputSection(InputSection *inputSection) {
       return;
     }
     isec->outSecOff = inputSectionsOrder++;
-    auto *osec = ConcatOutputSection::getOrCreateForInput(isec);
+    ConcatOutputSection *osec = cachedOsec ? *cachedOsec : nullptr;
+    if (!osec)
+      osec = ConcatOutputSection::getOrCreateForInput(isec);
+    if (cachedOsec)
+      *cachedOsec = osec;
     isec->parent = osec;
     inputSections.push_back(isec);
   } else if (auto *isec = dyn_cast<CStringInputSection>(inputSection)) {
@@ -79,6 +84,15 @@ void lld::macho::addInputSection(InputSection *inputSection) {
   }
 
   assert(inputSectionsOrder <= UnspecifiedInputOrder);
+}
+
+void lld::macho::addInputSection(InputSection *inputSection) {
+  addInputSectionImpl(inputSection, nullptr);
+}
+
+void lld::macho::addInputSection(InputSection *inputSection,
+                                 ConcatOutputSection *&osec) {
+  addInputSectionImpl(inputSection, &osec);
 }
 
 uint64_t InputSection::getFileSize() const {

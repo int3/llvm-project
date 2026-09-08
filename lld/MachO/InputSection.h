@@ -28,6 +28,7 @@ namespace macho {
 
 class InputFile;
 class OutputSection;
+class ConcatOutputSection;
 
 class InputSection {
 public:
@@ -398,6 +399,9 @@ constexpr const char addrSig[] = "__llvm_addrsig";
 } // namespace section_names
 
 void addInputSection(InputSection *inputSection);
+// The caller starts \p osec null for each input Section. All input sections
+// passed with it must belong to that Section.
+void addInputSection(InputSection *inputSection, ConcatOutputSection *&osec);
 
 uint64_t resolveSymbolOffsetVA(const Symbol *sym, uint8_t type, int64_t offset);
 } // namespace macho
