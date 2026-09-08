@@ -223,10 +223,9 @@ static void flushRebase(const RebaseState &state, raw_svector_ostream &os) {
 static void encodeRebases(const OutputSegment *seg,
                           MutableArrayRef<Location> locations,
                           raw_svector_ostream &os) {
-  // dyld operates on segments. Translate section offsets into segment offsets.
+  // Locations are sorted by virtual address. dyld rebases segment offsets.
   for (Location &loc : locations)
-    loc.offset =
-        loc.isec->parent->getSegmentOffset() + loc.isec->getOffset(loc.offset);
+    loc.offset -= seg->addr;
   // The algorithm assumes that locations are unique.
   Location *end =
       llvm::unique(locations, [](const Location &a, const Location &b) {
@@ -281,8 +280,10 @@ void RebaseSection::finalizeContents() {
   raw_svector_ostream os{contents};
   os << static_cast<uint8_t>(REBASE_OPCODE_SET_TYPE_IMM | REBASE_TYPE_POINTER);
 
+  for (Location &loc : locations)
+    loc.offset = loc.isec->getVA(loc.offset);
   llvm::sort(locations, [](const Location &a, const Location &b) {
-    return a.isec->getVA(a.offset) < b.isec->getVA(b.offset);
+    return a.offset < b.offset;
   });
 
   for (size_t i = 0, count = locations.size(); i < count;) {
