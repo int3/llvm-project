@@ -180,108 +180,108 @@ void MarkLiveImpl<RecordWhyLive>::markTransitively() {
     } while (!worklist.empty());
   } else {
 
-  // Literal-section liveness is backed by packed bitfields. Workers only
-  // collect their writes; the serial merge below applies them after a frontier
-  // has drained. Concat sections and symbols use their addressable atomic bits.
-  using LiteralEntry = std::pair<InputSection *, uint64_t>;
-  auto enqueueParallel = [](InputSection *isec, uint64_t off,
-                            SmallVectorImpl<WorklistEntry *> &next,
-                            SmallVectorImpl<LiteralEntry> &literals) {
-    if (auto *concat = dyn_cast<ConcatInputSection>(isec)) {
-      if (!concat->live.load(std::memory_order_relaxed) &&
-          !concat->live.exchange(true, std::memory_order_relaxed)) {
-        assert(!concat->isCoalescedWeak());
-        next.push_back(concat);
-      }
-      return;
-    }
-    literals.emplace_back(isec, off);
-  };
-  auto addSymParallel = [&](Symbol *s, SmallVectorImpl<WorklistEntry *> &next,
-                             SmallVectorImpl<LiteralEntry> &literals) {
-    if (s->used.load(std::memory_order_relaxed) ||
-        s->used.exchange(true, std::memory_order_relaxed))
-      return;
-    if (auto *d = dyn_cast<Defined>(s)) {
-      if (d->isec())
-        enqueueParallel(d->isec(), d->value, next, literals);
-      if (d->unwindEntry())
-        enqueueParallel(d->unwindEntry(), 0, next, literals);
-    }
-  };
-  auto visit = [&](ConcatInputSection *isec,
-                   SmallVectorImpl<WorklistEntry *> &next,
-                   SmallVectorImpl<LiteralEntry> &literals) {
-    for (const Relocation &r : isec->relocs) {
-      if (auto *s = r.referent.dyn_cast<Symbol *>())
-        addSymParallel(s, next, literals);
-      else
-        enqueueParallel(cast<InputSection *>(r.referent), r.addend, next,
-                        literals);
-    }
-    for (Defined *d : isec->symbols)
-      addSymParallel(d, next, literals);
-  };
-
-  while (true) {
-    while (!worklist.empty()) {
-      SmallVector<WorklistEntry *, 256> frontier;
-      frontier.swap(worklist);
-      const size_t workers =
-          std::min(frontier.size(), llvm::parallel::getThreadCount());
-      if (workers == 1 || frontier.size() < 1024) {
-        SmallVector<LiteralEntry, 256> literals;
-        for (WorklistEntry *entry : frontier)
-          visit(cast<ConcatInputSection>(entry), worklist, literals);
-        for (const LiteralEntry &entry : literals)
-          entry.first->markLive(entry.second);
-        continue;
-      }
-
-      SmallVector<SmallVector<WorklistEntry *, 0>, 0> nextWorklists(workers);
-      SmallVector<SmallVector<LiteralEntry, 0>, 0> literalWorklists(workers);
-      {
-        llvm::parallel::TaskGroup tasks;
-        for (size_t worker = 0; worker != workers; ++worker) {
-          const size_t begin = frontier.size() * worker / workers;
-          const size_t end = frontier.size() * (worker + 1) / workers;
-          tasks.spawn([&, worker, begin, end] {
-            for (size_t i = begin; i != end; ++i)
-              visit(cast<ConcatInputSection>(frontier[i]), nextWorklists[worker],
-                    literalWorklists[worker]);
-          });
+    // Literal-section liveness is backed by packed bitfields. Workers only
+    // collect their writes; the serial merge below applies them after a frontier
+    // has drained. Concat sections and symbols use their addressable atomic bits.
+    using LiteralEntry = std::pair<InputSection *, uint64_t>;
+    auto enqueueParallel = [](InputSection *isec, uint64_t off,
+                              SmallVectorImpl<WorklistEntry *> &next,
+                              SmallVectorImpl<LiteralEntry> &literals) {
+      if (auto *concat = dyn_cast<ConcatInputSection>(isec)) {
+        if (!concat->live.load(std::memory_order_relaxed) &&
+            !concat->live.exchange(true, std::memory_order_relaxed)) {
+          assert(!concat->isCoalescedWeak());
+          next.push_back(concat);
         }
+        return;
       }
-      for (SmallVectorImpl<WorklistEntry *> &next : nextWorklists)
-        worklist.append(next.begin(), next.end());
-      for (SmallVectorImpl<LiteralEntry> &literals : literalWorklists)
-        for (const LiteralEntry &entry : literals)
-          entry.first->markLive(entry.second);
-    }
-
-    // Keep LIVE_SUPPORT and its fixed point serial. It depends on all literal
-    // writes from the preceding frontier and is usually a narrow tail.
-    for (ConcatInputSection *isec : inputSections) {
-      if (!(isec->getFlags() & S_ATTR_LIVE_SUPPORT) || isec->live)
-        continue;
+      literals.emplace_back(isec, off);
+    };
+    auto addSymParallel = [&](Symbol *s, SmallVectorImpl<WorklistEntry *> &next,
+                               SmallVectorImpl<LiteralEntry> &literals) {
+      if (s->used.load(std::memory_order_relaxed) ||
+          s->used.exchange(true, std::memory_order_relaxed))
+        return;
+      if (auto *d = dyn_cast<Defined>(s)) {
+        if (d->isec())
+          enqueueParallel(d->isec(), d->value, next, literals);
+        if (d->unwindEntry())
+          enqueueParallel(d->unwindEntry(), 0, next, literals);
+      }
+    };
+    auto visit = [&](ConcatInputSection *isec,
+                     SmallVectorImpl<WorklistEntry *> &next,
+                     SmallVectorImpl<LiteralEntry> &literals) {
       for (const Relocation &r : isec->relocs) {
-        if (auto *s = dyn_cast<Symbol *>(r.referent)) {
-          if (s->isLive()) {
-            InputSection *referentIsec = nullptr;
-            if (auto *d = dyn_cast<Defined>(s))
-              referentIsec = d->isec();
-            enqueue(isec, 0, makeEntry(referentIsec, nullptr));
+        if (auto *s = r.referent.dyn_cast<Symbol *>())
+          addSymParallel(s, next, literals);
+        else
+          enqueueParallel(cast<InputSection *>(r.referent), r.addend, next,
+                          literals);
+      }
+      for (Defined *d : isec->symbols)
+        addSymParallel(d, next, literals);
+    };
+
+    while (true) {
+      while (!worklist.empty()) {
+        SmallVector<WorklistEntry *, 256> frontier;
+        frontier.swap(worklist);
+        const size_t workers =
+            std::min(frontier.size(), llvm::parallel::getThreadCount());
+        if (workers == 1 || frontier.size() < 1024) {
+          SmallVector<LiteralEntry, 256> literals;
+          for (WorklistEntry *entry : frontier)
+            visit(cast<ConcatInputSection>(entry), worklist, literals);
+          for (const LiteralEntry &entry : literals)
+            entry.first->markLive(entry.second);
+          continue;
+        }
+
+        SmallVector<SmallVector<WorklistEntry *, 0>, 0> nextWorklists(workers);
+        SmallVector<SmallVector<LiteralEntry, 0>, 0> literalWorklists(workers);
+        {
+          llvm::parallel::TaskGroup tasks;
+          for (size_t worker = 0; worker != workers; ++worker) {
+            const size_t begin = frontier.size() * worker / workers;
+            const size_t end = frontier.size() * (worker + 1) / workers;
+            tasks.spawn([&, worker, begin, end] {
+              for (size_t i = begin; i != end; ++i)
+                visit(cast<ConcatInputSection>(frontier[i]), nextWorklists[worker],
+                      literalWorklists[worker]);
+            });
           }
-        } else {
-          auto *referentIsec = cast<InputSection *>(r.referent);
-          if (referentIsec->isLive(r.addend))
-            enqueue(isec, 0, makeEntry(referentIsec, nullptr));
+        }
+        for (SmallVectorImpl<WorklistEntry *> &next : nextWorklists)
+          worklist.append(next.begin(), next.end());
+        for (SmallVectorImpl<LiteralEntry> &literals : literalWorklists)
+          for (const LiteralEntry &entry : literals)
+            entry.first->markLive(entry.second);
+      }
+
+      // Keep LIVE_SUPPORT and its fixed point serial. It depends on all literal
+      // writes from the preceding frontier and is usually a narrow tail.
+      for (ConcatInputSection *isec : inputSections) {
+        if (!(isec->getFlags() & S_ATTR_LIVE_SUPPORT) || isec->live)
+          continue;
+        for (const Relocation &r : isec->relocs) {
+          if (auto *s = r.referent.dyn_cast<Symbol *>()) {
+            if (s->isLive()) {
+              InputSection *referentIsec = nullptr;
+              if (auto *d = dyn_cast<Defined>(s))
+                referentIsec = d->isec();
+              enqueue(isec, 0, makeEntry(referentIsec, nullptr));
+            }
+          } else {
+            auto *referentIsec = cast<InputSection *>(r.referent);
+            if (referentIsec->isLive(r.addend))
+              enqueue(isec, 0, makeEntry(referentIsec, nullptr));
+          }
         }
       }
+      if (worklist.empty())
+        break;
     }
-    if (worklist.empty())
-      break;
-  }
   }
 }
 
