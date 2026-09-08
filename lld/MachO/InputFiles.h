@@ -25,6 +25,7 @@
 #include "llvm/Support/Threading.h"
 #include "llvm/TextAPI/TextAPIReader.h"
 
+#include <memory>
 #include <vector>
 
 namespace llvm {
@@ -159,15 +160,22 @@ struct FDE {
 // .o file
 class ObjFile final : public InputFile {
 public:
+  class Prepared;
+
   ObjFile(MemoryBufferRef mb, uint32_t modTime, StringRef archiveName,
           bool lazy = false, bool forceHidden = false, bool compatArch = true,
           bool builtFromBitcode = false);
+  ObjFile(MemoryBufferRef mb, uint32_t modTime, StringRef archiveName,
+          bool lazy, bool forceHidden, bool compatArch, bool builtFromBitcode,
+          std::unique_ptr<Prepared> prepared);
+  // Collects object-local data that can be parsed before this object publishes
+  // sections, symbols, or diagnostics to linker-global state.
+  static std::unique_ptr<Prepared> prepare(MemoryBufferRef mb);
   ArrayRef<llvm::MachO::data_in_code_entry> getDataInCode() const;
   ArrayRef<uint8_t> getOptimizationHints() const;
   template <class LP> void parse();
   template <class LP>
   void parseLinkerOptions(llvm::SmallVectorImpl<StringRef> &LinkerOptions);
-  void parseDeferredRelocations();
 
   static bool classof(const InputFile *f) { return f->kind() == ObjKind; }
 
@@ -189,8 +197,10 @@ public:
 
 private:
   llvm::once_flag initDwarf;
+  template <class LP> void parse(const Prepared *prepared);
   template <class LP> void parseLazy();
-  template <class SectionHeader> void parseSections(ArrayRef<SectionHeader>);
+  template <class SectionHeader>
+  void parseSections(ArrayRef<SectionHeader>, const Prepared *prepared);
   template <class LP>
   void parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
                     ArrayRef<typename LP::nlist> nList, const char *strtab,
@@ -199,8 +209,8 @@ private:
   Symbol *parseNonSectionSymbol(const NList &sym, const char *strtab);
   template <class SectionHeader>
   void parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
-                        const SectionHeader &, Section &);
-  template <class LP> void parseDeferredRelocationsImpl();
+                        const SectionHeader &, Section &, size_t sectionIndex,
+                        const Prepared *prepared);
   void parseDebugInfo();
   void splitEhFrames(ArrayRef<uint8_t> dataArr, Section &ehFrameSection);
   void registerCompactUnwind(Section &compactUnwindSection);
@@ -291,6 +301,9 @@ public:
   explicit ArchiveFile(std::unique_ptr<llvm::object::Archive> &&file,
                        bool forceHidden);
   void addLazySymbols();
+  // Prepares eager archive members with the regular linker thread strategy,
+  // but publishes them in archive order on the main thread.
+  void fetchAllMembers(llvm::StringRef reason);
   void fetch(const llvm::object::Archive::Symbol &);
   // LLD normally doesn't use Error for error-handling, but the underlying
   // Archive library does, so this is the cleanest way to wrap it.
@@ -330,8 +343,6 @@ extern llvm::DenseMap<llvm::CachedHashStringRef, MemoryBufferRef> cachedReads;
 extern llvm::SmallVector<StringRef> unprocessedLCLinkerOptions;
 
 std::optional<MemoryBufferRef> readFile(StringRef path);
-
-void parseDeferredRelocations();
 
 void extract(InputFile &file, StringRef reason);
 

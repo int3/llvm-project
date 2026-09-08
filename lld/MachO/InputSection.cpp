@@ -313,6 +313,11 @@ void CStringInputSection::splitIntoPieces() {
   }
 }
 
+void CStringInputSection::setPreparedPieces(std::vector<StringPiece> prepared) {
+  assert(pieces.empty());
+  pieces = std::move(prepared);
+}
+
 StringPiece &CStringInputSection::getStringPiece(uint64_t off) {
   if (off >= data.size())
     fatal(toString(this) + ": offset is outside the section");

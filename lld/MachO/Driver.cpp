@@ -452,31 +452,19 @@ static InputFile *processFile(std::optional<MemoryBufferRef> buffer,
     if ((isCommandLineLoad && config->allLoad) ||
         loadType == LoadType::CommandLineForce || isLCLinkerForceLoad) {
       if (readFile(path)) {
-        Error e = Error::success();
-        for (const object::Archive::Child &c : file->getArchive().children(e)) {
-          StringRef reason;
-          switch (loadType) {
-          case LoadType::LCLinkerOption:
-            reason = "LC_LINKER_OPTION";
-            break;
-          case LoadType::CommandLineForce:
-            reason = "-force_load";
-            break;
-          case LoadType::CommandLine:
-            reason = "-all_load";
-            break;
-          }
-          if (Error e = file->fetch(c, reason)) {
-            if (config->warnThinArchiveMissingMembers)
-              warn(toString(file) + ": " + reason +
-                   " failed to load archive member: " + toString(std::move(e)));
-            else
-              llvm::consumeError(std::move(e));
-          }
+        StringRef reason;
+        switch (loadType) {
+        case LoadType::LCLinkerOption:
+          reason = "LC_LINKER_OPTION";
+          break;
+        case LoadType::CommandLineForce:
+          reason = "-force_load";
+          break;
+        case LoadType::CommandLine:
+          reason = "-all_load";
+          break;
         }
-        if (e)
-          error(toString(file) +
-                ": Archive::children failed: " + toString(std::move(e)));
+        file->fetchAllMembers(reason);
       }
     } else if (isCommandLineLoad && config->forceLoadObjC) {
       if (file->getArchive().hasSymbolTable()) {
@@ -2492,8 +2480,6 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
       StringRef sectName = arg->getValue(1);
       inputFiles.insert(make<OpaqueFile>(MemoryBufferRef(), segName, sectName));
     }
-
-    parseDeferredRelocations();
 
     gatherInputSections();
 

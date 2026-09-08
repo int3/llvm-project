@@ -1,15 +1,33 @@
 # REQUIRES: x86
 # RUN: rm -rf %t; split-file %s %t
 # RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/archive-foo.s -o %t/archive-foo.o
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/archive-qux.s -o %t/archive-qux.o
 # RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/archive-baz.s -o %t/archive-baz.o
-# RUN: llvm-ar rcs %t/foo.a %t/archive-foo.o
+# RUN: llvm-ar rcs %t/foo.a %t/archive-foo.o %t/archive-qux.o
+# RUN: llvm-ar csrT %t/foo-thin.a %t/archive-foo.o %t/archive-qux.o
 # RUN: llvm-ar rcs %t/baz.a %t/archive-baz.o
 # RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/foo.s -o %t/foo.o
 # RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/test.s -o %t/test.o
 
-# RUN: %lld -lSystem -force_load %t/foo.a %t/foo.o %t/test.o -o %t/test-force-load-first
+# RUN: %lld -lSystem -force_load %t/foo.a %t/foo.o %t/test.o -o %t/test-force-load-first --threads=1
 # FORCE-LOAD-FIRST:  __TEXT,archive _foo
 # RUN: llvm-objdump --syms %t/test-force-load-first | FileCheck %s --check-prefix=FORCE-LOAD-FIRST
+
+## Eager archive preparation must publish archive members in their original
+## order when the normal linker parallel strategy has multiple threads.
+# RUN: %lld -lSystem -force_load %t/foo.a %t/foo.o %t/test.o -o %t/test-force-load-workers --threads=2
+# RUN: llvm-objdump --syms %t/test-force-load-workers | FileCheck %s --check-prefix=FORCE-LOAD-WORKERS
+# FORCE-LOAD-WORKERS:      __TEXT,archive _foo
+# FORCE-LOAD-WORKERS-NEXT: __TEXT,archive2 _qux
+# RUN: %lld -lSystem -force_load %t/foo.a %t/foo.o %t/test.o -o %t/test-force-load-workers4 --threads=4
+# RUN: llvm-objdump --syms %t/test-force-load-workers4 | FileCheck %s --check-prefix=FORCE-LOAD-WORKERS
+
+## Thin Archive::Child buffers are acquired serially before parallel object
+## preparation, because fetching a thin member appends to the parent archive.
+# RUN: %lld -lSystem -force_load %t/foo-thin.a %t/test.o -o %t/test-force-load-thin --threads=2
+# RUN: llvm-objdump --syms %t/test-force-load-thin | FileCheck %s --check-prefix=THIN
+# THIN:      __TEXT,archive _foo
+# THIN-NEXT: __TEXT,archive2 _qux
 
 # RUN: %lld %t/foo.o -lSystem -force_load %t/foo.a %t/test.o -o %t/test-force-load-second
 # RUN: llvm-objdump --syms %t/test-force-load-second | FileCheck %s --check-prefix=FORCE-LOAD-SECOND
@@ -54,6 +72,19 @@
 .weak_definition _foo
 _foo:
 _bar:
+
+## Exercise object-local C-string splitting and relocations in the eager
+## preparation path. Publication remains ordered by the archive member list.
+.section __TEXT,__cstring,cstring_literals
+L_archive_string:
+  .asciz "archive string"
+.section __DATA,__data
+  .quad L_archive_string
+
+#--- archive-qux.s
+.section __TEXT,archive2
+.globl _qux
+_qux:
 
 #--- archive-baz.s
 .section __TEXT,archive

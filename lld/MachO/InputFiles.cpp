@@ -75,6 +75,7 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/TarWriter.h"
 #include "llvm/Support/TimeProfiler.h"
+#include "llvm/Support/xxhash.h"
 #include "llvm/TextAPI/Architecture.h"
 #include "llvm/TextAPI/InterfaceFile.h"
 
@@ -323,6 +324,144 @@ static std::optional<size_t> getRecordSize(StringRef segname, StringRef name) {
   return {};
 }
 
+class ObjFile::Prepared {
+public:
+  struct Relocation {
+    relocation_info info;
+    std::optional<int64_t> embeddedAddend;
+  };
+
+  struct Section {
+    std::vector<StringPiece> literalPieces;
+    bool literalPiecesPrepared = false;
+    // Fixed-size records can be split without creating InputSections. The
+    // publication thread creates those sections in input order below.
+    std::vector<std::pair<uint64_t, uint64_t>> recordSubsections;
+    bool recordSubsectionsPrepared = false;
+    std::vector<Relocation> relocations;
+  };
+
+  std::vector<Section> sections;
+};
+
+template <class LP>
+static std::unique_ptr<ObjFile::Prepared>
+prepareObjectForPublication(MemoryBufferRef mb) {
+  using Header = typename LP::mach_header;
+  using SegmentCommand = typename LP::segment_command;
+  using SectionHeader = typename LP::section;
+
+  auto prepared = std::make_unique<ObjFile::Prepared>();
+  const auto *buf = reinterpret_cast<const uint8_t *>(mb.getBufferStart());
+  if (mb.getBufferSize() < sizeof(Header))
+    return prepared;
+  const auto *hdr = reinterpret_cast<const Header *>(buf);
+  if (hdr->magic != LP::magic)
+    return prepared;
+
+  if (hdr->sizeofcmds > mb.getBufferSize() - sizeof(Header))
+    return prepared;
+  const uint8_t *commands = buf + sizeof(Header);
+  const uint8_t *commandsEnd = commands + hdr->sizeofcmds;
+  const load_command *segmentCommand = nullptr;
+  for (uint32_t index = 0; index != hdr->ncmds; ++index) {
+    if (size_t(commandsEnd - commands) < sizeof(load_command))
+      return prepared;
+    const auto *command = reinterpret_cast<const load_command *>(commands);
+    if (command->cmdsize < sizeof(load_command) ||
+        command->cmdsize > size_t(commandsEnd - commands))
+      return prepared;
+    if (command->cmd == LP::segmentLCType && !segmentCommand)
+      segmentCommand = command;
+    commands += command->cmdsize;
+  }
+  if (!segmentCommand ||
+      segmentCommand->cmdsize < sizeof(SegmentCommand))
+    return prepared;
+  const auto *segment = reinterpret_cast<const SegmentCommand *>(segmentCommand);
+  uint64_t sectionBytes = uint64_t(segment->nsects) * sizeof(SectionHeader);
+  if (sectionBytes > segmentCommand->cmdsize - sizeof(SegmentCommand))
+    return prepared;
+  ArrayRef<SectionHeader> headers{
+      reinterpret_cast<const SectionHeader *>(segment + 1), segment->nsects};
+  prepared->sections.resize(headers.size());
+
+  auto inBuffer = [&](uint64_t offset, uint64_t size) {
+    return offset <= mb.getBufferSize() && size <= mb.getBufferSize() - offset;
+  };
+  for (size_t index = 0; index != headers.size(); ++index) {
+    const SectionHeader &sec = headers[index];
+    ObjFile::Prepared::Section &section = prepared->sections[index];
+    StringRef name(sec.sectname, strnlen(sec.sectname, sizeof(sec.sectname)));
+    StringRef segname(sec.segname, strnlen(sec.segname, sizeof(sec.segname)));
+
+    if (sec.align < 32 &&
+        (isZeroFill(sec.flags) || inBuffer(sec.offset, sec.size))) {
+      ArrayRef<uint8_t> data = {
+          isZeroFill(sec.flags) ? nullptr : buf + sec.offset,
+          static_cast<size_t>(sec.size)};
+      if (sectionType(sec.flags) == S_CSTRING_LITERALS && !sec.nreloc) {
+        bool dedupLiterals =
+            name == section_names::objcMethname || config->dedupStrings;
+        StringRef strings = toStringRef(data);
+        size_t offset = 0;
+        bool complete = true;
+        while (!strings.empty()) {
+          size_t end = strings.find(0);
+          if (end == StringRef::npos) {
+            // Let the ordered parser diagnose malformed literals exactly as it
+            // did before. Do not publish an incomplete prepared result.
+            section.literalPieces.clear();
+            complete = false;
+            break;
+          }
+          section.literalPieces.emplace_back(
+              offset, dedupLiterals ? xxh3_64bits(strings.take_front(end)) : 0);
+          size_t size = end + 1;
+          strings = strings.substr(size);
+          offset += size;
+        }
+        section.literalPiecesPrepared = complete;
+      } else if (auto recordSize = getRecordSize(segname, name)) {
+        section.recordSubsectionsPrepared = true;
+        for (uint64_t offset = 0; offset < data.size(); offset += *recordSize)
+          section.recordSubsections.emplace_back(
+              offset, std::min<uint64_t>(data.size() - offset, *recordSize));
+      }
+    }
+
+    uint64_t relocationBytes = uint64_t(sec.nreloc) * sizeof(relocation_info);
+    if (!sec.nreloc || !inBuffer(sec.reloff, relocationBytes))
+      continue;
+    ArrayRef<relocation_info> relocs(
+        reinterpret_cast<const relocation_info *>(buf + sec.reloff),
+        sec.nreloc);
+    section.relocations.reserve(relocs.size());
+    for (const relocation_info &reloc : relocs) {
+      ObjFile::Prepared::Relocation &preparedReloc =
+          section.relocations.emplace_back();
+      preparedReloc.info = reloc;
+      // Embedded addends only read object-local instruction bytes. Retain the
+      // original serial validation/diagnostics for malformed relocations.
+      if (reloc.r_type < target->relocAttrs.size() &&
+          !(reloc.r_address & R_SCATTERED) && reloc.r_address >= 0 &&
+          (reloc.r_length == 2 || reloc.r_length == 3) &&
+          sec.offset <= mb.getBufferSize() &&
+          uint64_t(reloc.r_address) <= mb.getBufferSize() - sec.offset &&
+          (uint64_t{1} << reloc.r_length) <=
+              mb.getBufferSize() - sec.offset - uint64_t(reloc.r_address))
+        preparedReloc.embeddedAddend =
+            target->getEmbeddedAddend(mb, sec.offset, reloc);
+    }
+  }
+  return prepared;
+}
+
+std::unique_ptr<ObjFile::Prepared> ObjFile::prepare(MemoryBufferRef mb) {
+  return target->wordSize == 8 ? prepareObjectForPublication<LP64>(mb)
+                               : prepareObjectForPublication<ILP32>(mb);
+}
+
 static Error parseCallGraph(ArrayRef<uint8_t> data,
                             std::vector<CallGraphEntry> &callGraph) {
   TimeTraceScope timeScope("Parsing call graph section");
@@ -344,11 +483,17 @@ static Error parseCallGraph(ArrayRef<uint8_t> data,
 // Parse the sequence of sections within a single LC_SEGMENT(_64).
 // Split each section into subsections.
 template <class SectionHeader>
-void ObjFile::parseSections(ArrayRef<SectionHeader> sectionHeaders) {
+void ObjFile::parseSections(ArrayRef<SectionHeader> sectionHeaders,
+                            const Prepared *prepared) {
   sections.reserve(sectionHeaders.size());
   auto *buf = reinterpret_cast<const uint8_t *>(mb.getBufferStart());
 
-  for (const SectionHeader &sec : sectionHeaders) {
+  for (size_t index = 0; index != sectionHeaders.size(); ++index) {
+    const SectionHeader &sec = sectionHeaders[index];
+    const Prepared::Section *preparedSection =
+        prepared && index < prepared->sections.size()
+            ? &prepared->sections[index]
+            : nullptr;
     StringRef name =
         StringRef(sec.sectname, strnlen(sec.sectname, sizeof(sec.sectname)));
     StringRef segname =
@@ -369,11 +514,21 @@ void ObjFile::parseSections(ArrayRef<SectionHeader> sectionHeaders) {
       if (data.empty())
         return;
       Subsections &subsections = section.subsections;
-      subsections.reserve(data.size() / recordSize);
-      for (uint64_t off = 0; off < data.size(); off += recordSize) {
+      if (preparedSection && preparedSection->recordSubsectionsPrepared)
+        subsections.reserve(preparedSection->recordSubsections.size());
+      else
+        subsections.reserve(data.size() / recordSize);
+      auto add = [&](uint64_t off, uint64_t size) {
         auto *isec = make<ConcatInputSection>(
-            section, data.slice(off, std::min(data.size(), recordSize)), align);
+            section, data.slice(off, size), align);
         subsections.push_back({off, isec});
+      };
+      if (preparedSection && preparedSection->recordSubsectionsPrepared) {
+        for (auto [off, size] : preparedSection->recordSubsections)
+          add(off, size);
+      } else {
+        for (uint64_t off = 0; off < data.size(); off += recordSize)
+          add(off, std::min<uint64_t>(data.size() - off, recordSize));
       }
       section.doneSplitting = true;
     };
@@ -386,8 +541,11 @@ void ObjFile::parseSections(ArrayRef<SectionHeader> sectionHeaders) {
           name == section_names::objcMethname || config->dedupStrings;
       InputSection *isec =
           make<CStringInputSection>(section, data, align, dedupLiterals);
-      // FIXME: parallelize this?
-      cast<CStringInputSection>(isec)->splitIntoPieces();
+      auto *cstring = cast<CStringInputSection>(isec);
+      if (preparedSection && preparedSection->literalPiecesPrepared)
+        cstring->setPreparedPieces(preparedSection->literalPieces);
+      else
+        cstring->splitIntoPieces();
       section.subsections.push_back({0, isec});
     } else if (isWordLiteralSection(sec.flags)) {
       if (sec.nreloc)
@@ -541,14 +699,31 @@ static bool validateRelocationInfo(InputFile *file, const SectionHeader &sec,
 
 template <class SectionHeader>
 void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
-                               const SectionHeader &sec, Section &section) {
+                               const SectionHeader &sec, Section &section,
+                               size_t sectionIndex, const Prepared *prepared) {
   auto *buf = reinterpret_cast<const uint8_t *>(mb.getBufferStart());
-  ArrayRef<relocation_info> relInfos(
+  ArrayRef<relocation_info> rawRelocs(
       reinterpret_cast<const relocation_info *>(buf + sec.reloff), sec.nreloc);
+  const std::vector<Prepared::Relocation> *preparedRelocs = nullptr;
+  if (prepared && sectionIndex < prepared->sections.size() &&
+      prepared->sections[sectionIndex].relocations.size() == sec.nreloc)
+    preparedRelocs = &prepared->sections[sectionIndex].relocations;
+  size_t relocCount = preparedRelocs ? preparedRelocs->size() : rawRelocs.size();
+  auto relocationAt = [&](size_t index) -> relocation_info {
+    return preparedRelocs ? (*preparedRelocs)[index].info : rawRelocs[index];
+  };
+  auto embeddedAddendAt = [&](size_t index, relocation_info reloc) {
+    if (preparedRelocs) {
+      if (std::optional<int64_t> addend =
+              (*preparedRelocs)[index].embeddedAddend)
+        return *addend;
+    }
+    return target->getEmbeddedAddend(mb, sec.offset, reloc);
+  };
 
   Subsections &subsections = section.subsections;
   auto subsecIt = subsections.rbegin();
-  for (size_t i = 0; i < relInfos.size(); i++) {
+  for (size_t i = 0; i < relocCount; i++) {
     // Paired relocations serve as Mach-O's method for attaching a
     // supplemental datum to a primary relocation record. ELF does not
     // need them because the *_RELOC_RELA records contain the extra
@@ -573,21 +748,21 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
     // insert them. Storing addends in the instruction stream is possible, but
     // inconvenient and more costly at link time.
 
-    relocation_info relInfo = relInfos[i];
+    relocation_info relInfo = relocationAt(i);
     bool isSubtrahend =
         target->hasAttr(relInfo.r_type, RelocAttrBits::SUBTRAHEND);
     int64_t pairedAddend = 0;
     if (target->hasAttr(relInfo.r_type, RelocAttrBits::ADDEND)) {
       pairedAddend = SignExtend64<24>(relInfo.r_symbolnum);
-      relInfo = relInfos[++i];
+      relInfo = relocationAt(++i);
     }
-    assert(i < relInfos.size());
+    assert(i < relocCount);
     if (!validateRelocationInfo(this, sec, relInfo))
       continue;
     if (relInfo.r_address & R_SCATTERED)
       fatal("TODO: Scattered relocations not supported");
 
-    int64_t embeddedAddend = target->getEmbeddedAddend(mb, sec.offset, relInfo);
+    int64_t embeddedAddend = embeddedAddendAt(i, relInfo);
     assert(!(embeddedAddend && pairedAddend));
     int64_t totalAddend = pairedAddend + embeddedAddend;
     Relocation r;
@@ -643,7 +818,7 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
     subsec->relocs.push_back(r);
 
     if (isSubtrahend) {
-      relocation_info minuendInfo = relInfos[++i];
+      relocation_info minuendInfo = relocationAt(++i);
       // SUBTRACTOR relocations should always be followed by an UNSIGNED one
       // attached to the same address.
       assert(target->hasAttr(minuendInfo.r_type, RelocAttrBits::UNSIGNED) &&
@@ -1025,6 +1200,12 @@ SmallVector<StringRef> macho::unprocessedLCLinkerOptions;
 ObjFile::ObjFile(MemoryBufferRef mb, uint32_t modTime, StringRef archiveName,
                  bool lazy, bool forceHidden, bool compatArch,
                  bool builtFromBitcode)
+    : ObjFile(mb, modTime, archiveName, lazy, forceHidden, compatArch,
+              builtFromBitcode, nullptr) {}
+
+ObjFile::ObjFile(MemoryBufferRef mb, uint32_t modTime, StringRef archiveName,
+                 bool lazy, bool forceHidden, bool compatArch,
+                 bool builtFromBitcode, std::unique_ptr<Prepared> prepared)
     : InputFile(ObjKind, mb, lazy), modTime(modTime), forceHidden(forceHidden),
       builtFromBitcode(builtFromBitcode) {
   this->archiveName = std::string(archiveName);
@@ -1036,18 +1217,13 @@ ObjFile::ObjFile(MemoryBufferRef mb, uint32_t modTime, StringRef archiveName,
       parseLazy<ILP32>();
   } else {
     if (target->wordSize == 8)
-      parse<LP64>();
+      parse<LP64>(prepared.get());
     else
-      parse<ILP32>();
+      parse<ILP32>(prepared.get());
   }
 }
 
-static bool isUnwindSection(const Section &sec) {
-  return sec.name == section_names::compactUnwind ||
-         sec.name == section_names::ehFrame;
-}
-
-template <class LP> void ObjFile::parse() {
+template <class LP> void ObjFile::parse(const Prepared *prepared) {
   using Header = typename LP::mach_header;
   using SegmentCommand = typename LP::segment_command;
   using SectionHeader = typename LP::section;
@@ -1073,7 +1249,7 @@ template <class LP> void ObjFile::parse() {
     auto *c = reinterpret_cast<const SegmentCommand *>(cmd);
     sectionHeaders = ArrayRef<SectionHeader>{
         reinterpret_cast<const SectionHeader *>(c + 1), c->nsects};
-    parseSections(sectionHeaders);
+    parseSections(sectionHeaders, prepared);
   }
 
   // TODO: Error on missing LC_SYMTAB?
@@ -1091,13 +1267,10 @@ template <class LP> void ObjFile::parse() {
 
   // The relocations may refer to the symbols, so we parse them after we have
   // parsed all the symbols.
-  //
-  // Parse sections that are consumed by registerCompactUnwind() and
-  // registerEhFrames() immediately. The rest can be deferred to be done in
-  // parallel.
   for (size_t i = 0, n = sections.size(); i < n; ++i)
-    if (!sections[i]->subsections.empty() && isUnwindSection(*sections[i]))
-      parseRelocations(sectionHeaders, sectionHeaders[i], *sections[i]);
+    if (!sections[i]->subsections.empty())
+      parseRelocations(sectionHeaders, sectionHeaders[i], *sections[i], i,
+                       prepared);
 
   parseDebugInfo();
 
@@ -1116,6 +1289,8 @@ template <class LP> void ObjFile::parse() {
   if (ehFrameSection)
     registerEhFrames(*ehFrameSection);
 }
+
+template <class LP> void ObjFile::parse() { parse<LP>(nullptr); }
 
 template <class LP> void ObjFile::parseLazy() {
   using Header = typename LP::mach_header;
@@ -1171,41 +1346,6 @@ void ObjFile::parseDebugInfo() {
   // PR48637.
   auto it = units.begin();
   compileUnit = it != units.end() ? it->get() : nullptr;
-}
-
-template <class LP> void ObjFile::parseDeferredRelocationsImpl() {
-  using Header = typename LP::mach_header;
-  using SegmentCommand = typename LP::segment_command;
-  using SectionHeader = typename LP::section;
-
-  auto *hdr = reinterpret_cast<const Header *>(mb.getBufferStart());
-  const load_command *cmd = findCommand(hdr, LP::segmentLCType);
-  if (!cmd)
-    return;
-  auto *c = reinterpret_cast<const SegmentCommand *>(cmd);
-  ArrayRef<SectionHeader> sectionHeaders{
-      reinterpret_cast<const SectionHeader *>(c + 1), c->nsects};
-
-  // Mirroring section filter in parse() since we already parsed unwind
-  // sections.
-  for (size_t i = 0, n = sections.size(); i < n; ++i)
-    if (!sections[i]->subsections.empty() && !isUnwindSection(*sections[i]))
-      parseRelocations(sectionHeaders, sectionHeaders[i], *sections[i]);
-}
-
-void ObjFile::parseDeferredRelocations() {
-  if (target->wordSize == 8)
-    parseDeferredRelocationsImpl<LP64>();
-  else
-    parseDeferredRelocationsImpl<ILP32>();
-}
-
-void macho::parseDeferredRelocations() {
-  TimeTraceScope timeScope("Parse relocations");
-  parallelForEach(inputFiles, [](InputFile *file) {
-    if (auto *objFile = dyn_cast<ObjFile>(file))
-      objFile->parseDeferredRelocations();
-  });
 }
 
 ArrayRef<data_in_code_entry> ObjFile::getDataInCode() const {
@@ -2674,14 +2814,16 @@ void ArchiveFile::addLazySymbols() {
 static Expected<InputFile *>
 loadArchiveMember(MemoryBufferRef mb, uint32_t modTime, StringRef archiveName,
                   uint64_t offsetInArchive, bool forceHidden, bool compatArch,
-                  bool lazy) {
+                  bool lazy,
+                  std::unique_ptr<ObjFile::Prepared> prepared = nullptr) {
   if (config->zeroModTime)
     modTime = 0;
 
   switch (identify_magic(mb.getBuffer())) {
   case file_magic::macho_object:
     return make<ObjFile>(mb, modTime, archiveName, lazy, forceHidden,
-                         compatArch);
+                         compatArch, /*builtFromBitcode=*/false,
+                         std::move(prepared));
   case file_magic::bitcode:
     return make<BitcodeFile>(mb, archiveName, offsetInArchive, lazy,
                              forceHidden, compatArch);
@@ -2702,6 +2844,84 @@ Error ArchiveFile::fetch(const object::Archive::Child &c, StringRef reason) {
   inputFiles.insert(*file);
   printArchiveMemberLoad(reason, *file);
   return Error::success();
+}
+
+void ArchiveFile::fetchAllMembers(StringRef reason) {
+  // Archive::Child::getMemoryBufferRef() appends thin-member buffers to the
+  // parent archive, so acquire every buffer and timestamp before dispatching
+  // object-local preparation. Publication stays below in archive order.
+  SmallVector<object::Archive::Child> children;
+  Error childError = Error::success();
+  for (const object::Archive::Child &c : file->children(childError))
+    children.push_back(c);
+
+  struct PreparedArchiveMember {
+    uint64_t offset;
+    std::optional<MemoryBufferRef> buffer;
+    uint32_t modTime = 0;
+    std::unique_ptr<ObjFile::Prepared> object;
+    std::string error;
+  };
+  std::vector<PreparedArchiveMember> prepared(children.size());
+
+  for (size_t index = 0; index != children.size(); ++index) {
+    PreparedArchiveMember &member = prepared[index];
+    const object::Archive::Child &child = children[index];
+    member.offset = child.getChildOffset();
+    Expected<MemoryBufferRef> buffer = child.getMemoryBufferRef();
+    if (!buffer) {
+      member.error = toString(buffer.takeError());
+      continue;
+    }
+    Expected<TimePoint<std::chrono::seconds>> modTime = child.getLastModified();
+    if (!modTime) {
+      member.error = toString(modTime.takeError());
+      continue;
+    }
+    member.buffer = *buffer;
+    member.modTime = toTimeT(*modTime);
+  }
+
+  // Use the regular linker parallel strategy, independently of the optional
+  // --read-workers page-in setting. --threads=1 runs this loop serially.
+  llvm::parallelFor(size_t(0), prepared.size(), [&](size_t index) {
+    PreparedArchiveMember &member = prepared[index];
+    if (member.buffer &&
+        identify_magic(member.buffer->getBuffer()) == file_magic::macho_object)
+      member.object = ObjFile::prepare(*member.buffer);
+  });
+
+  for (PreparedArchiveMember &member : prepared) {
+    // fetch() marks a member seen before attempting to read it. Preserve that
+    // behavior for a member whose parallel preparation failed.
+    if (!seen.insert(member.offset).second)
+      continue;
+    if (!member.buffer) {
+      if (config->warnThinArchiveMissingMembers)
+        warn(toString(this) + ": " + reason +
+             " failed to load archive member: " + member.error);
+      continue;
+    }
+
+    Expected<InputFile *> memberFile = loadArchiveMember(
+        *member.buffer, member.modTime, getName(), member.offset, forceHidden,
+        compatArch, /*lazy=*/false, std::move(member.object));
+    if (!memberFile) {
+      if (config->warnThinArchiveMissingMembers)
+        warn(toString(this) + ": " + reason +
+             " failed to load archive member: " +
+             toString(memberFile.takeError()));
+      else
+        llvm::consumeError(memberFile.takeError());
+      continue;
+    }
+    inputFiles.insert(*memberFile);
+    printArchiveMemberLoad(reason, *memberFile);
+  }
+
+  if (childError)
+    error(toString(this) +
+          ": Archive::children failed: " + toString(std::move(childError)));
 }
 
 void ArchiveFile::fetch(const object::Archive::Symbol &sym) {
