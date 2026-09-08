@@ -17,6 +17,8 @@
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/MathExtras.h"
 
+#include <atomic>
+
 namespace lld {
 namespace macho {
 
@@ -49,7 +51,7 @@ public:
 
   StringRef getName() const { return {nameData, nameSize}; }
 
-  bool isLive() const { return used; }
+  bool isLive() const { return used.load(std::memory_order_relaxed); }
   bool isLazy() const {
     return symbolKind == LazyArchiveKind || symbolKind == LazyObjectKind;
   }
@@ -109,7 +111,7 @@ public:
   bool isUsedInRegularObj : 1;
 
   // True if this symbol is used from a live section.
-  bool used : 1;
+  std::atomic_bool used;
 };
 
 class Defined : public Symbol {
@@ -377,10 +379,11 @@ T *replaceSymbol(Symbol *s, ArgT &&...arg) {
          "Not a Symbol");
 
   bool isUsedInRegularObj = s->isUsedInRegularObj;
-  bool used = s->used;
+  bool used = s->used.load(std::memory_order_relaxed);
   T *sym = new (s) T(std::forward<ArgT>(arg)...);
   sym->isUsedInRegularObj |= isUsedInRegularObj;
-  sym->used |= used;
+  if (used)
+    sym->used.store(true, std::memory_order_relaxed);
   return sym;
 }
 

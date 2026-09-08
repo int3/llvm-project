@@ -21,6 +21,8 @@
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/BinaryFormat/MachO.h"
 
+#include <atomic>
+
 namespace lld {
 namespace macho {
 
@@ -116,12 +118,22 @@ public:
   ConcatInputSection(const Section &section, ArrayRef<uint8_t> data,
                      uint32_t align = 1)
       : InputSection(ConcatKind, section, data, align) {}
+  ConcatInputSection(const ConcatInputSection &other)
+      : InputSection(other), replacement(other.replacement),
+        icfEqClass{other.icfEqClass[0], other.icfEqClass[1]},
+        wasCoalesced(other.wasCoalesced),
+        live(other.live.load(std::memory_order_relaxed)),
+        outSecOff(other.outSecOff) {}
 
   uint64_t getOffset(uint64_t off) const override { return outSecOff + off; }
   uint64_t getVA() const { return InputSection::getVA(0); }
   // ConcatInputSections are entirely live or dead, so the offset is irrelevant.
-  bool isLive(uint64_t off) const override { return live; }
-  void markLive(uint64_t off) override { live = true; }
+  bool isLive(uint64_t off) const override {
+    return live.load(std::memory_order_relaxed);
+  }
+  void markLive(uint64_t off) override {
+    live.store(true, std::memory_order_relaxed);
+  }
   bool isCoalescedWeak() const { return wasCoalesced && symbols.empty(); }
   bool shouldOmitFromOutput() const { return !live || isCoalescedWeak(); }
   void writeTo(uint8_t *buf);
@@ -150,7 +162,7 @@ public:
   // while all copies in other translation units are coalesced into the
   // first and not copied to the output.
   bool wasCoalesced = false;
-  bool live = !config->deadStrip;
+  std::atomic_bool live = !config->deadStrip;
   // This variable has two usages. Initially, it represents the input order.
   // After assignAddresses is called, it represents the offset from the
   // beginning of the output section this section was assigned to.

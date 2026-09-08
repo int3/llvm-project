@@ -4,6 +4,9 @@
 
 # RUN: llvm-mc -filetype=obj -triple=x86_64-apple-macos \
 # RUN:     %t/basics.s -o %t/basics.o
+# RUN: %lld -lSystem -dead_strip --threads=1 -no_uuid %t/basics.o -o %t/basics-threads1
+# RUN: %lld -lSystem -dead_strip --threads=4 -no_uuid %t/basics.o -o %t/basics-threads4
+# RUN: cmp %t/basics-threads1 %t/basics-threads4
 
 ## Check that .private_extern symbols are marked as local in the symbol table
 ## and aren't in the export trie.
