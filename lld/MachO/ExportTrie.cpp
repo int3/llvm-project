@@ -282,7 +282,27 @@ tailcall:
     // This is the tail-call-optimized version of the following:
     // sortAndBuild(vec.slice(i, j - i), node, lastPos, pos + 1);
     vec = vec.slice(i, j - i);
-    ++pos;
+    // A multi-symbol partition with no less/greater sides has a common
+    // non-terminal byte at pos. Scan its remaining common prefix at once
+    // rather than revisiting every symbol for each byte. Stop before 0xff:
+    // charAt() treats that signed byte as its end sentinel.
+    if (!isTerminal && !prefixesDiverge && vec.size() > 1) {
+      StringRef firstName = vec.front()->getName();
+      size_t commonEnd = firstName.size();
+      for (const Symbol *sym : vec.drop_front()) {
+        StringRef name = sym->getName();
+        commonEnd = std::min(commonEnd, name.size());
+        size_t commonPos = pos + 1;
+        while (commonPos < commonEnd &&
+               static_cast<unsigned char>(firstName[commonPos]) != 0xff &&
+               firstName[commonPos] == name[commonPos])
+          ++commonPos;
+        commonEnd = commonPos;
+      }
+      pos = commonEnd;
+    } else {
+      ++pos;
+    }
     goto tailcall;
   }
 }

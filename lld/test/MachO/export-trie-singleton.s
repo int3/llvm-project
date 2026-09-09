@@ -12,6 +12,9 @@
 # CHECK-DAG: _shared_prefix_for_fast_trie_right_suffix{{$}}
 # CHECK-DAG: _foo{{$}}
 # CHECK-DAG: _foobar{{$}}
+# CHECK-DAG: _rust_export_trie_common_prefix_alphabet{{$}}
+# CHECK-DAG: _rust_export_trie_common_prefix_alpine{{$}}
+# CHECK-DAG: _rust_export_trie_common_prefix_beta{{$}}
 # CHECK-DAG: _weak_singleton_export [weak_def]{{$}}
 
 .text
@@ -33,6 +36,20 @@ _foo:
 
 .globl _foobar
 _foobar:
+  ret
+
+# Exercise a multi-symbol common prefix with branching at two distinct
+# suffix positions. Their definition order is deliberately not lexical.
+.globl _rust_export_trie_common_prefix_beta
+_rust_export_trie_common_prefix_beta:
+  ret
+
+.globl _rust_export_trie_common_prefix_alpine
+_rust_export_trie_common_prefix_alpine:
+  ret
+
+.globl _rust_export_trie_common_prefix_alphabet
+_rust_export_trie_common_prefix_alphabet:
   ret
 
 .globl _weak_singleton_export
