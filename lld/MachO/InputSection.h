@@ -232,8 +232,6 @@ public:
   const StringPiece &getStringPiece(uint64_t off) const;
   // Split at each null byte.
   void splitIntoPieces();
-  // Uses object-local literal splitting done before ordered publication.
-  void setPreparedPieces(std::vector<StringPiece> prepared);
 
   LLVM_ATTRIBUTE_ALWAYS_INLINE
   StringRef getStringRef(size_t i) const {

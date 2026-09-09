@@ -25,7 +25,6 @@
 #include "llvm/Support/Threading.h"
 #include "llvm/TextAPI/TextAPIReader.h"
 
-#include <memory>
 #include <vector>
 
 namespace llvm {
@@ -116,8 +115,8 @@ public:
   virtual ~InputFile() = default;
   Kind kind() const { return fileKind; }
   StringRef getName() const { return name; }
-  bool isCompatible() const { return compatArch; }
   static void resetIdCount() { idCount = 0; }
+  bool isCompatible() const { return compatArch; }
 
   MemoryBufferRef mb;
 
@@ -161,17 +160,9 @@ struct FDE {
 // .o file
 class ObjFile final : public InputFile {
 public:
-  class Prepared;
-
   ObjFile(MemoryBufferRef mb, uint32_t modTime, StringRef archiveName,
           bool lazy = false, bool forceHidden = false, bool compatArch = true,
           bool builtFromBitcode = false);
-  ObjFile(MemoryBufferRef mb, uint32_t modTime, StringRef archiveName,
-          bool lazy, bool forceHidden, bool compatArch, bool builtFromBitcode,
-          std::unique_ptr<Prepared> prepared);
-  // Collects object-local data that can be parsed before this object publishes
-  // sections, symbols, or diagnostics to linker-global state.
-  static std::unique_ptr<Prepared> prepare(MemoryBufferRef mb);
   void parseRegularRelocations();
   ArrayRef<llvm::MachO::data_in_code_entry> getDataInCode() const;
   ArrayRef<uint8_t> getOptimizationHints() const;
@@ -199,11 +190,9 @@ public:
 
 private:
   llvm::once_flag initDwarf;
-  template <class LP> void parse(Prepared *prepared);
   template <class LP> void parseRegularRelocations();
   template <class LP> void parseLazy();
-  template <class SectionHeader>
-  void parseSections(ArrayRef<SectionHeader>, Prepared *prepared);
+  template <class SectionHeader> void parseSections(ArrayRef<SectionHeader>);
   template <class LP>
   void parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
                     ArrayRef<typename LP::nlist> nList, const char *strtab,
@@ -303,9 +292,6 @@ public:
   explicit ArchiveFile(std::unique_ptr<llvm::object::Archive> &&file,
                        bool forceHidden);
   void addLazySymbols();
-  // Prepares eager archive members with the regular linker thread strategy,
-  // but publishes them in archive order on the main thread.
-  void fetchAllMembers(llvm::StringRef reason);
   void fetch(const llvm::object::Archive::Symbol &);
   // LLD normally doesn't use Error for error-handling, but the underlying
   // Archive library does, so this is the cleanest way to wrap it.
