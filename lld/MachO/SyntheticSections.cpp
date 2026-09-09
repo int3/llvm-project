@@ -1271,26 +1271,94 @@ void SymtabSection::emitStabs() {
 
   llvm::stable_sort(symbolsNeedingStabs, llvm::less_second());
 
-  // Decode each contributing object source path before serial STABS
-  // publication. sourceFile() only consults DWARF data owned by that object,
-  // so these independent decodes can run concurrently while preserving the
-  // existing sorted file order for emission.
+  // Group the ordered symbols by object. The records in each group can be
+  // constructed independently; source and object path strings still have to
+  // be interned in this order below.
   struct SourceFile {
     ObjFile *file;
+    size_t begin;
+    size_t end;
     std::string path;
+    std::vector<StabsEntry> stabs;
   };
   std::vector<SourceFile> sourceFiles;
-  bool hasPreviousFileId = false;
-  int previousFileId = 0;
-  for (const SortingPair &pair : symbolsNeedingStabs) {
-    if (hasPreviousFileId && pair.second == previousFileId)
-      continue;
-    previousFileId = pair.second;
-    hasPreviousFileId = true;
-    Defined *defined = cast<Defined>(pair.first->sym);
+  for (size_t begin = 0; begin < symbolsNeedingStabs.size();) {
+    size_t end = begin + 1;
+    while (end < symbolsNeedingStabs.size() &&
+           symbolsNeedingStabs[end].second == symbolsNeedingStabs[begin].second)
+      ++end;
+    Defined *defined = cast<Defined>(symbolsNeedingStabs[begin].first->sym);
     ObjFile *file = cast<ObjFile>(defined->originalIsec->getFile());
-    sourceFiles.push_back({file, {}});
+    sourceFiles.push_back({file, begin, end, {}, {}});
+    begin = end;
   }
+
+  if (config->dedupSymbolStrings) {
+    auto buildStabs = [&](SourceFile &sourceFile) {
+      sourceFile.path = sourceFile.file->sourceFile();
+      sourceFile.stabs.reserve(2 * (sourceFile.end - sourceFile.begin));
+      for (size_t i = sourceFile.begin; i != sourceFile.end; ++i) {
+        const SymtabEntry &entry = *symbolsNeedingStabs[i].first;
+        Defined *defined = cast<Defined>(entry.sym);
+        InputSection *isec = defined->originalIsec;
+
+        StabsEntry symStab;
+        symStab.sect = isec->parent->index;
+        symStab.strx = entry.strx;
+        if (defined->identicalCodeFoldingKind == Symbol::ICFFoldKind::Thunk)
+          symStab.value = getBodyForThunkFoldedSym(defined)->getVA();
+        else
+          symStab.value = defined->getVA();
+
+        if (isCodeSection(isec)) {
+          symStab.type = N_FUN;
+          sourceFile.stabs.emplace_back(std::move(symStab));
+          StabsEntry endFunStab(N_FUN);
+          if (defined->identicalCodeFoldingKind == Symbol::ICFFoldKind::Thunk)
+            endFunStab.value = getBodyForThunkFoldedSym(defined)->size;
+          else
+            endFunStab.value = defined->size;
+          sourceFile.stabs.emplace_back(std::move(endFunStab));
+        } else {
+          symStab.type = defined->isExternal() ? N_GSYM : N_STSYM;
+          sourceFile.stabs.emplace_back(std::move(symStab));
+        }
+      }
+    };
+
+    // Avoid creating worker tasks for the small links where their setup is
+    // more expensive than the short serial loop.
+    if (sourceFiles.size() < 4)
+      for (SourceFile &sourceFile : sourceFiles)
+        buildStabs(sourceFile);
+    else
+      parallelForEach(sourceFiles, buildStabs);
+
+    size_t numStabs = stabs.size() + sourceFiles.size() * 3;
+    if (sourceFiles.empty() && !stabs.empty())
+      ++numStabs;
+    for (const SourceFile &sourceFile : sourceFiles)
+      numStabs += sourceFile.stabs.size();
+    stabs.reserve(numStabs);
+    for (size_t i = 0; i != sourceFiles.size(); ++i) {
+      if (i != 0)
+        emitEndSourceStab();
+      SourceFile &sourceFile = sourceFiles[i];
+      emitBeginSourceStab(sourceFile.path);
+      emitObjectFileStab(sourceFile.file);
+      stabs.insert(stabs.end(),
+                   std::make_move_iterator(sourceFile.stabs.begin()),
+                   std::make_move_iterator(sourceFile.stabs.end()));
+      std::vector<StabsEntry>().swap(sourceFile.stabs);
+    }
+
+    if (!stabs.empty())
+      emitEndSourceStab();
+    return;
+  }
+
+  // Keep the non-deduplicated path serial: its symbol strings are appended
+  // between the source/object entries and must retain that exact order.
   parallelForEach(sourceFiles, [](SourceFile &sourceFile) {
     sourceFile.path = sourceFile.file->sourceFile();
   });
