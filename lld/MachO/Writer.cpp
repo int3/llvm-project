@@ -701,52 +701,116 @@ static void prepareSymbolRelocation(Symbol *sym, const InputSection *isec,
   }
 }
 
+struct RelocationEvent {
+  ConcatInputSection *isec;
+  uint32_t index;
+};
+
+static void canonicalizeReferent(Relocation &r) {
+  if (auto *referentIsec = dyn_cast_if_present<InputSection *>(r.referent))
+    r.referent = referentIsec->canonical();
+}
+
+static void replayRelocation(ConcatInputSection *isec, Relocation &r) {
+  if (auto *sym = dyn_cast_if_present<Symbol *>(r.referent)) {
+    if (auto *undefined = dyn_cast<Undefined>(sym))
+      treatUndefinedSymbol(*undefined, isec, r.offset);
+    // treatUndefinedSymbol() can replace sym with a DylibSymbol; re-check.
+    if (!isa<Undefined>(sym) && validateSymbolRelocation(sym, isec, r))
+      prepareSymbolRelocation(sym, isec, r);
+  } else if (!r.pcrel) {
+    if (config->emitChainedFixups)
+      in.chainedFixups->addRebase(isec, r.offset);
+    else
+      in.rebase->addEntry(isec, r.offset);
+  }
+}
+
+static void scanSectionRelocations(ConcatInputSection *isec) {
+  if (isec->shouldOmitFromOutput())
+    return;
+
+  for (size_t index = 0; index < isec->relocs.size(); ++index) {
+    Relocation &r = isec->relocs[index];
+    canonicalizeReferent(r);
+    if (target->hasAttr(r.type, RelocAttrBits::SUBTRAHEND)) {
+      // The following UNSIGNED relocation is only the minuend. It has no
+      // ordinary UNSIGNED semantics and must not emit a rebase opcode.
+      canonicalizeReferent(isec->relocs[++index]);
+      continue;
+    }
+    replayRelocation(isec, r);
+  }
+}
+
+static bool isCompletedRelocation(const ConcatInputSection *isec,
+                                  const Relocation &r) {
+  if (auto *sym = dyn_cast_if_present<Symbol *>(r.referent)) {
+    // Keep all cases that can diagnose or mutate global linker state in the
+    // ordered replay below.
+    if ((!isa<Defined>(sym) && !isa<DylibSymbol>(sym)) || !sym->isLive())
+      return false;
+
+    const RelocAttrs &relocAttrs = target->getRelocAttrs(r.type);
+    if (relocAttrs.hasAttr(RelocAttrBits::TLV) != sym->isTlv())
+      return false;
+    if (relocAttrs.hasAttr(RelocAttrBits::BRANCH))
+      return !needsBinding(sym);
+    if (relocAttrs.hasAttr(RelocAttrBits::GOT))
+      return !relocAttrs.hasAttr(RelocAttrBits::POINTER) &&
+             !needsBinding(sym);
+    if (relocAttrs.hasAttr(RelocAttrBits::TLV))
+      return !needsBinding(sym);
+    if (relocAttrs.hasAttr(RelocAttrBits::UNSIGNED))
+      return isThreadLocalVariables(isec->getFlags()) && isa<Defined>(sym);
+    return true;
+  }
+
+  return r.pcrel;
+}
+
 void Writer::scanRelocations() {
   TimeTraceScope timeScope("Scan relocations");
 
-  // This can't use a for-each loop: It calls treatUndefinedSymbol(), which can
-  // add to inputSections, which invalidates inputSections's iterators.
-  for (size_t i = 0; i < inputSections.size(); ++i) {
-    ConcatInputSection *isec = inputSections[i];
-
-    if (isec->shouldOmitFromOutput())
-      continue;
-
-    for (auto it = isec->relocs.begin(); it != isec->relocs.end(); ++it) {
-      Relocation &r = *it;
-
-      // Canonicalize the referent so that later accesses in Writer won't
-      // have to worry about it.
-      if (auto *referentIsec = dyn_cast_if_present<InputSection *>(r.referent))
-        r.referent = referentIsec->canonical();
-
-      if (target->hasAttr(r.type, RelocAttrBits::SUBTRAHEND)) {
-        // Skip over the following UNSIGNED relocation -- it's just there as the
-        // minuend, and doesn't have the usual UNSIGNED semantics. We don't want
-        // to emit rebase opcodes for it.
-        ++it;
-        // Canonicalize the referent so that later accesses in Writer won't
-        // have to worry about it.
-        if (auto *referentIsec = it->referent.dyn_cast<InputSection *>())
-          it->referent = referentIsec->canonical();
+  // Classify only the input sections already present. Ordered replay may add
+  // synthetic sections while resolving undefined symbols, so scan that suffix
+  // serially below.
+  const size_t initialSectionCount = inputSections.size();
+  constexpr size_t sectionsPerChunk = 128;
+  const size_t numChunks =
+      (initialSectionCount + sectionsPerChunk - 1) / sectionsPerChunk;
+  std::vector<std::vector<RelocationEvent>> events(numChunks);
+  parallelFor(0, numChunks, [&](size_t chunkIndex) {
+    const size_t begin = chunkIndex * sectionsPerChunk;
+    const size_t end = std::min(begin + sectionsPerChunk, initialSectionCount);
+    std::vector<RelocationEvent> &chunkEvents = events[chunkIndex];
+    for (size_t i = begin; i != end; ++i) {
+      ConcatInputSection *isec = inputSections[i];
+      if (isec->shouldOmitFromOutput())
         continue;
-      }
-      if (auto *sym = dyn_cast_if_present<Symbol *>(r.referent)) {
-        if (auto *undefined = dyn_cast<Undefined>(sym))
-          treatUndefinedSymbol(*undefined, isec, r.offset);
-        // treatUndefinedSymbol() can replace sym with a DylibSymbol; re-check.
-        if (!isa<Undefined>(sym) && validateSymbolRelocation(sym, isec, r))
-          prepareSymbolRelocation(sym, isec, r);
-      } else {
-        if (!r.pcrel) {
-          if (config->emitChainedFixups)
-            in.chainedFixups->addRebase(isec, r.offset);
-          else
-            in.rebase->addEntry(isec, r.offset);
+      for (size_t index = 0; index < isec->relocs.size(); ++index) {
+        Relocation &r = isec->relocs[index];
+        canonicalizeReferent(r);
+        if (target->hasAttr(r.type, RelocAttrBits::SUBTRAHEND)) {
+          canonicalizeReferent(isec->relocs[++index]);
+          continue;
         }
+        if (!isCompletedRelocation(isec, r))
+          chunkEvents.push_back({isec, static_cast<uint32_t>(index)});
       }
     }
-  }
+  });
+
+  // Replaying in section and relocation order preserves GOT/stub/binding
+  // insertion order and lets each undefined reference observe earlier symbol
+  // replacements.
+  for (const std::vector<RelocationEvent> &chunkEvents : events)
+    for (const RelocationEvent &event : chunkEvents)
+      replayRelocation(event.isec, event.isec->relocs[event.index]);
+
+  // This cannot use a range-for loop: ordered replay can append sections.
+  for (size_t i = initialSectionCount; i < inputSections.size(); ++i)
+    scanSectionRelocations(inputSections[i]);
 
   in.unwindInfo->prepare();
 }
