@@ -24,6 +24,8 @@
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <array>
+
 namespace llvm {
 class DWARFUnit;
 } // namespace llvm
@@ -429,6 +431,11 @@ public:
   StringTableSection();
   // Returns the start offset of the added string.
   uint32_t addString(StringRef);
+  // Intern the strings in input order, assigning offsets without changing the
+  // resulting string-table order. This is only used for normal symbols before
+  // serial STABS emission.
+  void addStringsInOrder(llvm::MutableArrayRef<llvm::CachedHashStringRef>,
+                         llvm::MutableArrayRef<uint32_t>);
   uint64_t getRawSize() const override { return size; }
   void writeTo(uint8_t *buf) const override;
 
@@ -439,7 +446,10 @@ private:
   // match its behavior here since some tools depend on it.
   // Consequently, the empty string will be at index 1, not zero.
   std::vector<StringRef> strings{" "};
-  llvm::DenseMap<llvm::CachedHashStringRef, uint32_t> stringMap;
+  static constexpr size_t stringMapShards = 16;
+  std::array<llvm::DenseMap<llvm::CachedHashStringRef, uint32_t>,
+             stringMapShards>
+      stringMaps;
   size_t size = 2;
 };
 

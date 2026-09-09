@@ -2,17 +2,23 @@
 
 # RUN: rm -rf %t && mkdir -p %t
 # RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin %s -o %t/input.o
-# RUN: %no-lsystem-lld -arch arm64 -dylib -oso_prefix %t/ %t/input.o -o %t/default.dylib
+# RUN: %no-lsystem-lld -arch arm64 -dylib -install_name @rpath/libtest.dylib -oso_prefix %t/ -no_uuid --threads=1 -add_ast_path _local_function -add_ast_path added.ast %t/input.o -o %t/default.dylib
 # RUN: obj2yaml %t/default.dylib | FileCheck %s --check-prefix=DEFAULT
+# RUN: %no-lsystem-lld -arch arm64 -dylib -install_name @rpath/libtest.dylib -oso_prefix %t/ -no_uuid --threads=4 -add_ast_path _local_function -add_ast_path added.ast %t/input.o -o %t/threaded.dylib
+# RUN: cmp %t/default.dylib %t/threaded.dylib
 # RUN: %no-lsystem-lld -arch arm64 -dylib -oso_prefix %t/ -no-deduplicate-symbol-strings %t/input.o -o %t/nodedup.dylib
 # RUN: obj2yaml %t/nodedup.dylib | FileCheck %s --check-prefix=NONDEDUP
 
 ## With the default string-table policy, STABS should use the offsets already
 ## assigned to local/external symbols. Cover functions and data of both kinds.
 # DEFAULT:      NameList:
+# DEFAULT:        - n_strx:          2
+# DEFAULT-NEXT:     n_type:          0x32
 # DEFAULT:        - n_strx:          64
+# DEFAULT-NEXT:     n_type:          0x32
+# DEFAULT:        - n_strx:          74
 # DEFAULT-NEXT:     n_type:          0x64
-# DEFAULT:        - n_strx:          99
+# DEFAULT:        - n_strx:          109
 # DEFAULT-NEXT:     n_type:          0x66
 # DEFAULT:        - n_strx:          2
 # DEFAULT-NEXT:     n_type:          0x24
@@ -36,6 +42,7 @@
 # DEFAULT-NEXT:     - _local_data
 # DEFAULT-NEXT:     - _external_function
 # DEFAULT-NEXT:     - _external_data
+# DEFAULT-NEXT:     - added.ast
 # DEFAULT-NEXT:     - {{'?}}/tmp{{[/\\]}}stabs-symbol-string-offsets.s{{'?}}
 # DEFAULT-NEXT:     - input.o
 

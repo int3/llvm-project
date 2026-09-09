@@ -1357,8 +1357,11 @@ void SymtabSection::emitStabs() {
 }
 
 void SymtabSection::finalizeContents() {
+  size_t normalSymbolOrdinal = 0;
   auto addSymbol = [&](std::vector<SymtabEntry> &symbols, Symbol *sym) {
-    uint32_t strx = stringTableSection.addString(sym->getName());
+    size_t strx = config->dedupSymbolStrings
+                      ? normalSymbolOrdinal++
+                      : stringTableSection.addString(sym->getName());
     symbols.push_back({sym, strx});
   };
 
@@ -1424,6 +1427,24 @@ void SymtabSection::finalizeContents() {
       if (dysym->isReferenced())
         addSymbol(undefinedSymbols, sym);
     }
+  }
+
+  if (config->dedupSymbolStrings) {
+    assert(normalSymbolOrdinal <= UINT32_MAX);
+    std::vector<CachedHashStringRef> names(normalSymbolOrdinal,
+                                            CachedHashStringRef("", 0));
+    std::vector<uint32_t> offsets(normalSymbolOrdinal);
+    for (SymtabEntry &entry : concat<SymtabEntry>(
+             localSymbols, externalSymbols, undefinedSymbols))
+      names[entry.strx] = CachedHashStringRef(entry.sym->getName(), 0);
+
+    parallelFor(0, names.size(), [&](size_t i) {
+      names[i] = CachedHashStringRef(names[i].val());
+    });
+    stringTableSection.addStringsInOrder(names, offsets);
+    for (SymtabEntry &entry : concat<SymtabEntry>(
+             localSymbols, externalSymbols, undefinedSymbols))
+      entry.strx = offsets[entry.strx];
   }
 
   emitStabs();
@@ -1588,6 +1609,7 @@ uint32_t StringTableSection::addString(StringRef str) {
   uint32_t strx = size;
   if (config->dedupSymbolStrings) {
     llvm::CachedHashStringRef hashedStr(str);
+    auto &stringMap = stringMaps[hashedStr.hash() >> 28];
     auto [it, inserted] = stringMap.try_emplace(hashedStr, strx);
     if (!inserted)
       return it->second;
@@ -1596,6 +1618,46 @@ uint32_t StringTableSection::addString(StringRef str) {
   strings.push_back(str);
   size += str.size() + 1; // account for null terminator
   return strx;
+}
+
+void StringTableSection::addStringsInOrder(
+    MutableArrayRef<CachedHashStringRef> names,
+    MutableArrayRef<uint32_t> offsets) {
+  assert(config->dedupSymbolStrings);
+  assert(names.size() == offsets.size());
+  assert(names.size() <= UINT32_MAX);
+
+  std::array<std::vector<uint32_t>, stringMapShards> occurrences;
+  const uint32_t count = names.size();
+  for (uint32_t i = 0; i != count; ++i)
+    occurrences[names[i].hash() >> 28].push_back(i);
+
+  std::vector<uint32_t> firstOccurrence(names.size());
+  parallelFor(0, stringMapShards, [&](size_t shard) {
+    auto &stringMap = stringMaps[shard];
+    stringMap.reserve(occurrences[shard].size());
+    for (uint32_t index : occurrences[shard]) {
+      auto [it, inserted] = stringMap.try_emplace(names[index], index);
+      firstOccurrence[index] = it->second;
+    }
+  });
+
+  // Preserve addString()'s exact first-occurrence order. STABS are emitted
+  // after this pass and use the completed shard maps through addString().
+  for (uint32_t i = 0; i != count; ++i) {
+    if (firstOccurrence[i] != i)
+      continue;
+    offsets[i] = size;
+    strings.push_back(names[i].val());
+    size += names[i].size() + 1;
+  }
+
+  parallelFor(0, stringMapShards, [&](size_t shard) {
+    for (uint32_t index : occurrences[shard])
+      offsets[index] = offsets[firstOccurrence[index]];
+    for (auto &entry : stringMaps[shard])
+      entry.second = offsets[entry.second];
+  });
 }
 
 void StringTableSection::writeTo(uint8_t *buf) const {
