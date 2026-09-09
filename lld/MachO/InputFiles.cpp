@@ -640,6 +640,19 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
     } else {
       subsec = subsecIt->isec;
       r.offset -= subsecIt->offset;
+      if (subsec->relocs.empty() && subsec->relocs.capacity() == 0) {
+        uint64_t subsecStart = subsecIt->offset;
+        uint64_t subsecEnd = subsecStart + subsec->getSize();
+        size_t end = i + 1;
+        while (end < relInfos.size()) {
+          uint64_t address = static_cast<uint32_t>(relInfos[end].r_address);
+          if (address < subsecStart || address >= subsecEnd)
+            break;
+          ++end;
+        }
+        if (end > i + 1)
+          subsec->relocs.reserve(end - i);
+      }
     }
     subsec->relocs.push_back(r);
 
