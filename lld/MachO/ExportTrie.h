@@ -30,9 +30,11 @@ public:
   void writeTo(uint8_t *buf) const;
 
 private:
-  TrieNode *makeNode();
+  TrieNode *makeNode(std::vector<TrieNode *> &allocatedNodes);
   void sortAndBuild(llvm::MutableArrayRef<const Symbol *> vec, TrieNode *node,
-                    size_t lastPos, size_t pos);
+                    size_t lastPos, size_t pos,
+                    std::vector<TrieNode *> &allocatedNodes,
+                    size_t splitBudget);
 
   uint64_t imageBase = 0;
   std::vector<const Symbol *> exported;

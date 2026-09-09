@@ -43,6 +43,7 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/Support/LEB128.h"
+#include "llvm/Support/Parallel.h"
 #include <optional>
 
 using namespace llvm;
@@ -97,6 +98,20 @@ struct macho::TrieNode {
   bool updateOffset(size_t &nextOffset);
   void writeTo(uint8_t *buf) const;
 };
+
+namespace {
+
+// A fragment has a private root while it is built in a task. Its root is only
+// a staging area: it is not added to TrieBuilder::nodes and is spliced into
+// the real parent after all sibling tasks have completed.
+struct TrieFragment {
+  TrieNode root;
+  std::vector<TrieNode *> nodes;
+};
+
+constexpr size_t minimumParallelSymbols = 4096;
+
+} // namespace
 
 // For regular symbols, the node layout (excluding the children) is
 //
@@ -196,9 +211,9 @@ TrieBuilder::~TrieBuilder() {
     delete node;
 }
 
-TrieNode *TrieBuilder::makeNode() {
+TrieNode *TrieBuilder::makeNode(std::vector<TrieNode *> &allocatedNodes) {
   auto *node = new TrieNode();
-  nodes.emplace_back(node);
+  allocatedNodes.emplace_back(node);
   return node;
 }
 
@@ -221,7 +236,9 @@ static int charAt(const Symbol *sym, size_t pos) {
 // pos:     The string index we are currently sorting on. Note that each symbol
 //          S contained in vec has the same prefix S[0...pos).
 void TrieBuilder::sortAndBuild(MutableArrayRef<const Symbol *> vec,
-                               TrieNode *node, size_t lastPos, size_t pos) {
+                               TrieNode *node, size_t lastPos, size_t pos,
+                               std::vector<TrieNode *> &allocatedNodes,
+                               size_t splitBudget) {
 tailcall:
   if (vec.empty())
     return;
@@ -236,7 +253,7 @@ tailcall:
     StringRef suffix = name.drop_front(lastPos);
     if (!suffix.contains(static_cast<char>(0xff))) {
       if (!suffix.empty()) {
-        TrieNode *newNode = makeNode();
+        TrieNode *newNode = makeNode(allocatedNodes);
         node->edges.emplace_back(suffix, newNode);
         node = newNode;
       }
@@ -265,15 +282,84 @@ tailcall:
   bool isTerminal = pivot == -1;
   bool prefixesDiverge = i != 0 || j != vec.size();
   if (lastPos != pos && (isTerminal || prefixesDiverge)) {
-    TrieNode *newNode = makeNode();
+    TrieNode *newNode = makeNode(allocatedNodes);
     node->edges.emplace_back(pivotSymbol->getName().slice(lastPos, pos),
                              newNode);
     node = newNode;
     lastPos = pos;
   }
 
-  sortAndBuild(vec.slice(0, i), node, lastPos, pos);
-  sortAndBuild(vec.slice(j), node, lastPos, pos);
+  // There is enough independent work only at a large diverging partition.
+  // Fragments retain both their allocated nodes and their root edges locally,
+  // so worker tasks never write the builder's node list or a shared parent.
+  // The split budget limits recursive task groups despite a highly branching
+  // input trie.
+  if (prefixesDiverge && vec.size() >= minimumParallelSymbols &&
+      splitBudget != 0 && parallel::getThreadCount() > 1) {
+    TrieFragment less;
+    TrieFragment greater;
+    TrieFragment equal;
+    size_t activeChildren = (i != 0) + (j != vec.size()) + !isTerminal;
+    size_t remainingBudget = splitBudget - 1;
+    auto takeBudget = [&] {
+      size_t result = remainingBudget / activeChildren;
+      remainingBudget -= result;
+      --activeChildren;
+      return result;
+    };
+
+    size_t lessBudget = i != 0 ? takeBudget() : 0;
+    size_t greaterBudget = j != vec.size() ? takeBudget() : 0;
+    size_t equalBudget = !isTerminal ? takeBudget() : 0;
+    {
+      parallel::TaskGroup tasks;
+      if (i != 0)
+        tasks.spawn([&, lessBudget] {
+          sortAndBuild(vec.slice(0, i), &less.root, lastPos, pos, less.nodes,
+                       lessBudget);
+        });
+      if (j != vec.size())
+        tasks.spawn([&, greaterBudget] {
+          sortAndBuild(vec.slice(j), &greater.root, lastPos, pos,
+                       greater.nodes, greaterBudget);
+        });
+      if (!isTerminal)
+        tasks.spawn([&, equalBudget] {
+          sortAndBuild(vec.slice(i, j - i), &equal.root, lastPos, pos + 1,
+                       equal.nodes, equalBudget);
+        });
+    }
+
+    // Node order is part of the serialized representation. Keep the serial
+    // depth-first allocation order regardless of task completion order.
+    allocatedNodes.insert(allocatedNodes.end(), less.nodes.begin(),
+                          less.nodes.end());
+    allocatedNodes.insert(allocatedNodes.end(), greater.nodes.begin(),
+                          greater.nodes.end());
+    allocatedNodes.insert(allocatedNodes.end(), equal.nodes.begin(),
+                          equal.nodes.end());
+
+    auto mergeFragment = [&](TrieFragment &fragment) {
+      node->edges.insert(node->edges.end(), fragment.root.edges.begin(),
+                         fragment.root.edges.end());
+      if (fragment.root.info) {
+        assert(!node->info);
+        node->info = std::move(fragment.root.info);
+      }
+    };
+    mergeFragment(less);
+    mergeFragment(greater);
+    if (isTerminal) {
+      assert(j - i == 1); // no duplicate symbols
+      node->info = ExportInfo(*pivotSymbol, imageBase);
+    }
+    mergeFragment(equal);
+    return;
+  }
+
+  sortAndBuild(vec.slice(0, i), node, lastPos, pos, allocatedNodes,
+               splitBudget);
+  sortAndBuild(vec.slice(j), node, lastPos, pos, allocatedNodes, splitBudget);
 
   if (isTerminal) {
     assert(j - i == 1); // no duplicate symbols
@@ -311,8 +397,10 @@ size_t TrieBuilder::build() {
   if (exported.empty())
     return 0;
 
-  TrieNode *root = makeNode();
-  sortAndBuild(exported, root, 0, 0);
+  TrieNode *root = makeNode(nodes);
+  size_t splitBudget =
+      std::min<size_t>(parallel::getThreadCount() * 2, size_t(32));
+  sortAndBuild(exported, root, 0, 0, nodes, splitBudget);
 
   // Assign each node in the vector an offset in the trie stream, iterating
   // until all uleb128 sizes have stabilized.
