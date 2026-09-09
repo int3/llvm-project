@@ -25,25 +25,23 @@ Symbol *SymbolTable::find(CachedHashStringRef cachedName) {
   auto it = symMap.find(cachedName);
   if (it == symMap.end())
     return nullptr;
-  return symVector[it->second];
+  return it->second;
 }
 
 std::pair<Symbol *, bool> SymbolTable::insert(StringRef name,
                                               const InputFile *file) {
-  auto p = symMap.insert({CachedHashStringRef(name), (int)symVector.size()});
+  auto [it, wasInserted] =
+      symMap.try_emplace(CachedHashStringRef(name), nullptr);
 
-  Symbol *sym;
-  if (!p.second) {
-    // Name already present in the symbol table.
-    sym = symVector[p.first->second];
-  } else {
+  if (wasInserted) {
     // Name is a new symbol.
-    sym = reinterpret_cast<Symbol *>(make<SymbolUnion>());
-    symVector.push_back(sym);
+    it->second = reinterpret_cast<Symbol *>(make<SymbolUnion>());
+    symVector.push_back(it->second);
   }
+  Symbol *sym = it->second;
 
   sym->isUsedInRegularObj |= !file || isa<ObjFile>(file);
-  return {sym, p.second};
+  return {sym, wasInserted};
 }
 
 namespace {

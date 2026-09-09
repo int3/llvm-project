@@ -67,7 +67,7 @@ public:
 
 private:
   std::pair<Symbol *, bool> insert(StringRef name, const InputFile *);
-  llvm::DenseMap<llvm::CachedHashStringRef, int> symMap;
+  llvm::DenseMap<llvm::CachedHashStringRef, Symbol *> symMap;
   std::vector<Symbol *> symVector;
 };
 
