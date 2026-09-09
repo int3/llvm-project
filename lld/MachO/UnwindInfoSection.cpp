@@ -25,6 +25,7 @@
 
 #include "mach-o/compact_unwind_encoding.h"
 
+#include <limits>
 #include <numeric>
 
 using namespace llvm;
@@ -146,12 +147,10 @@ private:
   Symbol *canonicalizePersonality(Symbol *);
 
   uint64_t unwindInfoSize = 0;
-  SmallVector<decltype(symbols)::value_type, 0> symbolsVec;
   CompactUnwindLayout cuLayout;
   std::vector<std::pair<compact_unwind_encoding_t, size_t>> commonEncodings;
   EncodingMap commonEncodingIndexes;
-  // The entries here will be in the same order as their originating symbols
-  // in symbolsVec.
+  // The entries here will be in the same order as their originating symbols.
   std::vector<CompactUnwindEntry> cuEntries;
   std::vector<Symbol *> personalities;
   SmallDenseMap<std::pair<InputSection *, uint64_t /* addend */>, Symbol *>
@@ -185,23 +184,46 @@ UnwindInfoSection::UnwindInfoSection()
 void UnwindInfoSection::addSymbol(const Defined *d) {
   if (d->unwindEntry())
     allEntriesAreOmitted = false;
-  // We don't yet know the final output address of this symbol, but we know that
-  // they are uniquely determined by a combination of the isec and value, so
-  // we use that as the key here.
-  auto p = symbols.insert({{d->isec(), d->value}, d});
+  // Most function symbols start at offset zero of a ConcatInputSection. Keep
+  // their one-based index in that section; alternate entries and non-concat
+  // sections use the fallback map.
+  auto appendSymbol = [&] {
+    if (symbols.size() == std::numeric_limits<uint32_t>::max())
+      fatal("too many unwind symbols");
+    symbols.push_back(d);
+    return static_cast<uint32_t>(symbols.size());
+  };
+  uint32_t index;
+  bool useFallback = d->value != 0;
+  if (!useFallback) {
+    if (auto *isec = dyn_cast_or_null<ConcatInputSection>(d->isec())) {
+      index = isec->unwindSymbolIndex;
+      if (index == 0) {
+        index = isec->unwindSymbolIndex = appendSymbol();
+      }
+    } else {
+      useFallback = true;
+    }
+  }
+  if (useFallback) {
+    auto [it, inserted] = nonZeroSymbols.try_emplace({d->isec(), d->value}, 0);
+    if (inserted)
+      it->second = appendSymbol();
+    index = it->second;
+  }
   // If we have multiple symbols at the same address, only one of them can have
   // an associated unwind entry.
-  if (!p.second && d->unwindEntry()) {
-    assert(p.first->second == d || !p.first->second->unwindEntry());
-    p.first->second = d;
+  const Defined *&previous = symbols[index - 1];
+  if (previous != d && d->unwindEntry()) {
+    assert(!previous->unwindEntry());
+    previous = d;
   }
 }
 
 void UnwindInfoSectionImpl::prepare() {
   // This iteration needs to be deterministic, since prepareRelocations may add
-  // entries to the GOT. Hence the use of a MapVector for
-  // UnwindInfoSection::symbols.
-  for (const Defined *d : make_second_range(symbols))
+  // entries to the GOT. symbols preserves Writer::scanSymbols() order.
+  for (const Defined *d : symbols)
     if (d->unwindEntry()) {
       if (d->unwindEntry()->getName() == section_names::compactUnwind) {
         prepareRelocations(d->unwindEntry());
@@ -349,9 +371,9 @@ Symbol *UnwindInfoSectionImpl::canonicalizePersonality(Symbol *personality) {
 // is no source address to make a relative location meaningful.
 void UnwindInfoSectionImpl::relocateCompactUnwind(
     std::vector<CompactUnwindEntry> &cuEntries) {
-  parallelFor(0, symbolsVec.size(), [&](size_t i) {
+  parallelFor(0, symbols.size(), [&](size_t i) {
     CompactUnwindEntry &cu = cuEntries[i];
-    const Defined *d = symbolsVec[i].second;
+    const Defined *d = symbols[i];
     cu.functionAddress = d->getVA();
     if (!d->unwindEntry())
       return;
@@ -461,10 +483,6 @@ void UnwindInfoSectionImpl::finalize() {
   // and without any LSDA. Folding is necessary because it reduces the
   // number of CU entries by as much as 3 orders of magnitude!
   cuEntries.resize(symbols.size());
-  // The "map" part of the symbols MapVector was only needed for deduplication
-  // in addSymbol(). Now that we are done adding, move the contents to a plain
-  // std::vector for indexed access.
-  symbolsVec = symbols.takeVector();
   relocateCompactUnwind(cuEntries);
 
   // Sort the entries by address.

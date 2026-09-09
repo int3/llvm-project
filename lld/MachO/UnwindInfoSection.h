@@ -11,7 +11,7 @@
 
 #include "ConcatOutputSection.h"
 #include "SyntheticSections.h"
-#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/DenseMap.h"
 
 namespace lld::macho {
 
@@ -26,9 +26,10 @@ public:
 protected:
   UnwindInfoSection();
 
-  llvm::MapVector<std::pair<const InputSection *, uint64_t /*Defined::value*/>,
-                  const Defined *>
-      symbols;
+  std::vector<const Defined *> symbols;
+  llvm::DenseMap<
+      std::pair<const InputSection *, uint64_t /*Defined::value*/>, uint32_t>
+      nonZeroSymbols;
   bool allEntriesAreOmitted = true;
 };
 

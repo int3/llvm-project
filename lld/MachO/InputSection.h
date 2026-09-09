@@ -164,6 +164,9 @@ public:
   // first and not copied to the output.
   bool wasCoalesced = false;
   std::atomic_bool live = !config->deadStrip;
+  // One-based index into UnwindInfoSection::symbols for the symbol at offset
+  // zero. Kept in the padding before outSecOff.
+  uint32_t unwindSymbolIndex = 0;
   // This variable has two usages. Initially, it represents the input order.
   // After assignAddresses is called, it represents the offset from the
   // beginning of the output section this section was assigned to.
