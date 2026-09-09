@@ -1280,11 +1280,16 @@ void SymtabSection::emitStabs() {
     std::string path;
   };
   std::vector<SourceFile> sourceFiles;
+  bool hasPreviousFileId = false;
+  int previousFileId = 0;
   for (const SortingPair &pair : symbolsNeedingStabs) {
+    if (hasPreviousFileId && pair.second == previousFileId)
+      continue;
+    previousFileId = pair.second;
+    hasPreviousFileId = true;
     Defined *defined = cast<Defined>(pair.first->sym);
     ObjFile *file = cast<ObjFile>(defined->originalIsec->getFile());
-    if (sourceFiles.empty() || sourceFiles.back().file != file)
-      sourceFiles.push_back({file, {}});
+    sourceFiles.push_back({file, {}});
   }
   parallelForEach(sourceFiles, [](SourceFile &sourceFile) {
     sourceFile.path = sourceFile.file->sourceFile();
