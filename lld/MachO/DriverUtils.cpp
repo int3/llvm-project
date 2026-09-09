@@ -245,8 +245,15 @@ static void prepareTapiFile(PreparedTapiFile *file) {
 void macho::prepareTapiFiles(ArrayRef<MemoryBufferRef> buffers,
                              std::vector<PreparedTapiFile> &prepared) {
   prepared.reserve(buffers.size());
-  for (MemoryBufferRef buffer : buffers)
+  for (MemoryBufferRef buffer : buffers) {
+    CachedHashStringRef path(buffer.getBufferIdentifier());
+    auto it = loadedDylibs.find(path);
+    // loadDylib() will reuse the existing file, but the deferred entry still
+    // needs to be consumed to apply its metadata in the original order.
+    if (it != loadedDylibs.end() && it->second)
+      continue;
     prepared.emplace_back(buffer);
+  }
 
   SmallVector<PreparedTapiFile *> files;
   for (PreparedTapiFile &file : prepared)
