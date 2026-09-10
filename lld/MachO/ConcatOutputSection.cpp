@@ -265,19 +265,28 @@ void TextOutputSection::finalize() {
       deferredBranchRedirects;
 
   const uint64_t slop = config->slopScale * target->thunkSize;
+  // A waiting front is revisited after finalizeOne/current relocation scans,
+  // which may insert into thunkMap but cannot create thunks. Reuse only its
+  // failed lookup; keep no map reference because inserts may rehash.
+  Relocation *checkedFront = nullptr;
   for (auto *isec : inputs) {
     while (!branchesToProcess.empty()) {
       auto [callerIsec, r] = branchesToProcess.front();
       assert(callerIsec->isFinal);
-      auto &thunkInfo = thunkMap[*r];
       if (isTargetKnownInRange(*callerIsec, *r)) {
         branchesToProcess.pop_front();
+        checkedFront = nullptr;
         continue;
       }
-      if (auto *thunk = getThunkInRange(*callerIsec, *r, thunkInfo)) {
-        deferredBranchRedirects.emplace_back(callerIsec, r, thunk);
-        branchesToProcess.pop_front();
-        continue;
+      if (r != checkedFront) {
+        auto &thunkInfo = thunkMap[*r];
+        if (auto *thunk = getThunkInRange(*callerIsec, *r, thunkInfo)) {
+          deferredBranchRedirects.emplace_back(callerIsec, r, thunk);
+          branchesToProcess.pop_front();
+          checkedFront = nullptr;
+          continue;
+        }
+        checkedFront = r;
       }
       uint64_t highVA =
           callerIsec->getVA() + r->offset + target->forwardBranchRange;
@@ -290,7 +299,9 @@ void TextOutputSection::finalize() {
       if (nextEnd + slop <= highVA)
         break;
 
+      auto &thunkInfo = thunkMap[*r];
       createThunk(*callerIsec, *r, thunkInfo);
+      checkedFront = nullptr;
       branchesToProcess.pop_front();
     }
     finalizeOne(isec);
