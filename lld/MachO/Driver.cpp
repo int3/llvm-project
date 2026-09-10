@@ -1537,24 +1537,139 @@ static void createFiles(const InputArgList &args) {
 #endif
 }
 
+namespace {
+
+// The input order of literal and ObjC synthetic sections is assigned once, at
+// the first input to each synthetic section. Keep those inputs in the
+// coordinator's serial order. Everything else is a ConcatInputSection whose
+// output slot and input order can be assigned independently.
+struct GatheredInputSection {
+  struct SpecialInput {
+    InputSection *isec;
+    size_t ordinaryCountBefore;
+  };
+
+  struct OrdinaryRun {
+    size_t begin;
+    size_t end;
+    size_t destinationIndex;
+    int inputOrderBase;
+    ConcatOutputSection *osec;
+  };
+
+  std::vector<ConcatInputSection *> ordinary;
+  std::vector<SpecialInput> special;
+  std::vector<OrdinaryRun> runs;
+};
+
+struct GatheredInputFile {
+  std::vector<GatheredInputSection> sections;
+};
+
+static void classifyInputSection(const Section &section,
+                                 GatheredInputSection &result) {
+  // Compact unwind entries require special handling elsewhere. (In contrast,
+  // EH frames are handled like regular ConcatInputSections.)
+  if (section.name == section_names::compactUnwind)
+    return;
+  // Addrsig sections contain metadata only needed at link time.
+  if (section.name == section_names::addrSig)
+    return;
+
+  for (const Subsection &subsection : section.subsections) {
+    InputSection *isec = subsection.isec;
+    if (auto *concat = dyn_cast<ConcatInputSection>(isec)) {
+      if (concat->isCoalescedWeak())
+        continue;
+      // This must inspect each subsection's symbols: a Section can have been
+      // split by symbols, and only some subsections may be method lists.
+      if (config->emitRelativeMethodLists &&
+          ObjCMethListSection::isMethodList(concat)) {
+        result.special.push_back({isec, result.ordinary.size()});
+      } else if (config->emitInitOffsets &&
+                 sectionType(concat->getFlags()) == S_MOD_INIT_FUNC_POINTERS) {
+        result.special.push_back({isec, result.ordinary.size()});
+      } else {
+        result.ordinary.push_back(concat);
+      }
+    } else if (isa<CStringInputSection>(isec) ||
+               isa<WordLiteralInputSection>(isec)) {
+      result.special.push_back({isec, result.ordinary.size()});
+    } else {
+      llvm_unreachable("unexpected input section kind");
+    }
+  }
+}
+
+} // namespace
+
 static void gatherInputSections() {
   TimeTraceScope timeScope("Gathering input sections");
-  for (const InputFile *file : inputFiles) {
-    for (const Section *section : file->sections) {
-      // Compact unwind entries require special handling elsewhere. (In
-      // contrast, EH frames are handled like regular ConcatInputSections.)
-      if (section->name == section_names::compactUnwind)
-        continue;
-      // Addrsig sections contain metadata only needed at link time.
-      if (section->name == section_names::addrSig)
-        continue;
+
+  ArrayRef<InputFile *> files = inputFiles.getArrayRef();
+  std::vector<GatheredInputFile> gatheredFiles(files.size());
+  parallelFor(0, files.size(), [&](size_t fileIndex) {
+    const InputFile *file = files[fileIndex];
+    GatheredInputFile &gatheredFile = gatheredFiles[fileIndex];
+    gatheredFile.sections.resize(file->sections.size());
+    for (size_t sectionIndex = 0; sectionIndex != file->sections.size();
+         ++sectionIndex)
+      classifyInputSection(*file->sections[sectionIndex],
+                           gatheredFile.sections[sectionIndex]);
+  });
+
+  // Keep all effects which depend on the original traversal order here. This
+  // includes output-section creation and the one-time input-order assignment
+  // for special sections. The resulting ordinary runs have disjoint output
+  // slots, so workers can fill them without touching shared graph state.
+  size_t inputSectionIndex = inputSections.size();
+  for (size_t fileIndex = 0; fileIndex != files.size(); ++fileIndex) {
+    const InputFile *file = files[fileIndex];
+    for (GatheredInputSection &gatheredSection :
+         gatheredFiles[fileIndex].sections) {
       ConcatOutputSection *osec = nullptr;
-      for (const Subsection &subsection : section->subsections)
-        addInputSection(subsection.isec, osec);
+      size_t ordinaryBegin = 0;
+      auto addOrdinaryRun = [&](size_t ordinaryEnd) {
+        if (ordinaryBegin == ordinaryEnd)
+          return;
+        assert(inputSectionsOrder + ordinaryEnd - ordinaryBegin <=
+               UnspecifiedInputOrder);
+        if (!osec)
+          osec = ConcatOutputSection::getOrCreateForInput(
+              gatheredSection.ordinary[ordinaryBegin]);
+        gatheredSection.runs.push_back(
+            {ordinaryBegin, ordinaryEnd, inputSectionIndex,
+             inputSectionsOrder, osec});
+        inputSectionIndex += ordinaryEnd - ordinaryBegin;
+        inputSectionsOrder += ordinaryEnd - ordinaryBegin;
+        ordinaryBegin = ordinaryEnd;
+      };
+
+      for (const GatheredInputSection::SpecialInput &special :
+           gatheredSection.special) {
+        addOrdinaryRun(special.ordinaryCountBefore);
+        addInputSection(special.isec);
+      }
+      addOrdinaryRun(gatheredSection.ordinary.size());
     }
     if (!file->objCImageInfo.empty())
       in.objCImageInfo->addFile(file);
   }
+
+  inputSections.resize(inputSectionIndex);
+  parallelForEach(gatheredFiles, [](GatheredInputFile &gatheredFile) {
+    for (GatheredInputSection &gatheredSection : gatheredFile.sections) {
+      for (const GatheredInputSection::OrdinaryRun &run :
+           gatheredSection.runs) {
+        for (size_t i = run.begin; i != run.end; ++i) {
+          ConcatInputSection *isec = gatheredSection.ordinary[i];
+          isec->parent = run.osec;
+          isec->outSecOff = run.inputOrderBase + i - run.begin;
+          inputSections[run.destinationIndex + i - run.begin] = isec;
+        }
+      }
+    }
+  });
 }
 
 static void codegenDataGenerate() {
