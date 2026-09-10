@@ -706,6 +706,18 @@ struct RelocationEvent {
   uint32_t index;
 };
 
+enum SymbolScanAction : uint8_t {
+  nonWeakDefinition = 1 << 0,
+  globalUnwind = 1 << 1,
+  dylibReference = 1 << 2,
+  objcStub = 1 << 3,
+};
+
+struct SymbolScanCandidate {
+  Symbol *sym;
+  uint8_t actions;
+};
+
 static void canonicalizeReferent(Relocation &r) {
   if (auto *referentIsec = dyn_cast_if_present<InputSection *>(r.referent))
     r.referent = referentIsec->canonical();
@@ -825,46 +837,76 @@ static void addNonWeakDefinition(const Defined *defined) {
 void Writer::scanSymbols() {
   TimeTraceScope timeScope("Scan symbols");
   ObjCSelRefsHelper::initialize();
-  for (Symbol *sym : symtab->getSymbols()) {
-    if (auto *defined = dyn_cast<Defined>(sym)) {
-      if (!defined->isLive())
-        continue;
-      if (defined->overridesWeakDef)
-        addNonWeakDefinition(defined);
-      if (!defined->isAbsolute() && isCodeSection(defined->isec()))
-        in.unwindInfo->addSymbol(defined);
-    } else if (const auto *dysym = dyn_cast<DylibSymbol>(sym)) {
-      // This branch intentionally doesn't check isLive().
-      if (dysym->isDynamicLookup())
-        continue;
-      dysym->getFile()->refState =
-          std::max(dysym->getFile()->refState, dysym->getRefState());
-    } else if (isa<Undefined>(sym)) {
-      if (ObjCStubsSection::isObjCStubSymbol(sym)) {
-        // When -dead_strip is enabled, we don't want to emit any dead stubs.
-        // Although this stub symbol is yet undefined, addSym() was called
-        // during MarkLive.
-        if (config->deadStrip) {
-          if (!sym->isLive())
-            continue;
-        }
-        in.objcStubs->addEntry(sym);
+  ArrayRef<Symbol *> symbols = symtab->getSymbols();
+  constexpr size_t symbolsPerChunk = 4096;
+  const size_t numChunks =
+      (symbols.size() + symbolsPerChunk - 1) / symbolsPerChunk;
+  std::vector<std::vector<SymbolScanCandidate>> globalCandidates(numChunks);
+  parallelFor(0, numChunks, [&](size_t chunkIndex) {
+    const size_t begin = chunkIndex * symbolsPerChunk;
+    const size_t end = std::min(begin + symbolsPerChunk, symbols.size());
+    std::vector<SymbolScanCandidate> &candidates =
+        globalCandidates[chunkIndex];
+    for (size_t i = begin; i != end; ++i) {
+      Symbol *sym = symbols[i];
+      uint8_t actions = 0;
+      if (auto *defined = dyn_cast<Defined>(sym)) {
+        if (!defined->isLive())
+          continue;
+        if (defined->overridesWeakDef)
+          actions |= nonWeakDefinition;
+        if (!defined->isAbsolute() && isCodeSection(defined->isec()))
+          actions |= globalUnwind;
+      } else if (const auto *dysym = dyn_cast<DylibSymbol>(sym)) {
+        // This branch intentionally doesn't check isLive().
+        if (!dysym->isDynamicLookup())
+          actions |= dylibReference;
+      } else if (isa<Undefined>(sym) &&
+                 ObjCStubsSection::isObjCStubSymbol(sym) &&
+                 (!config->deadStrip || sym->isLive())) {
+        actions |= objcStub;
+      }
+      if (actions != 0)
+        candidates.push_back({sym, actions});
+    }
+  });
+
+  // Replay in symVector order. The unwind insertion index is used by layout,
+  // and a definition's weak-binding effect precedes its unwind effect.
+  for (const auto &candidates : globalCandidates) {
+    for (const SymbolScanCandidate &candidate : candidates) {
+      if (candidate.actions & nonWeakDefinition)
+        addNonWeakDefinition(cast<Defined>(candidate.sym));
+      if (candidate.actions & globalUnwind)
+        in.unwindInfo->addSymbol(cast<Defined>(candidate.sym));
+      if (candidate.actions & dylibReference) {
+        const auto *dysym = cast<DylibSymbol>(candidate.sym);
+        dysym->getFile()->refState =
+            std::max(dysym->getFile()->refState, dysym->getRefState());
+      } else if (candidate.actions & objcStub) {
+        in.objcStubs->addEntry(candidate.sym);
       }
     }
   }
 
-  for (const InputFile *file : inputFiles) {
-    if (auto *objFile = dyn_cast<ObjFile>(file))
-      for (Symbol *sym : objFile->symbols) {
-        if (auto *defined = dyn_cast_or_null<Defined>(sym)) {
-          if (!defined->isLive())
-            continue;
-          if (!defined->isExternal() && !defined->isAbsolute() &&
-              isCodeSection(defined->isec()))
-            in.unwindInfo->addSymbol(defined);
-        }
-      }
-  }
+  // ObjC stub creation above can replace symbols and add input sections, so
+  // classify local symbols only after every global side effect is complete.
+  std::vector<std::vector<const Defined *>> localCandidates(inputFiles.size());
+  parallelFor(0, inputFiles.size(), [&](size_t fileIndex) {
+    const auto *objFile = dyn_cast<ObjFile>(inputFiles[fileIndex]);
+    if (!objFile)
+      return;
+    std::vector<const Defined *> &candidates = localCandidates[fileIndex];
+    for (Symbol *sym : objFile->symbols) {
+      auto *defined = dyn_cast_or_null<Defined>(sym);
+      if (defined && defined->isLive() && !defined->isExternal() &&
+          !defined->isAbsolute() && isCodeSection(defined->isec()))
+        candidates.push_back(defined);
+    }
+  });
+  for (const auto &candidates : localCandidates)
+    for (const Defined *defined : candidates)
+      in.unwindInfo->addSymbol(defined);
 }
 
 // TODO: ld64 enforces the old load commands in a few other cases.
