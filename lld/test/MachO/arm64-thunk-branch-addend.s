@@ -2,10 +2,11 @@
 
 # RUN: rm -rf %t; mkdir %t
 # RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin %s -o %t/input.o
+# RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin %S/Inputs/arm64-thunk-absolute-target.s -o %t/absolute.o
 
 ## When two call sites branch to the same target symbol with different addends
 ## and each needs a branch-extension thunk, the thunks must be distinct.
-# RUN: %lld -arch arm64 -lSystem -o %t/base %t/input.o
+# RUN: %lld -arch arm64 -lSystem -o %t/base %t/input.o %t/absolute.o
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/base \
 # RUN:   | FileCheck %s --check-prefixes=CHECK,BASE
 
@@ -13,7 +14,7 @@
 ## branch relocation is a Defined symbol that *also* has a __stubs entry
 ## (here forced via -interposable, which creates a stub for every extern
 ## Defined so callers can be interposed at runtime).
-# RUN: %lld -arch arm64 -lSystem -interposable -o %t/interp %t/input.o
+# RUN: %lld -arch arm64 -lSystem -interposable -o %t/interp %t/input.o %t/absolute.o
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/interp \
 # RUN:   | FileCheck %s --check-prefixes=CHECK,INTERP
 
@@ -39,11 +40,15 @@ _spacer:
   .space 0x8000000
   ret
 
+## An absolute Defined has no InputSection. Its thunk key must preserve that
+## typed-null identity while retaining the absolute value separately.
+
 .globl _main
 .p2align 2
 _main:
   bl _target
   bl _target+8
+  bl _absolute_target
   ret
 
 ## Capture _target's full VA.
@@ -53,6 +58,7 @@ _main:
 # BASE-LABEL: <_main>:
 # BASE-NEXT:    bl 0x{{[0-9a-f]+}} <_target.thunk.0>
 # BASE-NEXT:    bl 0x{{[0-9a-f]+}} <_target+8.thunk.0>
+# BASE-NEXT:    bl 0x{{[0-9a-f]+}} <_absolute_target.thunk.0>
 # BASE-NEXT:    ret
 
 ## For -interposable: The addend=0 call takes the __stubs fast-path, so its bl
@@ -61,6 +67,7 @@ _main:
 # INTERP-LABEL: <_main>:
 # INTERP-NEXT:  bl 0x[[#%x, STUB_CALL:]]
 # INTERP-NEXT:  bl 0x{{[0-9a-f]+}} <_target+8.thunk.0>
+# INTERP-NEXT:  bl 0x{{[0-9a-f]+}} <_absolute_target.thunk.0>
 # INTERP-NEXT:  ret
 
 ## The +0 thunk should be only present in BASE test.
@@ -74,6 +81,13 @@ _main:
 # CHECK-LABEL: <_target+8.thunk.0>:
 # CHECK-NEXT:   adrp  x16, 0x[[#TARGET_VA]]
 # CHECK-NEXT:   add   x16, x16, #8
+# CHECK-NEXT:   br    x16
+
+## The absolute target has no InputSection, but the thunk still materializes
+## its separate value.
+# CHECK-LABEL: <_absolute_target.thunk.0>:
+# CHECK-NEXT:   adrp  x16, 0x10000000
+# CHECK-NEXT:   add   x16, x16, #0
 # CHECK-NEXT:   br    x16
 
 # INTERP-LABEL: <__stubs>:

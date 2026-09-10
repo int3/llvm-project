@@ -15,6 +15,7 @@
 #include "lld/Common/LLVM.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/PointerUnion.h"
 
 namespace lld::macho {
 
@@ -138,34 +139,33 @@ extern llvm::MapVector<NamePair, ConcatOutputSection *> concatOutputSections;
 // distinct addresses and therefore need distinct thunks.
 //
 // After ICF, multiple Defined symbols may point to the same (isec, value)
-// yet remain as distinct Symbol pointers.  The equality predicate below
-// canonicalizes Defined symbols by (isec, value) so that ICF-folded copies
-// still share a single thunkMap entry when their addends match.
+// yet remain as distinct Symbol pointers. The constructor stores those symbols
+// as (isec, value) so ICF-folded copies still share a thunkMap entry when their
+// addends match. Non-Defined symbols retain their Symbol identity.
 struct ThunkKey {
-  Symbol *sym;
+  llvm::PointerUnion<InputSection *, Symbol *> referent;
+  uint64_t value;
   int64_t addend;
 
-  ThunkKey(Symbol *sym, int64_t addend) : sym(sym), addend(addend) {}
+  ThunkKey(Symbol *sym, int64_t addend) : value(0), addend(addend) {
+    if (const auto *d = dyn_cast<Defined>(sym)) {
+      referent = d->isec();
+      value = d->value;
+    } else {
+      referent = sym;
+    }
+  }
   ThunkKey(Relocation &r) : ThunkKey(cast<Symbol *>(r.referent), r.addend) {}
 
   bool operator==(const ThunkKey &other) const {
-    if (addend != other.addend)
-      return false;
-    if (sym == other.sym)
-      return true;
-    const auto *dl = dyn_cast<Defined>(sym);
-    const auto *dr = dyn_cast<Defined>(other.sym);
-    if (dl && dr)
-      return dl->isec() == dr->isec() && dl->value == dr->value;
-    return false;
+    return referent == other.referent && value == other.value &&
+           addend == other.addend;
   }
 };
 
 struct ThunkMapKeyInfo {
   static unsigned getHashValue(const ThunkKey &k) {
-    if (const auto *d = dyn_cast<Defined>(k.sym))
-      return llvm::hash_combine(d->isec(), d->value, k.addend);
-    return llvm::hash_combine(k.sym, k.addend);
+    return llvm::hash_combine(k.referent.getOpaqueValue(), k.value, k.addend);
   }
   static bool isEqual(const ThunkKey &lhs, const ThunkKey &rhs) {
     return lhs == rhs;
