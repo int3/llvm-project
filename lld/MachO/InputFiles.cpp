@@ -846,8 +846,9 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
                            const char *strtab, bool subsectionsViaSymbols) {
   using NList = typename LP::nlist;
 
-  // Groups indices of the symbols by the sections that contain them.
-  std::vector<std::vector<uint32_t>> symbolsBySection(sections.size());
+  // Count section-symbol indices first, then store them in one contiguous
+  // array while preserving their original nlist order within each section.
+  SmallVector<uint32_t, 32> sectionOffsets(sections.size() + 1, 0);
   symbols.resize(nList.size());
   SmallVector<unsigned, 32> undefineds;
   for (uint32_t i = 0; i < nList.size(); ++i) {
@@ -874,7 +875,7 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
       // parseSections() may have chosen not to parse this section.
       if (subsections.empty())
         continue;
-      symbolsBySection[sym.n_sect - 1].push_back(i);
+      ++sectionOffsets[sym.n_sect - 1];
     } else if (isUndef(sym)) {
       undefineds.push_back(i);
     } else {
@@ -882,11 +883,33 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
     }
   }
 
+  uint32_t totalIndices = 0;
+  for (uint32_t &offset : MutableArrayRef<uint32_t>(sectionOffsets).drop_back()) {
+    totalIndices += offset;
+    offset = totalIndices;
+  }
+  sectionOffsets.back() = totalIndices;
+
+  SmallVector<uint32_t, 0> symbolIndices;
+  symbolIndices.resize_for_overwrite(totalIndices);
+  for (size_t i = nList.size(); i-- != 0;) {
+    const NList &sym = nList[i];
+    if ((sym.n_type & (N_STAB | N_TYPE)) != N_SECT)
+      continue;
+    Subsections &subsections = sections[sym.n_sect - 1]->subsections;
+    if (subsections.empty())
+      continue;
+    symbolIndices[--sectionOffsets[sym.n_sect - 1]] =
+        static_cast<uint32_t>(i);
+  }
+
   for (size_t i = 0; i < sections.size(); ++i) {
     Subsections &subsections = sections[i]->subsections;
     if (subsections.empty())
       continue;
-    std::vector<uint32_t> &symbolIndices = symbolsBySection[i];
+    MutableArrayRef<uint32_t> sectionSymbolIndices =
+        MutableArrayRef<uint32_t>(symbolIndices).slice(
+            sectionOffsets[i], sectionOffsets[i + 1] - sectionOffsets[i]);
     uint64_t sectionAddr = sectionHeaders[i].addr;
     uint32_t sectionAlign = 1u << sectionHeaders[i].align;
 
@@ -894,8 +917,8 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
     // parseSections(), so we simply need to match Symbols to the corresponding
     // subsection here.
     if (sections[i]->doneSplitting) {
-      for (size_t j = 0; j < symbolIndices.size(); ++j) {
-        const uint32_t symIndex = symbolIndices[j];
+      for (size_t j = 0; j < sectionSymbolIndices.size(); ++j) {
+        const uint32_t symIndex = sectionSymbolIndices[j];
         const NList &sym = nList[symIndex];
         StringRef name = strtab + sym.n_strx;
         uint64_t symbolOffset = sym.n_value - sectionAddr;
@@ -921,7 +944,7 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
     // along symbol boundaries.
     // We populate subsections by repeatedly splitting the last (highest
     // address) subsection.
-    llvm::stable_sort(symbolIndices, [&](uint32_t lhs, uint32_t rhs) {
+    llvm::stable_sort(sectionSymbolIndices, [&](uint32_t lhs, uint32_t rhs) {
       // Put extern weak symbols after other symbols at the same address so
       // that weak symbol coalescing works correctly. See
       // SymbolTable::addDefined() for details.
@@ -932,15 +955,16 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
     });
     size_t sameAddrGroupIdx = 0;
     bool sameAddrHasRegularSymbol = false;
-    for (size_t j = 0; j < symbolIndices.size(); ++j) {
-      const uint32_t symIndex = symbolIndices[j];
+    for (size_t j = 0; j < sectionSymbolIndices.size(); ++j) {
+      const uint32_t symIndex = sectionSymbolIndices[j];
       const NList &sym = nList[symIndex];
       // An ordinary symbol establishes an atom boundary for every symbol at
       // its address, even when a local alt entry precedes it in the nlist.
       if (j == sameAddrGroupIdx) {
         sameAddrHasRegularSymbol = false;
-        while (sameAddrGroupIdx < symbolIndices.size()) {
-          const NList &sameAddrSym = nList[symbolIndices[sameAddrGroupIdx]];
+        while (sameAddrGroupIdx < sectionSymbolIndices.size()) {
+          const NList &sameAddrSym =
+              nList[sectionSymbolIndices[sameAddrGroupIdx]];
           if (sameAddrSym.n_value != sym.n_value)
             break;
           sameAddrHasRegularSymbol |= !(sameAddrSym.n_desc & N_ALT_ENTRY);
@@ -954,8 +978,8 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
       uint64_t subsecAddr = sectionAddr + subsec.offset;
       size_t symbolOffset = sym.n_value - subsecAddr;
       uint64_t symbolSize =
-          j + 1 < symbolIndices.size()
-              ? nList[symbolIndices[j + 1]].n_value - sym.n_value
+          j + 1 < sectionSymbolIndices.size()
+              ? nList[sectionSymbolIndices[j + 1]].n_value - sym.n_value
               : isec->data.size() - symbolOffset;
       const bool isInteriorAltEntry =
           (sym.n_desc & N_ALT_ENTRY) && !sameAddrHasRegularSymbol;
