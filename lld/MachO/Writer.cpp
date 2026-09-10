@@ -1134,6 +1134,10 @@ static void sortSegmentsAndSections() {
 
   orderObjCStubsByCallerPriority(isecPriorities);
 
+  bool hasPositivePriority =
+      llvm::any_of(isecPriorities, [](const auto &priority) {
+        return priority.second > 0;
+      });
   uint32_t sectionIndex = 0;
   for (OutputSegment *seg : outputSegments) {
     seg->sortOutputSections();
@@ -1165,11 +1169,22 @@ static void sortSegmentsAndSections() {
             merged->inputs.begin(), merged->inputs.end(),
             [](InputSection *isec) { return !isec->isCold; });
         if (!isecPriorities.empty()) {
-          std::stable_sort(merged->inputs.begin(), coldIt,
-                           [&](InputSection *a, InputSection *b) {
-                             return isecPriorities.lookup(a) <
-                                    isecPriorities.lookup(b);
-                           });
+          auto comparePriority = [&](InputSection *a, InputSection *b) {
+            return isecPriorities.lookup(a) < isecPriorities.lookup(b);
+          };
+          if (hasPositivePriority) {
+            std::stable_sort(merged->inputs.begin(), coldIt, comparePriority);
+          } else {
+            // Priorities default to zero, and entries with explicit zero values
+            // are possible. Keep that tail in input order; only negative
+            // priorities need sorting.
+            auto priorityEnd = std::stable_partition(
+                merged->inputs.begin(), coldIt, [&](InputSection *isec) {
+                  return isecPriorities.lookup(isec) < 0;
+                });
+            std::stable_sort(merged->inputs.begin(), priorityEnd,
+                             comparePriority);
+          }
         }
       }
     }
