@@ -54,6 +54,7 @@
 #include "SymbolTable.h"
 #include "Symbols.h"
 #include "SyntheticSections.h"
+#include "TapiSymbols.h"
 #include "Target.h"
 
 #include "lld/Common/CommonLinkerContext.h"
@@ -2361,8 +2362,36 @@ static bool isTargetPlatformArchCompatible(
   return isArchABICompatible(archSet, target.Arch);
 }
 
+void macho::prepareTapiSymbols(const InterfaceFile &interface,
+                               PreparedTapiSymbols &prepared) {
+  prepared.normalSymbols.reserve(interface.symbolsCount());
+  for (const auto *symbol : interface.symbols()) {
+    if (!isArchABICompatible(symbol->getArchitectures(), config->arch()))
+      continue;
+    // handleLDSymbol() mutates the dylib and the symbol table, so it stays on
+    // the ordered thread; record which symbols it consumes. It consumes
+    // exactly the "$ld$"-prefixed names.
+    if (symbol->getName().starts_with("$ld$")) {
+      prepared.ldSymbols.push_back(symbol);
+      continue;
+    }
+
+    switch (symbol->getKind()) {
+    case EncodeKind::GlobalSymbol:
+    case EncodeKind::ObjectiveCClass:
+    case EncodeKind::ObjectiveCClassEHType:
+    case EncodeKind::ObjectiveCInstanceVariable:
+      prepared.normalSymbols.push_back(symbol);
+    }
+  }
+  // interface.symbols() order is non-deterministic.
+  llvm::sort(prepared.normalSymbols,
+             [](auto *l, auto *r) { return l->getName() < r->getName(); });
+}
+
 DylibFile::DylibFile(const InterfaceFile &interface, DylibFile *umbrella,
-                     bool isBundleLoader, bool explicitlyLinked)
+                     bool isBundleLoader, bool explicitlyLinked,
+                     const PreparedTapiSymbols *preparedSymbols)
     : InputFile(DylibKind, interface), refState(RefState::Unreferenced),
       explicitlyLinked(explicitlyLinked), isBundleLoader(isBundleLoader) {
   // FIXME: Add test for the missing TBD code path.
@@ -2414,28 +2443,39 @@ DylibFile::DylibFile(const InterfaceFile &interface, DylibFile *umbrella,
                                        symbol.isThreadLocalValue()));
   };
 
-  std::vector<const llvm::MachO::Symbol *> normalSymbols;
-  normalSymbols.reserve(interface.symbolsCount());
-  for (const auto *symbol : interface.symbols()) {
-    if (!isArchABICompatible(symbol->getArchitectures(), config->arch()))
-      continue;
-    if (handleLDSymbol(symbol->getName()))
-      continue;
+  std::vector<const llvm::MachO::Symbol *> ownedNormalSymbols;
+  const std::vector<const llvm::MachO::Symbol *> *normalSymbols;
+  if (preparedSymbols) {
+    // The arch filter, the kind classification and the name sort were done off
+    // the ordered walk; the ordered side effects still happen here, in the same
+    // order as the single-pass loop below.
+    for (const llvm::MachO::Symbol *symbol : preparedSymbols->ldSymbols)
+      handleLDSymbol(symbol->getName());
+    normalSymbols = &preparedSymbols->normalSymbols;
+  } else {
+    ownedNormalSymbols.reserve(interface.symbolsCount());
+    for (const auto *symbol : interface.symbols()) {
+      if (!isArchABICompatible(symbol->getArchitectures(), config->arch()))
+        continue;
+      if (handleLDSymbol(symbol->getName()))
+        continue;
 
-    switch (symbol->getKind()) {
-    case EncodeKind::GlobalSymbol:
-    case EncodeKind::ObjectiveCClass:
-    case EncodeKind::ObjectiveCClassEHType:
-    case EncodeKind::ObjectiveCInstanceVariable:
-      normalSymbols.push_back(symbol);
+      switch (symbol->getKind()) {
+      case EncodeKind::GlobalSymbol:
+      case EncodeKind::ObjectiveCClass:
+      case EncodeKind::ObjectiveCClassEHType:
+      case EncodeKind::ObjectiveCInstanceVariable:
+        ownedNormalSymbols.push_back(symbol);
+      }
     }
+    // interface.symbols() order is non-deterministic.
+    llvm::sort(ownedNormalSymbols,
+               [](auto *l, auto *r) { return l->getName() < r->getName(); });
+    normalSymbols = &ownedNormalSymbols;
   }
-  // interface.symbols() order is non-deterministic.
-  llvm::sort(normalSymbols,
-             [](auto *l, auto *r) { return l->getName() < r->getName(); });
 
   // TODO(compnerd) filter out symbols based on the target platform
-  for (const auto *symbol : normalSymbols) {
+  for (const auto *symbol : *normalSymbols) {
     switch (symbol->getKind()) {
     case EncodeKind::GlobalSymbol:
       addSymbol(*symbol, symbol->getName());

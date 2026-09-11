@@ -35,6 +35,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/BinaryFormat/Magic.h"
 #include "llvm/CGData/CodeGenDataWriter.h"
@@ -1429,8 +1430,114 @@ static void handleSymbolPatterns(InputArgList &args,
     parseSymbolPatternsFile(arg, symbolPatterns);
 }
 
+// Pipelined TAPI preparation (see Driver.h). Parsing a TBD is a large,
+// order-independent part of initial loading, so it is started before the
+// ordered input walk and overlapped with it.
+static bool canPipelineTapiFiles() {
+#if !LLVM_ENABLE_THREADS
+  return false;
+#else
+  // At one thread a spawned task runs inline, in a different order.
+  if (parallel::strategy.ThreadsRequested == 1)
+    return false;
+  // Read workers prepare their own deferred TAPI inputs.
+  if (config->readWorkers)
+    return false;
+  // --reproduce records each tar member at the ordered readFile() call.
+  if (tar)
+    return false;
+  // -print_dylib_search would report the speculative searches out of order.
+  if (config->printDylibSearch)
+    return false;
+  return true;
+#endif
+}
+
+// Reads one resolved input path silently and, if it is a TBD, starts its parse.
+// Speculative: a read failure, a non-TBD file or an input which is never loaded
+// costs worker time only, and is still read, diagnosed and published by the
+// ordered walk.
+static void pipelineTapiPath(StringRef path) {
+  // An object or archive input is never a TBD; do not fault it in twice.
+  if (path.ends_with(".o") || path.ends_with(".a"))
+    return;
+  if (cachedReads.contains(CachedHashStringRef(path)))
+    return;
+
+  // Not readFile(): that diagnoses a failure and records a --reproduce member
+  // at the ordered position.
+  ErrorOr<std::unique_ptr<MemoryBuffer>> mbOrErr =
+      MemoryBuffer::getFile(path, /*IsText=*/false,
+                            /*RequiresNullTerminator=*/false);
+  if (!mbOrErr)
+    return;
+  MemoryBufferRef mbref = (*mbOrErr)->getMemBufferRef();
+  if (identify_magic(mbref.getBuffer()) != file_magic::tapi_file)
+    return;
+
+  // A TBD is never a fat file, so the ordered readFile() would return this
+  // buffer unchanged.
+  StringRef savedPath = saver().save(path);
+  MemoryBufferRef saved(mbref.getBuffer(), savedPath);
+  make<std::unique_ptr<MemoryBuffer>>(std::move(*mbOrErr));
+  cachedReads[CachedHashStringRef(savedPath)] = saved;
+  pipelineTapiFile(saved);
+}
+
+static void prepareCommandLineTapiFiles(const InputArgList &args) {
+  if (!canPipelineTapiFiles())
+    return;
+  startTapiPipeline();
+
+  // findLibrary(), findFramework() and rerootPath() are position independent,
+  // and the first two memoize their results, so resolving here changes nothing
+  // for the ordered walk.
+  for (const Arg *arg : args) {
+    switch (arg->getOption().getID()) {
+    case OPT_INPUT:
+    case OPT_needed_library:
+    case OPT_weak_library:
+    case OPT_reexport_library:
+    case OPT_force_load:
+    case OPT_load_hidden:
+      pipelineTapiPath(rerootPath(arg->getValue()));
+      break;
+    case OPT_filelist: {
+      ErrorOr<std::unique_ptr<MemoryBuffer>> mbOrErr =
+          MemoryBuffer::getFile(arg->getValue(), /*IsText=*/false,
+                                /*RequiresNullTerminator=*/false);
+      if (!mbOrErr)
+        break;
+      for (StringRef path : args::getLines((*mbOrErr)->getMemBufferRef()))
+        pipelineTapiPath(rerootPath(path));
+      break;
+    }
+    case OPT_l:
+    case OPT_needed_l:
+    case OPT_weak_l:
+    case OPT_reexport_l:
+    case OPT_hidden_l:
+      // A -l resolving to an archive or object is skipped by pipelineTapiPath().
+      if (std::optional<StringRef> path = findLibrary(arg->getValue()))
+        pipelineTapiPath(*path);
+      break;
+    case OPT_framework:
+    case OPT_needed_framework:
+    case OPT_weak_framework:
+    case OPT_reexport_framework:
+      if (std::optional<StringRef> path = findFramework(arg->getValue()))
+        pipelineTapiPath(*path);
+      break;
+    default:
+      break;
+    }
+  }
+}
+
 static void createFiles(const InputArgList &args) {
   TimeTraceScope timeScope("Load input files");
+  llvm::scope_exit endTapiPipeline([] { finishTapiPipeline(); });
+  prepareCommandLineTapiFiles(args);
   // This loop should be reserved for options whose exact ordering matters.
   // Other options should be handled via filtered() and/or getLastArg().
   bool isLazy = false;

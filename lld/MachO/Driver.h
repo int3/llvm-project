@@ -71,6 +71,10 @@ DylibFile *loadDylib(llvm::MemoryBufferRef mbref, DylibFile *umbrella = nullptr,
                      bool isBundleLoader = false,
                      bool explicitlyLinked = false);
 
+// Defined in InputFiles.h, which can name llvm::MachO::Symbol without
+// making the unqualified name ambiguous in Driver.cpp.
+struct PreparedTapiSymbols;
+
 struct PreparedTapiFile {
   explicit PreparedTapiFile(llvm::MemoryBufferRef buffer);
   PreparedTapiFile(PreparedTapiFile &&);
@@ -83,6 +87,14 @@ struct PreparedTapiFile {
   llvm::StringRef path;
   std::unique_ptr<llvm::MachO::InterfaceFile> interfaceFile;
   std::optional<std::string> error;
+  std::unique_ptr<PreparedTapiSymbols> symbols;
+  // Pipelined entries are published by a worker thread; guarded by the
+  // pipeline mutex. Entries prepared up front are already done.
+  bool done = true;
+  // A pipelined entry owns the path and the buffer it was read from, because
+  // it is created outside the ordered walk.
+  std::string pathStorage;
+  std::unique_ptr<llvm::MemoryBuffer> ownedBuffer;
 };
 
 void prepareTapiFiles(llvm::ArrayRef<llvm::MemoryBufferRef> buffers,
@@ -90,6 +102,15 @@ void prepareTapiFiles(llvm::ArrayRef<llvm::MemoryBufferRef> buffers,
 void setPreparedTapiFiles(
     llvm::ArrayRef<PreparedTapiFile *> preparedTapiFiles);
 void clearPreparedTapiFiles();
+
+// Pipelined TAPI preparation: TBD parses started before the ordered input walk
+// and overlapped with it. Preparation is speculative; the ordered walk still
+// reads, diagnoses and publishes every input exactly as before.
+void startTapiPipeline();
+void finishTapiPipeline();
+// Starts preparing an already-read TBD buffer. The buffer identifier must be
+// the path loadDylib() will look up, and must outlive the pipeline.
+void pipelineTapiFile(llvm::MemoryBufferRef buffer);
 
 void resetLoadedDylibs();
 

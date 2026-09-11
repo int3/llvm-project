@@ -216,6 +216,14 @@ public:
 };
 
 // .dylib or .tbd file
+// Defined in TapiSymbols.h.
+struct PreparedTapiSymbols;
+
+// Computes the order-independent half of the TAPI DylibFile constructor. Safe
+// to call off the ordered input walk.
+void prepareTapiSymbols(const llvm::MachO::InterfaceFile &interface,
+                        PreparedTapiSymbols &prepared);
+
 class DylibFile final : public InputFile {
 public:
   // Mach-O dylibs can re-export other dylibs as sub-libraries, meaning that the
@@ -229,7 +237,8 @@ public:
                      bool isBundleLoader, bool explicitlyLinked);
   explicit DylibFile(const llvm::MachO::InterfaceFile &interface,
                      DylibFile *umbrella, bool isBundleLoader,
-                     bool explicitlyLinked);
+                     bool explicitlyLinked,
+                     const PreparedTapiSymbols *preparedSymbols = nullptr);
   explicit DylibFile(DylibFile *umbrella);
 
   void parseLoadCommands(MemoryBufferRef mb);

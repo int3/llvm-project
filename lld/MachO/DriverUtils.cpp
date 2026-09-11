@@ -9,12 +9,14 @@
 #include "Config.h"
 #include "Driver.h"
 #include "InputFiles.h"
+#include "TapiSymbols.h"
 
 #include "lld/Common/Args.h"
 #include "lld/Common/CommonLinkerContext.h"
 #include "lld/Common/Reproduce.h"
 #include "llvm/ADT/CachedHashString.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/BinaryFormat/Magic.h"
 #include "llvm/LTO/LTO.h"
 #include "llvm/Option/Arg.h"
 #include "llvm/Option/ArgList.h"
@@ -25,6 +27,8 @@
 #include "llvm/Support/Path.h"
 #include "llvm/TextAPI/InterfaceFile.h"
 #include "llvm/TextAPI/TextAPIReader.h"
+#include <condition_variable>
+#include <mutex>
 
 using namespace llvm;
 using namespace llvm::MachO;
@@ -236,9 +240,11 @@ macho::PreparedTapiFile::~PreparedTapiFile() = default;
 static void prepareTapiFile(PreparedTapiFile *file) {
   Expected<std::unique_ptr<InterfaceFile>> result =
       TextAPIReader::get(file->buffer);
-  if (result)
+  if (result) {
     file->interfaceFile = std::move(*result);
-  else
+    file->symbols = std::make_unique<PreparedTapiSymbols>();
+    prepareTapiSymbols(*file->interfaceFile, *file->symbols);
+  } else
     file->error = toString(result.takeError());
 }
 
@@ -270,6 +276,209 @@ void macho::setPreparedTapiFiles(
 }
 
 void macho::clearPreparedTapiFiles() { ::preparedTapiFiles.clear(); }
+
+//===----------------------------------------------------------------------===//
+// Pipelined TAPI preparation
+//
+// TBD parsing is a large, order-independent part of initial loading. The
+// pipeline starts those parses before the ordered input walk and overlaps them
+// with it. Preparation never reads the symbol table, never saves a string and
+// never emits a diagnostic: the ordered walk still reads, diagnoses and
+// publishes every input in its original order, and simply picks up an already
+// parsed InterfaceFile when one is ready.
+//===----------------------------------------------------------------------===//
+
+namespace {
+struct TapiPipelineState {
+  // Entries keyed by the path loadDylib() looks up. unique_ptr keeps addresses
+  // stable while workers hold them.
+  llvm::DenseMap<CachedHashStringRef, std::unique_ptr<PreparedTapiFile>> files;
+  std::mutex mutex;
+  std::condition_variable cv;
+  // Declared last so that it is destroyed first: the group joins its workers
+  // while the state they use is still alive.
+  llvm::parallel::TaskGroup group;
+};
+} // namespace
+
+static std::unique_ptr<TapiPipelineState> tapiPipeline;
+
+static void runTapiPipelineTask(TapiPipelineState *state,
+                                PreparedTapiFile *file);
+
+// Registers one already-read TBD. Returns null when the path is already
+// pipelined. \p ownPath copies the path, for callers whose path is transient.
+static PreparedTapiFile *addPipelinedTapiFile(TapiPipelineState *state,
+                                              StringRef path, StringRef content,
+                                              std::unique_ptr<MemoryBuffer> owned,
+                                              bool ownPath) {
+  auto entry = std::make_unique<PreparedTapiFile>(MemoryBufferRef());
+  if (ownPath) {
+    entry->pathStorage = path.str();
+    path = entry->pathStorage;
+  }
+  entry->path = path;
+  entry->buffer = MemoryBufferRef(content, path);
+  entry->ownedBuffer = std::move(owned);
+  entry->done = false;
+  PreparedTapiFile *file = entry.get();
+
+  std::lock_guard<std::mutex> lock(state->mutex);
+  if (!state->files.try_emplace(CachedHashStringRef(path), std::move(entry))
+           .second)
+    return nullptr;
+  return file;
+}
+
+// A silent mirror of resolveDylibPath(): it must not log a search, must not
+// save a string and must not touch the dependency tracker, because the ordered
+// findDylib() still performs the real, diagnosed lookup. A miss here only means
+// that this re-export is not prepared.
+static bool probeDylibPath(const Twine &candidate, SmallVectorImpl<char> &out) {
+  SmallString<261> buf;
+  StringRef path = candidate.toStringRef(buf);
+  SmallString<261> tbdPath = path;
+  llvm::sys::path::replace_extension(tbdPath, ".tbd");
+  if (fs::exists(tbdPath)) {
+    out.assign(tbdPath.begin(), tbdPath.end());
+    return true;
+  }
+  if (fs::exists(path)) {
+    out.assign(path.begin(), path.end());
+    return true;
+  }
+  return false;
+}
+
+// A silent mirror of the on-disk half of findDylib()'s search order. Install
+// names which need the not-yet-constructed umbrella (@loader_path, @rpath,
+// @executable_path) and documents inlined in a parent TBD are not prepared.
+static bool probeReexportPath(StringRef path, SmallVectorImpl<char> &out) {
+  if (path.contains('@'))
+    return false;
+
+  // 1. Install name basename in -F / -L directories.
+  StringRef stem = llvm::sys::path::stem(path);
+  SmallString<128> frameworkName("/");
+  frameworkName += stem;
+  frameworkName += ".framework/";
+  size_t i = path.rfind(frameworkName);
+  if (i != StringRef::npos) {
+    StringRef frameworkPath = path.substr(i + 1);
+    for (StringRef dir : config->frameworkSearchPaths) {
+      SmallString<261> candidate = dir;
+      llvm::sys::path::append(candidate, frameworkPath);
+      if (probeDylibPath(candidate.str(), out))
+        return true;
+    }
+  } else {
+    for (StringRef dir : config->librarySearchPaths)
+      for (StringRef ext : {".tbd", ".dylib", ".so"}) {
+        SmallString<261> candidate = dir;
+        llvm::sys::path::append(candidate, stem);
+        candidate += ext;
+        if (fs::exists(candidate)) {
+          out.assign(candidate.begin(), candidate.end());
+          return true;
+        }
+      }
+  }
+
+  // 2. As absolute path.
+  if (llvm::sys::path::is_absolute(path, llvm::sys::path::Style::posix))
+    for (StringRef root : config->systemLibraryRoots)
+      if (probeDylibPath(root + path, out))
+        return true;
+
+  return false;
+}
+
+// Re-exports are the larger half of the initial TBD parsing work, and they are
+// only known once the parent is parsed, so the worker resolves and spawns them
+// itself. The ordered parseReexports() still recurses in its original order.
+static void pipelineReexports(TapiPipelineState *state,
+                              const InterfaceFile &interface) {
+  for (const llvm::MachO::InterfaceFileRef &ref :
+       interface.reexportedLibraries()) {
+    SmallString<261> resolved;
+    if (!probeReexportPath(ref.getInstallName(), resolved))
+      continue;
+    ErrorOr<std::unique_ptr<MemoryBuffer>> mbOrErr =
+        MemoryBuffer::getFile(resolved, /*IsText=*/false,
+                              /*RequiresNullTerminator=*/false);
+    if (!mbOrErr)
+      continue;
+    MemoryBufferRef mbref = (*mbOrErr)->getMemBufferRef();
+    if (identify_magic(mbref.getBuffer()) != file_magic::tapi_file)
+      continue;
+    StringRef content = mbref.getBuffer();
+    if (PreparedTapiFile *child =
+            addPipelinedTapiFile(state, resolved, content,
+                                 std::move(*mbOrErr), /*ownPath=*/true))
+      state->group.spawn([state, child] { runTapiPipelineTask(state, child); });
+  }
+}
+
+static void runTapiPipelineTask(TapiPipelineState *state,
+                                PreparedTapiFile *file) {
+  prepareTapiFile(file);
+  if (file->interfaceFile)
+    pipelineReexports(state, *file->interfaceFile);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    file->done = true;
+  }
+  state->cv.notify_all();
+}
+
+void macho::startTapiPipeline() {
+  assert(!tapiPipeline);
+  tapiPipeline = std::make_unique<TapiPipelineState>();
+}
+
+void macho::pipelineTapiFile(MemoryBufferRef buffer) {
+  TapiPipelineState *state = tapiPipeline.get();
+  assert(state);
+  if (PreparedTapiFile *file = addPipelinedTapiFile(
+          state, buffer.getBufferIdentifier(), buffer.getBuffer(),
+          /*owned=*/nullptr, /*ownPath=*/false))
+    state->group.spawn([state, file] { runTapiPipelineTask(state, file); });
+}
+
+void macho::finishTapiPipeline() {
+  // ~TapiPipelineState destroys the task group first, joining every worker
+  // before the state they use goes away.
+  tapiPipeline.reset();
+}
+
+// Returns the prepared entry for \p path, waiting for a pipelined parse which
+// is still running, or null if there is none. A pipelined entry is owned by the
+// pipeline, so its ownership is handed to \p owner: the caller's use of the
+// entry outlives its removal from the map, and nothing may point into it after
+// that scope ends.
+static PreparedTapiFile *
+takePreparedTapiFile(CachedHashStringRef path,
+                     std::unique_ptr<PreparedTapiFile> &owner) {
+  if (TapiPipelineState *state = tapiPipeline.get()) {
+    std::unique_lock<std::mutex> lock(state->mutex);
+    auto it = state->files.find(path);
+    if (it != state->files.end()) {
+      PreparedTapiFile *file = it->second.get();
+      state->cv.wait(lock, [file] { return file->done; });
+      owner = std::move(it->second);
+      state->files.erase(it);
+      return file;
+    }
+  }
+
+  // Entries prepared by the read workers are owned by their caller.
+  auto it = ::preparedTapiFiles.find(path);
+  if (it == ::preparedTapiFiles.end())
+    return nullptr;
+  PreparedTapiFile *file = it->second;
+  ::preparedTapiFiles.erase(it);
+  return file;
+}
 
 static StringRef realPathIfDifferent(StringRef path) {
   SmallString<128> realPathBuf;
@@ -313,16 +522,19 @@ DylibFile *macho::loadDylib(MemoryBufferRef mbref, DylibFile *umbrella,
   file_magic magic = identify_magic(mbref.getBuffer());
   if (magic == file_magic::tapi_file) {
     std::unique_ptr<InterfaceFile> interfaceFile;
-    auto it = preparedTapiFiles.find(path);
-    if (it != preparedTapiFiles.end()) {
-      PreparedTapiFile *prepared = it->second;
-      preparedTapiFiles.erase(it);
+    const PreparedTapiSymbols *preparedSymbols = nullptr;
+    // Keeps a pipelined entry, and so the symbol vectors pointing into its
+    // InterfaceFile, alive for as long as preparedSymbols is used below.
+    std::unique_ptr<PreparedTapiFile> preparedOwner;
+    if (PreparedTapiFile *prepared =
+            takePreparedTapiFile(path, preparedOwner)) {
       if (prepared->error) {
         error("could not load TAPI file at " + mbref.getBufferIdentifier() +
               ": " + *prepared->error);
         return nullptr;
       }
       interfaceFile = std::move(prepared->interfaceFile);
+      preparedSymbols = prepared->symbols.get();
     } else {
       Expected<std::unique_ptr<InterfaceFile>> result = TextAPIReader::get(mbref);
       if (!result) {
@@ -337,9 +549,8 @@ DylibFile *macho::loadDylib(MemoryBufferRef mbref, DylibFile *umbrella,
             ": empty prepared TAPI file");
       return nullptr;
     }
-    file =
-        make<DylibFile>(*interfaceFile, umbrella, isBundleLoader,
-                        explicitlyLinked);
+    file = make<DylibFile>(*interfaceFile, umbrella, isBundleLoader,
+                           explicitlyLinked, preparedSymbols);
 
     // parseReexports() can recursively call loadDylib(). That's fine since
     // we wrote the DylibFile we just loaded to the loadDylib cache via the
@@ -392,6 +603,7 @@ DylibFile *macho::loadDylib(MemoryBufferRef mbref, DylibFile *umbrella,
 void macho::resetLoadedDylibs() {
   loadedDylibs.clear();
   preparedTapiFiles.clear();
+  finishTapiPipeline();
 }
 
 std::optional<StringRef>
