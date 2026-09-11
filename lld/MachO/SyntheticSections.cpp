@@ -1340,22 +1340,19 @@ void SymtabSection::emitStabs() {
     else
       parallelForEach(sourceFiles, buildStabs);
 
-    size_t numStabs = stabs.size() + sourceFiles.size() * 3;
+    size_t numMarkers = stabs.size() + sourceFiles.size() * 3;
     if (sourceFiles.empty() && !stabs.empty())
-      ++numStabs;
-    for (const SourceFile &sourceFile : sourceFiles)
-      numStabs += sourceFile.stabs.size();
-    stabs.reserve(numStabs);
+      ++numMarkers;
+    stabs.reserve(numMarkers);
+    stabsFragments.reserve(sourceFiles.size());
     for (size_t i = 0; i != sourceFiles.size(); ++i) {
       if (i != 0)
         emitEndSourceStab();
       SourceFile &sourceFile = sourceFiles[i];
       emitBeginSourceStab(sourceFile.path);
       emitObjectFileStab(sourceFile.file);
-      stabs.insert(stabs.end(),
-                   std::make_move_iterator(sourceFile.stabs.begin()),
-                   std::make_move_iterator(sourceFile.stabs.end()));
-      std::vector<StabsEntry>().swap(sourceFile.stabs);
+      fragmentEntryCount += sourceFile.stabs.size();
+      stabsFragments.push_back({stabs.size(), std::move(sourceFile.stabs)});
     }
 
     if (!stabs.empty())
@@ -1527,7 +1524,7 @@ void SymtabSection::finalizeContents() {
   }
 
   emitStabs();
-  uint32_t symtabIndex = stabs.size();
+  uint32_t symtabIndex = getNumStabs();
   for (const SymtabEntry &entry :
        concat<SymtabEntry>(localSymbols, externalSymbols, undefinedSymbols)) {
     entry.sym->symtabIndex = symtabIndex++;
@@ -1535,7 +1532,7 @@ void SymtabSection::finalizeContents() {
 }
 
 uint32_t SymtabSection::getNumSymbols() const {
-  return stabs.size() + localSymbols.size() + externalSymbols.size() +
+  return getNumStabs() + localSymbols.size() + externalSymbols.size() +
          undefinedSymbols.size();
 }
 
@@ -1556,14 +1553,24 @@ template <class LP> void SymtabSectionImpl<LP>::writeTo(uint8_t *buf) const {
   auto *nList = reinterpret_cast<typename LP::nlist *>(buf);
   // Emit the stabs entries before the "real" symbols. We cannot emit them
   // after as that would render Symbol::symtabIndex inaccurate.
-  for (const StabsEntry &entry : stabs) {
-    nList->n_strx = entry.strx;
-    nList->n_type = entry.type;
-    nList->n_sect = entry.sect;
-    nList->n_desc = entry.desc;
-    nList->n_value = entry.value;
-    ++nList;
+  auto writeStabs = [&](ArrayRef<StabsEntry> entries) {
+    for (const StabsEntry &entry : entries) {
+      nList->n_strx = entry.strx;
+      nList->n_type = entry.type;
+      nList->n_sect = entry.sect;
+      nList->n_desc = entry.desc;
+      nList->n_value = entry.value;
+      ++nList;
+    }
+  };
+  size_t markerBegin = 0;
+  for (const StabsFragment &fragment : stabsFragments) {
+    writeStabs(ArrayRef<StabsEntry>(stabs).slice(
+        markerBegin, fragment.markerEnd - markerBegin));
+    writeStabs(fragment.entries);
+    markerBegin = fragment.markerEnd;
   }
+  writeStabs(ArrayRef<StabsEntry>(stabs).drop_front(markerBegin));
 
   for (const SymtabEntry &entry : concat<const SymtabEntry>(
            localSymbols, externalSymbols, undefinedSymbols)) {

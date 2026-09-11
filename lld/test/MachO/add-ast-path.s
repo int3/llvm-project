@@ -4,6 +4,7 @@
 # RUN: dsymutil -s %t | FileCheck %s
 # CHECK:      [     0] {{[0-9a-f]+}} 32 (N_AST        ) 00     0000   0000000000000000 'asdf'
 # CHECK-NEXT: [     1] {{[0-9a-f]+}} 32 (N_AST        ) 00     0000   0000000000000000 'fdsa'
+# CHECK-NEXT: [     2] {{[0-9a-f]+}} 64 (N_SO         ) 01     0000   0000000000000000
 
 .globl _main
 

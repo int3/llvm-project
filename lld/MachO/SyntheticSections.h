@@ -484,6 +484,11 @@ struct StabsEntry {
 static_assert(sizeof(StabsEntry) == 16,
               "Keep StabsEntry compact; it is stored in vectors per source file");
 
+struct StabsFragment {
+  size_t markerEnd;
+  std::vector<StabsEntry> entries;
+};
+
 // Symbols of the same type must be laid out contiguously: we choose to emit
 // all local symbols first, then external symbols, and finally undefined
 // symbols. For each symbol type, the LC_DYSYMTAB load command will record the
@@ -493,7 +498,7 @@ public:
   void finalizeContents() override;
   uint32_t getNumSymbols() const;
   uint32_t getNumLocalSymbols() const {
-    return stabs.size() + localSymbols.size();
+    return getNumStabs() + localSymbols.size();
   }
   uint32_t getNumExternalSymbols() const { return externalSymbols.size(); }
   uint32_t getNumUndefinedSymbols() const { return undefinedSymbols.size(); }
@@ -507,12 +512,18 @@ private:
   void emitStabs();
 
 protected:
+  size_t getNumStabs() const { return stabs.size() + fragmentEntryCount; }
+
   SymtabSection(StringTableSection &);
 
   StringTableSection &stringTableSection;
   // STABS symbols are always local symbols, but we represent them with special
   // entries because they may use fields like n_sect and n_desc differently.
+  // With deduplicated source STABS, this retains markers while each source's
+  // body remains in stabsFragments; no-dedup keeps the complete flat sequence.
   std::vector<StabsEntry> stabs;
+  std::vector<StabsFragment> stabsFragments;
+  size_t fragmentEntryCount = 0;
   std::vector<SymtabEntry> localSymbols;
   std::vector<SymtabEntry> externalSymbols;
   std::vector<SymtabEntry> undefinedSymbols;

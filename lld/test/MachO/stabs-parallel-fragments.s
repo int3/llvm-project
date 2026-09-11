@@ -5,17 +5,27 @@
 # RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin %s -o %t/b.o
 # RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin %s -o %t/c.o
 # RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin %s -o %t/d.o
-# RUN: %no-lsystem-lld -arch arm64 -dylib -install_name @rpath/test.dylib -no_uuid --threads=1 \
+# RUN: %no-lsystem-lld -arch arm64 -dylib -install_name @rpath/test.dylib -no_uuid -undefined dynamic_lookup --threads=1 \
 # RUN:     -add_ast_path header.pcm %t/a.o %t/b.o %t/c.o %t/d.o -o %t/threads-1.dylib
-# RUN: %no-lsystem-lld -arch arm64 -dylib -install_name @rpath/test.dylib -no_uuid --threads=2 \
+# RUN: %no-lsystem-lld -arch arm64 -dylib -install_name @rpath/test.dylib -no_uuid -undefined dynamic_lookup --threads=2 \
 # RUN:     -add_ast_path header.pcm %t/a.o %t/b.o %t/c.o %t/d.o -o %t/threads-2.dylib
-# RUN: %no-lsystem-lld -arch arm64 -dylib -install_name @rpath/test.dylib -no_uuid --threads=4 \
+# RUN: %no-lsystem-lld -arch arm64 -dylib -install_name @rpath/test.dylib -no_uuid -undefined dynamic_lookup --threads=4 \
 # RUN:     -add_ast_path header.pcm %t/a.o %t/b.o %t/c.o %t/d.o -o %t/threads-4.dylib
-# RUN: %no-lsystem-lld -arch arm64 -dylib -install_name @rpath/test.dylib -no_uuid --threads=8 \
+# RUN: %no-lsystem-lld -arch arm64 -dylib -install_name @rpath/test.dylib -no_uuid -undefined dynamic_lookup --threads=8 \
 # RUN:     -add_ast_path header.pcm %t/a.o %t/b.o %t/c.o %t/d.o -o %t/threads-8.dylib
 # RUN: cmp %t/threads-1.dylib %t/threads-2.dylib
 # RUN: cmp %t/threads-1.dylib %t/threads-4.dylib
 # RUN: cmp %t/threads-1.dylib %t/threads-8.dylib
+# RUN: obj2yaml %t/threads-8.dylib | FileCheck %s --check-prefix=COUNTS
+# RUN: llvm-objdump --macho --indirect-symbols %t/threads-8.dylib | FileCheck %s --check-prefix=INDIRECT
+
+# RUN: llvm-mc -filetype=obj -triple=arm64_32-apple-watchos %s -o %t/lp32.o
+# RUN: %lld-watchos -arch arm64_32 -dylib -install_name @rpath/test.dylib -no_uuid -undefined dynamic_lookup --threads=1 \
+# RUN:     -add_ast_path header.pcm %t/lp32.o -o %t/lp32-threads-1.dylib
+# RUN: %lld-watchos -arch arm64_32 -dylib -install_name @rpath/test.dylib -no_uuid -undefined dynamic_lookup --threads=8 \
+# RUN:     -add_ast_path header.pcm %t/lp32.o -o %t/lp32-threads-8.dylib
+# RUN: cmp %t/lp32-threads-1.dylib %t/lp32-threads-8.dylib
+# RUN: llvm-objdump --macho --indirect-symbols %t/lp32-threads-8.dylib | FileCheck %s --check-prefix=LP32
 # RUN: dsymutil -s %t/threads-8.dylib | FileCheck %s
 
 ## Four contributing objects cross the fragment threshold. They intentionally
@@ -36,9 +46,30 @@
 # CHECK-NEXT: (N_SO{{.*}}){{.*}} '/tmp{{[/\\]}}stabs-parallel-fragments.s'
 # CHECK-NEXT: (N_OSO{{.*}}){{.*}} '/{{.*}}/d.o'
 
+# COUNTS:      cmd:             LC_SYMTAB
+# COUNTS:      nsyms:           36
+# COUNTS:      cmd:             LC_DYSYMTAB
+# COUNTS:      ilocalsym:       0
+# COUNTS-NEXT: nlocalsym:       34
+# COUNTS:      iextdefsym:      34
+# COUNTS-NEXT: nextdefsym:      0
+# COUNTS:      iundefsym:       34
+# COUNTS-NEXT: nundefsym:       2
+
+# INDIRECT:      Indirect symbols for (__TEXT,__stubs) 1 entries
+# INDIRECT-NEXT: address            index name
+# INDIRECT-NEXT: 0x{{[0-9a-f]+}} {{[ ]*}}34 _stabs_dynamic_lookup
+# INDIRECT:      Indirect symbols for (__DATA,__la_symbol_ptr) 1 entries
+# INDIRECT-NEXT: address            index name
+# INDIRECT-NEXT: 0x{{[0-9a-f]+}} {{[ ]*}}34 _stabs_dynamic_lookup
+
+# LP32: Indirect symbols for (__TEXT,__stubs) 1 entries
+# LP32: _stabs_dynamic_lookup
+
 .text
 _duplicate_function:
 Lfunc_begin0:
+  bl _stabs_dynamic_lookup
   ret
 Lfunc_end0:
 
