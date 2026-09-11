@@ -442,6 +442,13 @@ public:
   static constexpr size_t emptyStringIndex = 1;
 
 private:
+  struct WriteChunk {
+    uint32_t beginStringIndex;
+    uint32_t beginByteOffset;
+  };
+
+  void recordWriteChunk();
+
   // ld64 emits string tables which start with a space and a zero byte. We
   // match its behavior here since some tools depend on it.
   // Consequently, the empty string will be at index 1, not zero.
@@ -451,6 +458,9 @@ private:
              stringMapShards>
       stringMaps;
   size_t size = 2;
+  std::vector<WriteChunk> writeChunks;
+  size_t nextWriteChunk = 1024 * 1024;
+  bool parallelWriteEnabled = false;
 };
 
 struct SymtabEntry {

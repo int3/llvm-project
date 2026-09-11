@@ -1676,7 +1676,21 @@ void IndirectSymtabSection::writeTo(uint8_t *buf) const {
 }
 
 StringTableSection::StringTableSection()
-    : LinkEditSection(segment_names::linkEdit, section_names::stringTable) {}
+    : LinkEditSection(segment_names::linkEdit, section_names::stringTable) {
+#if LLVM_ENABLE_THREADS
+  parallelWriteEnabled = parallel::strategy.ThreadsRequested != 1;
+#endif
+}
+
+void StringTableSection::recordWriteChunk() {
+  if (!parallelWriteEnabled || size < nextWriteChunk || size > UINT32_MAX)
+    return;
+  if (writeChunks.empty())
+    writeChunks.push_back({0, 0});
+  writeChunks.push_back(
+      {static_cast<uint32_t>(strings.size()), static_cast<uint32_t>(size)});
+  nextWriteChunk = size + 1024 * 1024;
+}
 
 uint32_t StringTableSection::addString(StringRef str) {
   uint32_t strx = size;
@@ -1688,6 +1702,7 @@ uint32_t StringTableSection::addString(StringRef str) {
       return it->second;
   }
 
+  recordWriteChunk();
   strings.push_back(str);
   size += str.size() + 1; // account for null terminator
   return strx;
@@ -1721,6 +1736,7 @@ void StringTableSection::addStringsInOrder(
     if (firstOccurrence[i] != i)
       continue;
     offsets[i] = size;
+    recordWriteChunk();
     strings.push_back(names[i].val());
     size += names[i].size() + 1;
   }
@@ -1734,11 +1750,27 @@ void StringTableSection::addStringsInOrder(
 }
 
 void StringTableSection::writeTo(uint8_t *buf) const {
-  uint32_t off = 0;
-  for (StringRef str : strings) {
-    memcpy(buf + off, str.data(), str.size());
-    off += str.size() + 1; // account for null terminator
+  if (!parallelWriteEnabled || writeChunks.size() < 2 || size > UINT32_MAX) {
+    uint32_t off = 0;
+    for (StringRef str : strings) {
+      memcpy(buf + off, str.data(), str.size());
+      off += str.size() + 1; // account for null terminator
+    }
+    return;
   }
+
+  parallelFor(0, writeChunks.size(), [&](size_t chunkIndex) {
+    const WriteChunk &chunk = writeChunks[chunkIndex];
+    size_t end = chunkIndex + 1 == writeChunks.size()
+                     ? strings.size()
+                     : writeChunks[chunkIndex + 1].beginStringIndex;
+    uint32_t off = chunk.beginByteOffset;
+    for (size_t i = chunk.beginStringIndex; i != end; ++i) {
+      StringRef str = strings[i];
+      memcpy(buf + off, str.data(), str.size());
+      off += str.size() + 1; // account for null terminator
+    }
+  });
 }
 
 static_assert((CodeSignatureSection::blobHeadersSize % 8) == 0);
