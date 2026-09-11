@@ -21,6 +21,15 @@ using namespace llvm;
 using namespace lld;
 using namespace lld::macho;
 
+namespace {
+template <typename T, typename... Args>
+T *constructOrReplaceSymbol(Symbol *sym, bool wasInserted, Args &&...args) {
+  if (wasInserted)
+    return new (sym) T(std::forward<Args>(args)...);
+  return replaceSymbol<T>(sym, std::forward<Args>(args)...);
+}
+} // namespace
+
 Symbol *SymbolTable::find(CachedHashStringRef cachedName) {
   auto it = symMap.find(cachedName);
   if (it == symMap.end())
@@ -35,12 +44,14 @@ std::pair<Symbol *, bool> SymbolTable::insert(StringRef name,
 
   if (wasInserted) {
     // Name is a new symbol.
-    it->second = reinterpret_cast<Symbol *>(make<SymbolUnion>());
+    it->second = reinterpret_cast<Symbol *>(
+        getSpecificAllocSingleton<SymbolUnion>().Allocate());
     symVector.push_back(it->second);
   }
   Symbol *sym = it->second;
 
-  sym->isUsedInRegularObj |= !file || isa<ObjFile>(file);
+  if (!wasInserted)
+    sym->isUsedInRegularObj |= !file || isa<ObjFile>(file);
   return {sym, wasInserted};
 }
 
@@ -209,11 +220,11 @@ Defined *SymbolTable::addDefined(StringRef name, InputFile *file,
                         config->outputType != MachO::MH_EXECUTE) ||
                        config->interposable) &&
                       !isPrivateExtern;
-  Defined *defined = replaceSymbol<Defined>(
-      s, name, file, isec, value, size, isWeakDef, /*isExternal=*/true,
-      isPrivateExtern, /*includeInSymtab=*/true, isReferencedDynamically,
-      noDeadStrip, overridesWeakDef, isWeakDefCanBeHidden, interposable,
-      isCold);
+  Defined *defined = constructOrReplaceSymbol<Defined>(
+      s, wasInserted, name, file, isec, value, size, isWeakDef,
+      /*isExternal=*/true, isPrivateExtern, /*includeInSymtab=*/true,
+      isReferencedDynamically, noDeadStrip, overridesWeakDef,
+      isWeakDefCanBeHidden, interposable, isCold);
   return defined;
 }
 
@@ -233,8 +244,8 @@ Symbol *SymbolTable::addUndefined(StringRef name, InputFile *file,
   RefState refState = isWeakRef ? RefState::Weak : RefState::Strong;
 
   if (wasInserted)
-    replaceSymbol<Undefined>(s, name, file, refState,
-                             /*wasBitcodeSymbol=*/false);
+    constructOrReplaceSymbol<Undefined>(s, /*wasInserted=*/true, name, file,
+                                        refState, /*wasBitcodeSymbol=*/false);
   else if (auto *lazy = dyn_cast<LazyArchive>(s))
     lazy->fetchArchiveMember();
   else if (isa<LazyObject>(s))
@@ -261,7 +272,8 @@ Symbol *SymbolTable::addCommon(StringRef name, InputFile *file, uint64_t size,
     // a name conflict, we fall through to the replaceSymbol() call below.
   }
 
-  replaceSymbol<CommonSymbol>(s, name, file, size, align, isPrivateExtern);
+  constructOrReplaceSymbol<CommonSymbol>(s, wasInserted, name, file, size,
+                                         align, isPrivateExtern);
   return s;
 }
 
@@ -286,9 +298,12 @@ Symbol *SymbolTable::addDylib(StringRef name, DylibFile *file, bool isWeakDef,
       (isa<DylibSymbol>(s) &&
        ((!isWeakDef && s->isWeakDef()) ||
         (!isDynamicLookup && cast<DylibSymbol>(s)->isDynamicLookup())))) {
-    if (auto *dynsym = dyn_cast<DylibSymbol>(s))
-      dynsym->unreference();
-    replaceSymbol<DylibSymbol>(s, file, name, isWeakDef, refState, isTlv);
+    if (!wasInserted) {
+      if (auto *dynsym = dyn_cast<DylibSymbol>(s))
+        dynsym->unreference();
+    }
+    constructOrReplaceSymbol<DylibSymbol>(s, wasInserted, file, name,
+                                           isWeakDef, refState, isTlv);
   }
 
   return s;
@@ -303,7 +318,7 @@ Symbol *SymbolTable::addLazyArchive(StringRef name, ArchiveFile *file,
   auto [s, wasInserted] = insert(name, file);
 
   if (wasInserted) {
-    replaceSymbol<LazyArchive>(s, file, sym);
+    constructOrReplaceSymbol<LazyArchive>(s, /*wasInserted=*/true, file, sym);
   } else if (isa<Undefined>(s)) {
     file->fetch(sym);
   } else if (auto *dysym = dyn_cast<DylibSymbol>(s)) {
@@ -321,7 +336,8 @@ Symbol *SymbolTable::addLazyObject(StringRef name, InputFile &file) {
   auto [s, wasInserted] = insert(name, &file);
 
   if (wasInserted) {
-    replaceSymbol<LazyObject>(s, file, name);
+    constructOrReplaceSymbol<LazyObject>(s, /*wasInserted=*/true, file, name);
+    s->isUsedInRegularObj |= isa<ObjFile>(&file);
   } else if (isa<Undefined>(s)) {
     extract(file, name);
   } else if (auto *dysym = dyn_cast<DylibSymbol>(s)) {

@@ -8,8 +8,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "../../MachO/Relocations.h"
+#include "../../MachO/InputFiles.h"
 #include "../../MachO/InputSection.h"
+#include "../../MachO/SymbolTable.h"
 #include "../../MachO/Symbols.h"
+#include "../../MachO/Target.h"
 #include "lld/Common/CommonLinkerContext.h"
 
 #include "gtest/gtest.h"
@@ -244,5 +247,89 @@ TEST_F(RelocationTest, SymbolUnionReplacementKeepsQueriesAndFlags) {
   EXPECT_FALSE(sym->isWeakDef());
   EXPECT_TRUE(sym->isWeakRef());
   EXPECT_FALSE(sym->isTlv());
+}
+
+TEST_F(RelocationTest, SymbolTableConstructsFreshSymbolsDirectly) {
+  SymbolTable table;
+  DylibFile dylib(nullptr);
+  TargetInfo *savedTarget = target;
+  target = createX86_64TargetInfo();
+  ObjFile native(MemoryBufferRef("", "native.o"), 0, "",
+                 /*lazy=*/false, /*forceHidden=*/false,
+                 /*compatArch=*/false);
+  target = savedTarget;
+
+  auto checkFresh = [&](Symbol *sym, StringRef name, bool live, bool regular) {
+    EXPECT_EQ(name, sym->getName());
+    EXPECT_EQ(live, sym->isLive());
+    EXPECT_EQ(regular, sym->isUsedInRegularObj);
+    EXPECT_EQ(UINT32_MAX, sym->gotIndex);
+    EXPECT_EQ(UINT32_MAX, sym->symtabIndex);
+    EXPECT_FALSE(sym->isInStubs());
+  };
+  for (bool deadStrip : {false, true}) {
+    config->deadStrip = deadStrip;
+    StringRef definedName = deadStrip ? "defined-dead" : "defined-live";
+    StringRef undefinedName =
+        deadStrip ? "undefined-dead" : "undefined-live";
+    StringRef commonName = deadStrip ? "common-dead" : "common-live";
+    StringRef dylibName = deadStrip ? "dylib-dead" : "dylib-live";
+    StringRef lazyName = deadStrip ? "lazy-dead" : "lazy-live";
+    Symbol *defined = table.addDefined(
+        definedName, nullptr, nullptr, 0, 0, /*isWeakDef=*/false,
+        /*isPrivateExtern=*/false,
+        /*isReferencedDynamically=*/false, /*noDeadStrip=*/false,
+        /*isWeakDefCanBeHidden=*/false);
+    EXPECT_TRUE(isa<Defined>(defined));
+    checkFresh(defined, definedName, !deadStrip, true);
+
+    Symbol *undefined = table.addUndefined(undefinedName, nullptr, false);
+    EXPECT_TRUE(isa<Undefined>(undefined));
+    checkFresh(undefined, undefinedName, !deadStrip, true);
+
+    Symbol *common = table.addCommon(commonName, nullptr, 4, 4, false);
+    EXPECT_TRUE(isa<CommonSymbol>(common));
+    checkFresh(common, commonName, !deadStrip, true);
+
+    Symbol *dylibSymbol = table.addDylib(dylibName, &dylib, false, false);
+    EXPECT_TRUE(isa<DylibSymbol>(dylibSymbol));
+    checkFresh(dylibSymbol, dylibName, !deadStrip, false);
+
+    Symbol *lazy = table.addLazyObject(lazyName, native);
+    EXPECT_TRUE(isa<LazyObject>(lazy));
+    checkFresh(lazy, lazyName, !deadStrip, true);
+  }
+}
+
+TEST_F(RelocationTest, SymbolTableReplacesExistingSymbols) {
+  SymbolTable table;
+  config->deadStrip = true;
+  DylibFile dylib(nullptr);
+
+  Symbol *symbol = table.addUndefined("replace", nullptr, false);
+  symbol->used.store(true, std::memory_order_relaxed);
+  symbol->isUsedInRegularObj = true;
+  Symbol *const address = symbol;
+
+  symbol = table.addDylib("replace", &dylib, false, false);
+  EXPECT_EQ(address, symbol);
+  EXPECT_TRUE(symbol->isLive());
+  EXPECT_TRUE(symbol->isUsedInRegularObj);
+  EXPECT_TRUE(dylib.isReferenced());
+
+  symbol = table.addDefined(
+      "replace", nullptr, nullptr, 0, 0, /*isWeakDef=*/false,
+      /*isPrivateExtern=*/false, /*isReferencedDynamically=*/false,
+      /*noDeadStrip=*/false, /*isWeakDefCanBeHidden=*/false);
+  EXPECT_EQ(address, symbol);
+  EXPECT_TRUE(symbol->isLive());
+  EXPECT_TRUE(symbol->isUsedInRegularObj);
+  EXPECT_FALSE(dylib.isReferenced());
+
+  Symbol *weak = table.addUndefined("upgrade", nullptr, true);
+  EXPECT_EQ(RefState::Weak, cast<Undefined>(weak)->refState);
+  Symbol *strong = table.addUndefined("upgrade", nullptr, false);
+  EXPECT_EQ(weak, strong);
+  EXPECT_EQ(RefState::Strong, cast<Undefined>(strong)->refState);
 }
 } // namespace
