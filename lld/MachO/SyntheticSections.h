@@ -471,8 +471,8 @@ struct SymtabEntry {
 };
 
 struct StabsEntry {
-  uint8_t type = 0;
   uint32_t strx = StringTableSection::emptyStringIndex;
+  uint8_t type = 0;
   uint8_t sect = 0;
   uint16_t desc = 0;
   uint64_t value = 0;
@@ -480,6 +480,9 @@ struct StabsEntry {
   StabsEntry() = default;
   explicit StabsEntry(uint8_t type) : type(type) {}
 };
+
+static_assert(sizeof(StabsEntry) == 16,
+              "Keep StabsEntry compact; it is stored in vectors per source file");
 
 // Symbols of the same type must be laid out contiguously: we choose to emit
 // all local symbols first, then external symbols, and finally undefined
