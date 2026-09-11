@@ -13,6 +13,7 @@
 #include "Target.h"
 
 #include "lld/Common/DWARF.h"
+#include "lld/Common/ErrorHandler.h"
 #include "lld/Common/LLVM.h"
 #include "lld/Common/Memory.h"
 #include "llvm/ADT/CachedHashString.h"
@@ -42,11 +43,77 @@ namespace macho {
 
 struct PlatformInfo;
 class ConcatInputSection;
+class InputSection;
+class InputFile;
 class Symbol;
 class Defined;
 class AliasSymbol;
 struct Relocation;
 enum class RefState : uint8_t;
+
+// A symbol record's position in the historical serial input order. The high 32
+// bits hold the ordinal of the input file that produced the record and the low
+// 32 bits hold the sequence number of the record within that file's parse, so
+// that comparing two ordinals answers "which of these two records would the
+// serial linker have applied first?".
+using RecordOrdinal = uint64_t;
+
+// A definition that lost the fold, recorded so that the effects it has on
+// *other* files (moving local aliases into the prevailing section, and removing
+// a definition that a lower-ordinal record displaced) can be applied serially
+// once every winner is final. See SymbolTable::applyPendingCoalesces().
+struct PendingCoalesce {
+  RecordOrdinal ordinal;
+  ConcatInputSection *isec;
+  Symbol *slot;
+  uint64_t value;
+  // True when this definition had already been constructed into the slot, and
+  // therefore into isec->symbols, before another record displaced it. The
+  // serial pass removes it, because in the serial order it was either never put
+  // there or is about to be rebuilt by the replay.
+  bool eraseSlot;
+  // True when the section really did lose a coalescing contest, i.e. it must be
+  // marked coalesced and its local aliases moved into the prevailing section.
+  // False for a record that is merely being rewound for the replay.
+  bool coalesce;
+};
+
+// A defined-symbol record that the fold could not apply commutatively. These
+// are replayed serially, in ordinal order, through the ordinary addDefined()
+// body once the fold is complete.
+struct DeferredDefinedRecord {
+  RecordOrdinal ordinal;
+  StringRef name;
+  InputFile *file;
+  InputSection *isec;
+  uint64_t value;
+  uint64_t size;
+  bool isWeakDef;
+  bool isPrivateExtern;
+  bool isReferencedDynamically;
+  bool noDeadStrip;
+  bool isWeakDefCanBeHidden;
+  bool isCold;
+};
+
+// Per-file state for a parse that runs on a worker thread. Everything a parse
+// would otherwise append to a global lives here and is merged back in file
+// order by the coordinator.
+struct ParseContext {
+  uint32_t fileOrdinal = 0;
+  uint32_t seq = 0;
+  DeferredDiagnostics diags;
+  llvm::SmallVector<PendingCoalesce, 0> coalesces;
+  llvm::SmallVector<DeferredDefinedRecord, 0> deferredDefined;
+  llvm::SmallVector<StringRef, 4> lcLinkerOptions;
+  // Files that owned a weak definition which a later strong definition
+  // displaces. Their unwind entries must be registered while they still own it.
+  llvm::SmallVector<InputFile *, 0> inlineUnwindFiles;
+
+  RecordOrdinal nextOrdinal() {
+    return (static_cast<RecordOrdinal>(fileOrdinal) << 32) | seq++;
+  }
+};
 
 // If --reproduce option is given, all input files are written
 // to this tar archive.
@@ -134,6 +201,11 @@ public:
   // True if this is a lazy ObjFile or BitcodeFile.
   bool lazy = false;
 
+  // Non-null only while this file is being parsed under the parallel input
+  // phase. Its presence is what switches the symbol table's add*() entry points
+  // from the serial bodies to the ordinal fold.
+  ParseContext *parseCtx = nullptr;
+
 protected:
   InputFile(Kind kind, MemoryBufferRef mb, bool lazy = false)
       : mb(mb), id(idCount++), lazy(lazy), fileKind(kind),
@@ -164,9 +236,15 @@ public:
           bool lazy = false, bool forceHidden = false, bool compatArch = true,
           bool builtFromBitcode = false);
   void parseRegularRelocations();
+  // Registration of compact-unwind and EH-frame entries reads symbols that
+  // other files own, so it cannot run inside a parallel parse. parse() skips it
+  // when deferUnwindRegistration is set and registerUnwind() runs it later.
+  void registerUnwind();
   ArrayRef<llvm::MachO::data_in_code_entry> getDataInCode() const;
   ArrayRef<uint8_t> getOptimizationHints() const;
   template <class LP> void parse();
+  // parse() with the word-size dispatch, for a parse the driver deferred.
+  void parseFile();
   template <class LP>
   void parseLinkerOptions(llvm::SmallVectorImpl<StringRef> &LinkerOptions);
 
@@ -187,6 +265,8 @@ public:
   std::vector<CallGraphEntry> callGraph;
   llvm::DenseMap<ConcatInputSection *, FDE> fdes;
   std::vector<AliasSymbol *> aliases;
+  // Set by the parallel input phase; see registerUnwind().
+  bool deferUnwindRegistration = false;
 
 private:
   llvm::once_flag initDwarf;
@@ -338,6 +418,15 @@ private:
 extern llvm::SetVector<InputFile *> inputFiles;
 extern llvm::DenseMap<llvm::CachedHashStringRef, MemoryBufferRef> cachedReads;
 extern llvm::SmallVector<StringRef> unprocessedLCLinkerOptions;
+
+// While set, a direct (non-lazy, non-archive-member) ObjFile does not parse
+// itself on construction; the driver parses the whole batch on workers.
+extern bool deferDirectObjParse;
+
+// True only while workers are parsing input files. Allocations made during a
+// parse then come from thread-local arenas; outside the region they come from
+// the ordinary ones, which keeps the serial phases' allocation locality.
+extern bool parallelParseActive;
 
 std::optional<MemoryBufferRef> readFile(StringRef path);
 

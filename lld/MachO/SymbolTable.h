@@ -13,8 +13,13 @@
 
 #include "lld/Common/LLVM.h"
 #include "llvm/ADT/CachedHashString.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Object/Archive.h"
+#include "llvm/Support/Allocator.h"
+
+#include <mutex>
+#include <vector>
 
 namespace lld::macho {
 
@@ -65,10 +70,103 @@ public:
   Symbol *find(llvm::CachedHashStringRef name);
   Symbol *find(StringRef name) { return find(llvm::CachedHashStringRef(name)); }
 
+  // --- Parallel input phase ------------------------------------------------
+  //
+  // enableSharding() replaces the single name map with a fixed set of
+  // independently locked shards, so that workers parsing different object files
+  // can resolve records concurrently. It must run before any symbol exists,
+  // because each slot allocated in this mode carries a hidden SlotMeta header.
+  // It is a no-op layout change on its own: nothing folds until
+  // beginParallelInput().
+  void enableSharding();
+  bool isSharded() const { return sharded; }
+
+  // Between these two calls, add*() records that carry a ParseContext are
+  // folded into the shards by rank and ordinal instead of being applied in
+  // arrival order. endParallelInput() rebuilds symVector in the order the
+  // serial linker would have created the slots.
+  void beginParallelInput();
+  void endParallelInput();
+  bool isFolding() const { return folding; }
+
+  // While folding, records added through the serial bodies (an -l dylib's
+  // exports, say) take their ordinals from here so that their slots land in the
+  // right place in symVector.
+  ParseContext *serialCtx = nullptr;
+
+  // Apply the deferred loser effects and the deferred records collected by the
+  // fold. Both run serially, in ordinal order, after endParallelInput().
+  void applyPendingCoalesces(llvm::MutableArrayRef<PendingCoalesce> pending);
+
+  // addDefined() with the arguments bundled, used by the fold and its replay.
+  Symbol *addDefinedRecord(const DeferredDefinedRecord &rec);
+
 private:
+  // Per-slot bookkeeping for the fold. Allocated immediately in front of the
+  // SymbolUnion so that Symbol itself does not grow: mechanism 44 left only two
+  // spare bytes in Symbol, so two ordinal fields would have pushed Symbol back
+  // to 40 bytes and Defined to 72.
+  struct SlotMeta {
+    // The lowest ordinal of any record that has touched this slot. This is the
+    // point at which the serial linker would have created it, and therefore the
+    // slot's position in symVector.
+    RecordOrdinal firstOrdinal;
+    // The ordinal of the record that produced the symbol currently in the slot,
+    // plus, in the top bit, a flag saying that one record for this name has been
+    // deferred and so every later record for it must be deferred too, so that
+    // the replay sees a single ordered stream. A file ordinal never reaches 2^31,
+    // so the top bit of an ordinal is always free.
+    RecordOrdinal winnerAndDeferred;
+
+    static constexpr RecordOrdinal deferredBit = RecordOrdinal(1) << 63;
+    RecordOrdinal winner() const { return winnerAndDeferred & ~deferredBit; }
+    void setWinner(RecordOrdinal ordinal) {
+      assert((ordinal & deferredBit) == 0);
+      winnerAndDeferred = ordinal | (winnerAndDeferred & deferredBit);
+    }
+    bool isDeferred() const { return winnerAndDeferred & deferredBit; }
+    void setDeferred() { winnerAndDeferred |= deferredBit; }
+  };
+  static_assert(sizeof(SlotMeta) == 16,
+                "the fold's per-slot header is paid per name");
+  static_assert(sizeof(SlotMeta) % alignof(SymbolUnion) == 0,
+                "SlotMeta must not disturb SymbolUnion's alignment");
+
+  static SlotMeta &metaOf(Symbol *sym) {
+    return *(reinterpret_cast<SlotMeta *>(sym) - 1);
+  }
+
+  static constexpr unsigned numShards = 64;
+  // The shards are lock domains only. Slots are not allocated from them: a slot
+  // drawn from a per-shard arena would put consecutive symbols in 64 different
+  // places, and every later phase walks symVector or chases Symbol* out of a
+  // relocation, so it would pay a cache miss per symbol.
+  struct Shard {
+    llvm::DenseMap<llvm::CachedHashStringRef, Symbol *> map;
+    std::vector<Symbol *> created;
+    std::mutex mu;
+  };
+  static unsigned shardOf(llvm::CachedHashStringRef name) {
+    return (name.hash() >> 25) & (numShards - 1);
+  }
+  Symbol *allocateSlot();
+  // The fold's per-slot header is only paid for slots that exist while the fold
+  // runs; everything the serial phases create afterwards keeps the plain layout.
+  bool headersActive = false;
+
+  Symbol *foldDefined(const DeferredDefinedRecord &rec);
+  Symbol *foldUndefined(StringRef name, InputFile *, bool isWeakRef);
+  Symbol *foldCommon(StringRef name, InputFile *, uint64_t size, uint32_t align,
+                     bool isPrivateExtern);
+
   std::pair<Symbol *, bool> insert(StringRef name, const InputFile *);
   llvm::DenseMap<llvm::CachedHashStringRef, Symbol *> symMap;
   std::vector<Symbol *> symVector;
+  std::unique_ptr<Shard[]> shards;
+  // The sharded map replaces symMap for the rest of the link once it is built.
+  bool sharded = false;
+  // True only while workers may be folding records.
+  bool folding = false;
 };
 
 void reportPendingUndefinedSymbols();

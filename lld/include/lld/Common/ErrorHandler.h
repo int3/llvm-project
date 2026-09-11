@@ -72,6 +72,7 @@
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileOutputBuffer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -151,6 +152,27 @@ void log(const Twine &msg);
 void message(const Twine &msg, llvm::raw_ostream &s = outs());
 void warn(const Twine &msg);
 uint64_t errorCount();
+
+// Diagnostics raised while a worker thread processes one unit of input must
+// not be emitted in arrival order, which is nondeterministic. A thread that
+// installs a DeferredDiagnostics buffer collects error() and warn() messages
+// instead of printing them; the coordinator replays the buffers in the
+// canonical (input) order once the parallel region has finished.
+struct DeferredDiagnostics {
+  enum class Kind : uint8_t { Warn, Error };
+  struct Entry {
+    Kind kind;
+    std::string msg;
+  };
+  llvm::SmallVector<Entry, 0> entries;
+  bool empty() const { return entries.empty(); }
+};
+
+// The buffer installed for the current thread, or null to emit immediately.
+extern thread_local DeferredDiagnostics *deferredDiagnostics;
+
+// Emit the collected diagnostics in the order they were collected.
+void replayDiagnostics(const DeferredDiagnostics &deferred);
 
 enum class DiagLevel { None, Log, Msg, Warn, Err, Fatal };
 

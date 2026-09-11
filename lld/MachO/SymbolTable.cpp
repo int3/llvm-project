@@ -16,6 +16,7 @@
 #include "lld/Common/ErrorHandler.h"
 #include "lld/Common/Memory.h"
 #include "llvm/Demangle/Demangle.h"
+#include "llvm/Support/Parallel.h"
 
 using namespace llvm;
 using namespace lld;
@@ -31,16 +32,120 @@ T *constructOrReplaceSymbol(Symbol *sym, bool wasInserted, Args &&...args) {
 } // namespace
 
 Symbol *SymbolTable::find(CachedHashStringRef cachedName) {
+  if (sharded) {
+    Shard &shard = shards[shardOf(cachedName)];
+    auto it = shard.map.find(cachedName);
+    return it == shard.map.end() ? nullptr : it->second;
+  }
   auto it = symMap.find(cachedName);
   if (it == symMap.end())
     return nullptr;
   return it->second;
 }
 
+void SymbolTable::enableSharding() {
+  assert(!sharded && symMap.empty() &&
+         "sharding must be chosen before any symbol exists");
+  shards = std::make_unique<Shard[]>(numShards);
+  sharded = true;
+  headersActive = true;
+}
+
+Symbol *SymbolTable::allocateSlot() {
+  if (!headersActive)
+    return reinterpret_cast<Symbol *>(
+        getSpecificAllocSingleton<SymbolUnion>().Allocate());
+  // While the fold runs, each worker draws from its own arena, so the names one
+  // file creates stay together in the order that file created them.
+  thread_local llvm::BumpPtrAllocator foldAlloc;
+  void *storage = foldAlloc.Allocate(sizeof(SlotMeta) + sizeof(SymbolUnion),
+                                     alignof(SymbolUnion));
+  auto *meta = static_cast<SlotMeta *>(storage);
+  meta->firstOrdinal = 0;
+  meta->winnerAndDeferred = 0;
+  return reinterpret_cast<Symbol *>(meta + 1);
+}
+
+void SymbolTable::beginParallelInput() {
+  assert(sharded);
+  folding = true;
+}
+
+void SymbolTable::endParallelInput() {
+  assert(folding);
+  folding = false;
+  headersActive = false;
+  serialCtx = nullptr;
+
+  size_t count = 0;
+  for (unsigned i = 0; i != numShards; ++i)
+    count += shards[i].created.size();
+  // The slot's lowest record ordinal is the position at which the serial linker
+  // would have inserted it, so sorting by it reproduces symVector's order --
+  // which Writer::scanSymbols, SymtabSection, markLive's roots and the
+  // undefined-symbol diagnostics all observe. The key is copied next to the
+  // pointer so that the sort does not chase a header per comparison, and no two
+  // slots can share a lowest ordinal, so the order is total and the parallel
+  // sort is deterministic.
+  std::vector<std::pair<RecordOrdinal, Symbol *>> created;
+  created.reserve(count);
+  for (unsigned i = 0; i != numShards; ++i) {
+    for (Symbol *sym : shards[i].created)
+      created.emplace_back(metaOf(sym).firstOrdinal, sym);
+    shards[i].created.clear();
+    shards[i].created.shrink_to_fit();
+  }
+  parallelSort(created.begin(), created.end());
+  symVector.reserve(symVector.size() + created.size());
+  for (const auto &[ordinal, sym] : created)
+    symVector.push_back(sym);
+
+  // Everything from here on is serial -- archive members, LTO output, synthetics
+  // -- and on an archive-heavy link that is most of the names. The shards exist
+  // only to let workers resolve concurrently, so they go back into one map and
+  // every later insert and lookup takes the original path.
+  size_t names = 0;
+  for (unsigned i = 0; i != numShards; ++i)
+    names += shards[i].map.size();
+  symMap.reserve(names);
+  for (unsigned i = 0; i != numShards; ++i)
+    for (const auto &entry : shards[i].map)
+      symMap.insert(entry);
+  sharded = false;
+  shards.reset();
+}
+
 std::pair<Symbol *, bool> SymbolTable::insert(StringRef name,
                                               const InputFile *file) {
-  auto [it, wasInserted] =
-      symMap.try_emplace(CachedHashStringRef(name), nullptr);
+  CachedHashStringRef cachedName(name);
+  if (sharded) {
+    Shard &shard = shards[shardOf(cachedName)];
+    auto [it, wasInserted] = shard.map.try_emplace(cachedName, nullptr);
+    if (wasInserted) {
+      Symbol *sym = allocateSlot();
+      it->second = sym;
+      if (folding) {
+        RecordOrdinal ord = serialCtx ? serialCtx->nextOrdinal() : 0;
+        metaOf(sym).firstOrdinal = ord;
+        metaOf(sym).setWinner(ord);
+        shard.created.push_back(sym);
+      } else {
+        symVector.push_back(sym);
+      }
+      return {sym, true};
+    }
+    Symbol *sym = it->second;
+    if (folding && serialCtx) {
+      RecordOrdinal ord = serialCtx->nextOrdinal();
+      SlotMeta &meta = metaOf(sym);
+      if (ord < meta.firstOrdinal)
+        meta.firstOrdinal = ord;
+    }
+    sym->isUsedInRegularObj |= !file || isa<ObjFile>(file);
+    return {sym, false};
+  }
+
+  auto [it, wasInserted] = symMap.try_emplace(cachedName, nullptr);
 
   if (wasInserted) {
     // Name is a new symbol.
@@ -108,12 +213,389 @@ static void transplantSymbolsAtOffset(InputSection *fromIsec,
   });
 }
 
+
+// Is there a non-external definition at offset \p off in \p isec that
+// transplantSymbolsAtOffset() would move into the prevailing section?
+static bool hasTransplantableLocals(const ConcatInputSection *isec,
+                                    uint64_t off) {
+  auto it = llvm::lower_bound(
+      isec->symbols, off, [](Defined *d, uint64_t off) { return d->value < off; });
+  for (auto end = isec->symbols.end(); it != end && (*it)->value == off; ++it)
+    if (!(*it)->isExternal())
+      return true;
+  return false;
+}
+
+// Reconstruct the record that produced \p d, so that a definition the fold
+// applied out of order can be rewound and replayed serially.
+static DeferredDefinedRecord recordFromDefined(RecordOrdinal ordinal,
+                                               Defined *d) {
+  return DeferredDefinedRecord{ordinal,
+                               d->getName(),
+                               d->getFile(),
+                               d->originalIsec,
+                               d->value,
+                               d->size,
+                               d->isWeakDef(),
+                               d->privateExtern,
+                               d->referencedDynamically,
+                               d->noDeadStrip,
+                               d->weakDefCanBeHidden,
+                               d->cold};
+}
+
+// Apply one definition to its slot under the slot's shard lock. The winner of a
+// name is a function of the record set and the records' ordinals, not of the
+// order in which the workers happen to arrive, so only the winner is ever
+// constructed and every loser does only work that commutes. The transitions that
+// do not commute -- duplicate strong definitions, a loser whose section has
+// local aliases to move, and a weak definition displaced by a later strong one --
+// are recorded for the serial passes instead.
+Symbol *SymbolTable::foldDefined(const DeferredDefinedRecord &rec) {
+  ParseContext &ctx = *rec.file->parseCtx;
+  const RecordOrdinal ord = rec.ordinal;
+  CachedHashStringRef cachedName(rec.name);
+  Shard &shard = shards[shardOf(cachedName)];
+
+  // With -flat_namespace, all extern symbols in dylibs are interposable.
+  const bool interposable = ((config->namespaceKind == NamespaceKind::flat &&
+                              config->outputType != MachO::MH_EXECUTE) ||
+                             config->interposable) &&
+                            !rec.isPrivateExtern;
+
+  std::lock_guard<std::mutex> lock(shard.mu);
+  auto [it, wasInserted] = shard.map.try_emplace(cachedName, nullptr);
+
+  auto build = [&](Symbol *slot, bool fresh, bool overridesWeakDef) -> Defined * {
+    if (fresh)
+      return new (slot)
+          Defined(rec.name, rec.file, rec.isec, rec.value, rec.size,
+                  rec.isWeakDef, /*isExternal=*/true, rec.isPrivateExtern,
+                  /*includeInSymtab=*/true, rec.isReferencedDynamically,
+                  rec.noDeadStrip, overridesWeakDef, rec.isWeakDefCanBeHidden,
+                  interposable, rec.isCold);
+    return replaceSymbol<Defined>(
+        slot, rec.name, rec.file, rec.isec, rec.value, rec.size, rec.isWeakDef,
+        /*isExternal=*/true, rec.isPrivateExtern, /*includeInSymtab=*/true,
+        rec.isReferencedDynamically, rec.noDeadStrip, overridesWeakDef,
+        rec.isWeakDefCanBeHidden, interposable, rec.isCold);
+  };
+
+  if (wasInserted) {
+    Symbol *slot = allocateSlot();
+    it->second = slot;
+    shard.created.push_back(slot);
+    SlotMeta &meta = metaOf(slot);
+    meta.firstOrdinal = ord;
+    meta.setWinner(ord);
+    build(slot, /*fresh=*/true, /*overridesWeakDef=*/false);
+    return slot;
+  }
+
+  Symbol *slot = it->second;
+  SlotMeta &meta = metaOf(slot);
+  if (ord < meta.firstOrdinal)
+    meta.firstOrdinal = ord;
+  slot->isUsedInRegularObj |= isa<ObjFile>(rec.file);
+
+  if (meta.isDeferred()) {
+    // The slot holds the lowest-ordinal record of this name and every other one
+    // is on the replay list, so that the replay sees exactly the serial stream
+    // whatever order the workers arrive in.
+    auto *defined = dyn_cast<Defined>(slot);
+    if (defined && ord < meta.winner()) {
+      // This record becomes the slot's prevailing definition, so if it is weak
+      // its file owns the name at its own completion point and has to register
+      // its unwind entries there. Flagging a file that turns out not to need it
+      // is harmless.
+      if (rec.isWeakDef)
+        ctx.inlineUnwindFiles.push_back(rec.file);
+      DeferredDefinedRecord later = recordFromDefined(meta.winner(), defined);
+      if (auto *oldIsec =
+              dyn_cast_or_null<ConcatInputSection>(defined->originalIsec))
+        ctx.coalesces.push_back({meta.winner(), oldIsec, slot, defined->value,
+                                 /*eraseSlot=*/true, /*coalesce=*/false});
+      replaceSymbol<Defined>(
+          slot, rec.name, rec.file, rec.isec, rec.value, rec.size,
+          rec.isWeakDef, /*isExternal=*/true, rec.isPrivateExtern,
+          /*includeInSymtab=*/true, rec.isReferencedDynamically,
+          rec.noDeadStrip, /*canOverrideWeakDef=*/false,
+          rec.isWeakDefCanBeHidden,
+          ((config->namespaceKind == NamespaceKind::flat &&
+            config->outputType != MachO::MH_EXECUTE) ||
+           config->interposable) &&
+              !rec.isPrivateExtern,
+          rec.isCold);
+      meta.setWinner(ord);
+      ctx.deferredDefined.push_back(later);
+    } else {
+      ctx.deferredDefined.push_back(rec);
+    }
+    return slot;
+  }
+
+  if (auto *defined = dyn_cast<Defined>(slot)) {
+    const bool existingWeak = defined->isWeakDef();
+    const RecordOrdinal existingOrd = meta.winner();
+    // The record with the lower ordinal is the one the serial linker applied
+    // first, whichever of the two reached the shard first.
+    const bool incomingFirst = ord < existingOrd;
+    auto *existingIsec =
+        dyn_cast_or_null<ConcatInputSection>(defined->originalIsec);
+    const uint64_t existingValue = defined->value;
+
+    if (rec.isWeakDef && existingWeak) {
+      if (!incomingFirst) {
+        // Ordinary weak coalescing. The metadata merge is commutative.
+        defined->privateExtern &= rec.isPrivateExtern;
+        defined->weakDefCanBeHidden &= rec.isWeakDefCanBeHidden;
+        defined->referencedDynamically |= rec.isReferencedDynamically;
+        defined->noDeadStrip |= rec.noDeadStrip;
+        defined->cold |= rec.isCold;
+        if (auto *ci = dyn_cast_or_null<ConcatInputSection>(rec.isec)) {
+          ci->wasCoalesced = true;
+          if (defined->originalIsec && hasTransplantableLocals(ci, rec.value))
+            ctx.coalesces.push_back({ord, ci, slot, rec.value,
+                                     /*eraseSlot=*/false, /*coalesce=*/true});
+        }
+        return slot;
+      }
+      // We have the lower ordinal, so we prevail and the definition already in
+      // the slot becomes the loser.
+      const bool oldPrivateExtern = defined->privateExtern;
+      const bool oldHidden = defined->weakDefCanBeHidden;
+      const bool oldRefDyn = defined->referencedDynamically;
+      const bool oldNoDeadStrip = defined->noDeadStrip;
+      const bool oldCold = defined->cold;
+      Defined *winner = build(slot, /*fresh=*/false, /*overridesWeakDef=*/false);
+      winner->privateExtern &= oldPrivateExtern;
+      winner->weakDefCanBeHidden &= oldHidden;
+      winner->referencedDynamically |= oldRefDyn;
+      winner->noDeadStrip |= oldNoDeadStrip;
+      winner->cold |= oldCold;
+      meta.setWinner(ord);
+      if (existingIsec)
+        ctx.coalesces.push_back({existingOrd, existingIsec, slot, existingValue,
+                                 /*eraseSlot=*/true, /*coalesce=*/true});
+      return slot;
+    }
+
+    if (!rec.isWeakDef && !existingWeak) {
+      // Duplicate strong definitions: the diagnostics are emitted in event
+      // order and the later definition prevails, so replay them serially.
+      if (incomingFirst) {
+        DeferredDefinedRecord later = recordFromDefined(existingOrd, defined);
+        build(slot, /*fresh=*/false, /*overridesWeakDef=*/false);
+        meta.setWinner(ord);
+        if (existingIsec)
+          ctx.coalesces.push_back({existingOrd, existingIsec, slot,
+                                   existingValue, /*eraseSlot=*/true,
+                                   /*coalesce=*/false});
+        ctx.deferredDefined.push_back(later);
+      } else {
+        ctx.deferredDefined.push_back(rec);
+      }
+      meta.setDeferred();
+      return slot;
+    }
+
+    // One definition is weak and the other strong. The strong one prevails
+    // either way, but if the weak one came first then it was the prevailing
+    // symbol at its own file's completion, which unwind registration observes,
+    // so that transition is replayed serially.
+    const bool weakFirst = rec.isWeakDef ? incomingFirst : !incomingFirst;
+    if (!weakFirst) {
+      if (rec.isWeakDef) {
+        // The prevailing strong definition is already in the slot.
+        if (auto *ci = dyn_cast_or_null<ConcatInputSection>(rec.isec)) {
+          ci->wasCoalesced = true;
+          if (defined->originalIsec && hasTransplantableLocals(ci, rec.value))
+            ctx.coalesces.push_back({ord, ci, slot, rec.value,
+                                     /*eraseSlot=*/false, /*coalesce=*/true});
+        }
+        return slot;
+      }
+      // Our strong definition has the lower ordinal and displaces the weak one.
+      build(slot, /*fresh=*/false, /*overridesWeakDef=*/false);
+      meta.setWinner(ord);
+      if (existingIsec)
+        ctx.coalesces.push_back({existingOrd, existingIsec, slot, existingValue,
+                                 /*eraseSlot=*/true, /*coalesce=*/true});
+      return slot;
+    }
+    meta.setDeferred();
+    // The weak definition prevails at the end of its own file, which is where
+    // that file registers its unwind entries.
+    if (rec.isWeakDef) {
+      ctx.inlineUnwindFiles.push_back(rec.file);
+      // The strong definition arrived first but belongs later; rewind it.
+      DeferredDefinedRecord strong = recordFromDefined(existingOrd, defined);
+      build(slot, /*fresh=*/false, /*overridesWeakDef=*/false);
+      meta.setWinner(ord);
+      if (existingIsec)
+        ctx.coalesces.push_back({existingOrd, existingIsec, slot, existingValue,
+                                 /*eraseSlot=*/true, /*coalesce=*/false});
+      ctx.deferredDefined.push_back(strong);
+    } else {
+      if (defined->getFile())
+        ctx.inlineUnwindFiles.push_back(defined->getFile());
+      ctx.deferredDefined.push_back(rec);
+    }
+    return slot;
+  }
+
+  // A definition outranks everything else that can be in the slot at this
+  // point. Lazy symbols cannot be: archives are not folded.
+  switch (slot->kind()) {
+  case Symbol::CommonKind:
+  case Symbol::UndefinedKind:
+    build(slot, /*fresh=*/false, /*overridesWeakDef=*/false);
+    meta.setWinner(ord);
+    return slot;
+  case Symbol::DylibKind: {
+    auto *dysym = cast<DylibSymbol>(slot);
+    // The condition is symmetric, so it does not matter whether the dylib
+    // record or this definition was applied first.
+    const bool overridesWeakDef = !rec.isWeakDef && dysym->isWeakDef();
+    dysym->unreference();
+    build(slot, /*fresh=*/false, overridesWeakDef);
+    meta.setWinner(ord);
+    return slot;
+  }
+  default:
+    llvm_unreachable("unexpected symbol kind during the parallel input fold");
+  }
+}
+
+Symbol *SymbolTable::foldUndefined(StringRef name, InputFile *file,
+                                   bool isWeakRef) {
+  ParseContext &ctx = *file->parseCtx;
+  const RecordOrdinal ord = ctx.nextOrdinal();
+  CachedHashStringRef cachedName(name);
+  Shard &shard = shards[shardOf(cachedName)];
+  const RefState refState = isWeakRef ? RefState::Weak : RefState::Strong;
+
+  std::lock_guard<std::mutex> lock(shard.mu);
+  auto [it, wasInserted] = shard.map.try_emplace(cachedName, nullptr);
+  if (wasInserted) {
+    Symbol *slot = allocateSlot();
+    it->second = slot;
+    shard.created.push_back(slot);
+    SlotMeta &meta = metaOf(slot);
+    meta.firstOrdinal = ord;
+    meta.setWinner(ord);
+    new (slot) Undefined(name, file, refState, /*wasBitcodeSymbol=*/false);
+    return slot;
+  }
+
+  Symbol *slot = it->second;
+  SlotMeta &meta = metaOf(slot);
+  if (ord < meta.firstOrdinal)
+    meta.firstOrdinal = ord;
+  slot->isUsedInRegularObj |= isa<ObjFile>(file);
+
+  if (auto *dysym = dyn_cast<DylibSymbol>(slot)) {
+    // reference()/unreference() net out to the same count whichever order the
+    // records arrive in.
+    dysym->reference(refState);
+  } else if (auto *undefined = dyn_cast<Undefined>(slot)) {
+    const RefState merged = std::max(undefined->refState, refState);
+    if (ord < meta.winner()) {
+      // The serial linker attributes an undefined symbol to the first file that
+      // referenced it, which the spelling-correction diagnostic reads.
+      replaceSymbol<Undefined>(slot, name, file, merged,
+                               /*wasBitcodeSymbol=*/false);
+      meta.setWinner(ord);
+    } else {
+      undefined->refState = merged;
+    }
+  } else {
+    assert(!slot->isLazy() && "lazy symbols are excluded from the fold");
+  }
+  return slot;
+}
+
+Symbol *SymbolTable::foldCommon(StringRef name, InputFile *file, uint64_t size,
+                                uint32_t align, bool isPrivateExtern) {
+  ParseContext &ctx = *file->parseCtx;
+  const RecordOrdinal ord = ctx.nextOrdinal();
+  CachedHashStringRef cachedName(name);
+  Shard &shard = shards[shardOf(cachedName)];
+
+  std::lock_guard<std::mutex> lock(shard.mu);
+  auto [it, wasInserted] = shard.map.try_emplace(cachedName, nullptr);
+  if (wasInserted) {
+    Symbol *slot = allocateSlot();
+    it->second = slot;
+    shard.created.push_back(slot);
+    SlotMeta &meta = metaOf(slot);
+    meta.firstOrdinal = ord;
+    meta.setWinner(ord);
+    new (slot) CommonSymbol(name, file, size, align, isPrivateExtern);
+    return slot;
+  }
+
+  Symbol *slot = it->second;
+  SlotMeta &meta = metaOf(slot);
+  if (ord < meta.firstOrdinal)
+    meta.firstOrdinal = ord;
+  slot->isUsedInRegularObj |= isa<ObjFile>(file);
+
+  if (auto *common = dyn_cast<CommonSymbol>(slot)) {
+    // The larger common wins; between equal sizes the later one wins, taking its
+    // alignment and visibility with it.
+    if (size < common->size ||
+        (size == common->size && ord < meta.winner()))
+      return slot;
+  } else if (isa<Defined>(slot)) {
+    return slot;
+  }
+  replaceSymbol<CommonSymbol>(slot, name, file, size, align, isPrivateExtern);
+  meta.setWinner(ord);
+  return slot;
+}
+
+void SymbolTable::applyPendingCoalesces(
+    MutableArrayRef<PendingCoalesce> pending) {
+  llvm::sort(pending, [](const PendingCoalesce &a, const PendingCoalesce &b) {
+    return a.ordinal < b.ordinal;
+  });
+  for (const PendingCoalesce &p : pending) {
+    if (p.eraseSlot)
+      llvm::erase_if(p.isec->symbols, [&](Defined *d) {
+        return static_cast<Symbol *>(d) == p.slot;
+      });
+    if (!p.coalesce)
+      continue;
+    p.isec->wasCoalesced = true;
+    auto *winner = dyn_cast<Defined>(p.slot);
+    if (!winner || !winner->originalIsec)
+      continue;
+    transplantSymbolsAtOffset(p.isec, winner->isec(), /*skip=*/nullptr, p.value,
+                              winner->value);
+  }
+}
+
+Symbol *SymbolTable::addDefinedRecord(const DeferredDefinedRecord &record) {
+  if (folding && record.file && record.file->parseCtx) {
+    DeferredDefinedRecord rec = record;
+    rec.ordinal = record.file->parseCtx->nextOrdinal();
+    return foldDefined(rec);
+  }
+  return addDefined(record.name, record.file, record.isec, record.value,
+                    record.size, record.isWeakDef, record.isPrivateExtern,
+                    record.isReferencedDynamically, record.noDeadStrip,
+                    record.isWeakDefCanBeHidden, record.isCold);
+}
+
 Defined *SymbolTable::addDefined(StringRef name, InputFile *file,
                                  InputSection *isec, uint64_t value,
                                  uint64_t size, bool isWeakDef,
                                  bool isPrivateExtern,
                                  bool isReferencedDynamically, bool noDeadStrip,
                                  bool isWeakDefCanBeHidden, bool isCold) {
+  assert((!folding || !file || !file->parseCtx) &&
+         "definitions from a worker must go through addDefinedRecord()");
   bool overridesWeakDef = false;
   auto [s, wasInserted] = insert(name, file);
 
@@ -239,6 +721,8 @@ Defined *SymbolTable::aliasDefined(Defined *src, StringRef target,
 
 Symbol *SymbolTable::addUndefined(StringRef name, InputFile *file,
                                   bool isWeakRef) {
+  if (folding && file && file->parseCtx)
+    return foldUndefined(name, file, isWeakRef);
   auto [s, wasInserted] = insert(name, file);
 
   RefState refState = isWeakRef ? RefState::Weak : RefState::Strong;
@@ -259,6 +743,8 @@ Symbol *SymbolTable::addUndefined(StringRef name, InputFile *file,
 
 Symbol *SymbolTable::addCommon(StringRef name, InputFile *file, uint64_t size,
                                uint32_t align, bool isPrivateExtern) {
+  if (folding && file && file->parseCtx)
+    return foldCommon(name, file, size, align, isPrivateExtern);
   auto [s, wasInserted] = insert(name, file);
 
   if (!wasInserted) {

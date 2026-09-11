@@ -57,6 +57,8 @@
 #include "llvm/TextAPI/Architecture.h"
 #include "llvm/TextAPI/PackedVersion.h"
 
+#include <deque>
+
 #if !_WIN32
 #include <sys/mman.h>
 #endif
@@ -597,6 +599,189 @@ static void checkAndCacheFramework(InputFile *file, StringRef path) {
   }
 }
 
+namespace {
+// E006 design 7, stage 1: direct object files are parsed on workers.
+//
+// The command line is still walked in order, so that every diagnostic, every
+// --reproduce member and every dylib registration keeps its position. A direct
+// object file is created at its position but its parse is held back; the held
+// parses run together, on workers, at the first point where the serial order
+// would become observable. That point is the first archive (a lazy symbol in
+// the table would make the fold's rank decisions wrong, and an archive's
+// extraction decisions depend on every preceding object having been resolved),
+// the first bitcode or --start-lib input, or the end of the walk.
+struct ParallelInputPhase {
+  bool active = false;
+  // Contexts are referenced by the files that own them, so the container must
+  // not reallocate.
+  std::deque<ParseContext> contexts;
+  std::vector<std::pair<ObjFile *, uint32_t>> objects;
+  uint32_t nextOrdinal = 0;
+};
+} // namespace
+
+static ParallelInputPhase parallelInput;
+
+static void startParallelInput() {
+#if LLVM_ENABLE_THREADS
+  // Check ThreadsRequested rather than getThreadCount(), which would create an
+  // executor capable of spawning a worker even for one thread.
+  if (parallel::strategy.ThreadsRequested == 1)
+    return;
+  parallelInput.active = true;
+  symtab->beginParallelInput();
+#endif
+}
+
+// Test hook. Reversing the order in which the workers take the held files apart
+// exercises the fold's out-of-order paths deterministically, at any thread
+// count; the output must not change.
+static bool reverseHeldParseOrder() {
+  static bool value = ::getenv("LLD_REVERSE_HELD_PARSE") != nullptr;
+  return value;
+}
+
+// Run the held parses and put the symbol table back into its serial mode.
+static void finishParallelInput() {
+  if (!parallelInput.active)
+    return;
+  parallelInput.active = false;
+  symtab->serialCtx = nullptr;
+
+  auto &objects = parallelInput.objects;
+  {
+    TimeTraceScope timeScope("Parse held object files");
+    std::vector<ObjFile *> order;
+    order.reserve(objects.size());
+    for (auto &[obj, ordinal] : objects)
+      order.push_back(obj);
+    if (reverseHeldParseOrder())
+      std::reverse(order.begin(), order.end());
+    parallelParseActive = true;
+    parallelForEach(order, [](ObjFile *obj) {
+      deferredDiagnostics = &obj->parseCtx->diags;
+      obj->parseFile();
+      deferredDiagnostics = nullptr;
+    });
+    parallelParseActive = false;
+  }
+
+  {
+    TimeTraceScope timeScope("Compact symbol vector");
+    symtab->endParallelInput();
+  }
+  TimeTraceScope timeScope("Apply deferred symbol effects");
+
+  // Merge everything the workers collected back in file order.
+  SmallVector<PendingCoalesce, 0> coalesces;
+  SmallVector<DeferredDefinedRecord, 0> deferred;
+  llvm::DenseSet<InputFile *> inlineUnwind;
+  for (ParseContext &ctx : parallelInput.contexts) {
+    if (!ctx.diags.empty())
+      replayDiagnostics(ctx.diags);
+    coalesces.append(ctx.coalesces.begin(), ctx.coalesces.end());
+    deferred.append(ctx.deferredDefined.begin(), ctx.deferredDefined.end());
+    unprocessedLCLinkerOptions.append(ctx.lcLinkerOptions);
+    inlineUnwind.insert(ctx.inlineUnwindFiles.begin(),
+                        ctx.inlineUnwindFiles.end());
+  }
+  for (auto &[obj, ordinal] : objects)
+    obj->parseCtx = nullptr;
+
+  symtab->applyPendingCoalesces(coalesces);
+
+  // Replay the records the fold could not apply, and register unwind entries,
+  // in one ordinal-ordered pass: a file whose weak definition a later strong one
+  // displaces must still see itself as the owner when it registers, which is
+  // what it did at its completion point in the serial order.
+  llvm::sort(deferred, [](const DeferredDefinedRecord &a,
+                          const DeferredDefinedRecord &b) {
+    return a.ordinal < b.ordinal;
+  });
+  size_t next = 0;
+  for (auto &[obj, ordinal] : objects) {
+    if (!inlineUnwind.contains(obj))
+      continue;
+    RecordOrdinal completion = static_cast<RecordOrdinal>(ordinal + 1) << 32;
+    while (next != deferred.size() && deferred[next].ordinal < completion)
+      symtab->addDefinedRecord(deferred[next++]);
+    obj->registerUnwind();
+    obj->deferUnwindRegistration = false;
+  }
+  while (next != deferred.size())
+    symtab->addDefinedRecord(deferred[next++]);
+
+  // The rest register on workers. Every winner is final by now, so the
+  // cross-file reads registration makes are stable, and each file only writes
+  // its own sections and its own symbol list. Diagnostics are collected per file
+  // and replayed in inputFiles order, which is where the serial linker
+  // registered.
+  {
+    TimeTraceScope timeScope("Register unwind info");
+    std::vector<ObjFile *> pending;
+    for (InputFile *file : inputFiles)
+      if (auto *obj = dyn_cast<ObjFile>(file))
+        if (obj->deferUnwindRegistration)
+          pending.push_back(obj);
+    std::vector<DeferredDiagnostics> diags(pending.size());
+    parallelParseActive = true;
+    parallelFor(0, pending.size(), [&](size_t i) {
+      deferredDiagnostics = &diags[i];
+      pending[i]->registerUnwind();
+      pending[i]->deferUnwindRegistration = false;
+      deferredDiagnostics = nullptr;
+    });
+    parallelParseActive = false;
+    for (DeferredDiagnostics &d : diags)
+      if (!d.empty())
+        replayDiagnostics(d);
+  }
+
+  objects.clear();
+  objects.shrink_to_fit();
+  // parallelInput.contexts is deliberately not cleared: deferFile() holds a
+  // pointer into it across the call that ends the phase.
+}
+
+// Decide whether this input's parse can be held back, and give it the ordinal
+// and context the phase needs. Anything that would observe a partially resolved
+// symbol table runs the held parses first.
+static bool beginHeldInput(MemoryBufferRef mbref, bool isLazy,
+                           ParseContext *ctx) {
+  bool holdParse = false;
+  if (parallelInput.active) {
+    switch (identify_magic(mbref.getBuffer())) {
+    case file_magic::macho_object:
+      if (isLazy)
+        finishParallelInput();
+      else
+        holdParse = true;
+      break;
+    case file_magic::archive:
+    case file_magic::bitcode:
+      finishParallelInput();
+      break;
+    default:
+      break;
+    }
+  }
+  if (parallelInput.active)
+    symtab->serialCtx = ctx;
+  deferDirectObjParse = holdParse;
+  return holdParse;
+}
+
+static void endHeldInput(InputFile *file, bool holdParse, ParseContext *ctx) {
+  deferDirectObjParse = false;
+  symtab->serialCtx = nullptr;
+  if (!holdParse)
+    return;
+  auto *obj = cast<ObjFile>(file);
+  obj->parseCtx = ctx;
+  obj->deferUnwindRegistration = true;
+  parallelInput.objects.emplace_back(obj, ctx->fileOrdinal);
+}
+
 static void deferFile(StringRef path, bool isLazy, DeferredFiles &deferred,
                       LoadType loadType = LoadType::CommandLine,
                       bool isNeeded = false, bool isWeak = false,
@@ -606,19 +791,27 @@ static void deferFile(StringRef path, bool isLazy, DeferredFiles &deferred,
   if (!buffer)
     return;
   MemoryBufferRef mbref = *buffer;
-  if (config->readWorkers || forceDefer)
+  if (config->readWorkers || forceDefer) {
     deferred.push_back({path, isLazy, mbref, loadType, isNeeded, isWeak,
                         isReexport, isHidden, isExplicit});
-  else {
-    if (loadedObjectFrameworks.contains(path))
-      return;
-
-    InputFile *file =
-        processFile(buffer, nullptr, path, loadType, isLazy, isExplicit,
-                    /*isBundleLoader=*/false, isHidden);
-    applyDylibMetadata(file, isNeeded, isWeak, isReexport);
-    checkAndCacheFramework(file, path);
+    return;
   }
+  if (loadedObjectFrameworks.contains(path))
+    return;
+
+  ParseContext *ctx = nullptr;
+  if (parallelInput.active) {
+    parallelInput.contexts.emplace_back();
+    ctx = &parallelInput.contexts.back();
+    ctx->fileOrdinal = parallelInput.nextOrdinal++;
+  }
+  bool holdParse = beginHeldInput(mbref, isLazy, ctx);
+  InputFile *file =
+      processFile(buffer, nullptr, path, loadType, isLazy, isExplicit,
+                  /*isBundleLoader=*/false, isHidden);
+  endHeldInput(file, holdParse, ctx);
+  applyDylibMetadata(file, isNeeded, isWeak, isReexport);
+  checkAndCacheFramework(file, path);
 }
 
 static void prepareTapiFiles(const DeferredFiles &deferred,
@@ -1534,6 +1727,7 @@ static void prepareCommandLineTapiFiles(const InputArgList &args) {
   }
 }
 
+
 static void createFiles(const InputArgList &args) {
   TimeTraceScope timeScope("Load input files");
   llvm::scope_exit endTapiPipeline([] { finishTapiPipeline(); });
@@ -1544,6 +1738,7 @@ static void createFiles(const InputArgList &args) {
   // If we've processed an opening --start-lib, without a matching --end-lib
   bool inLib = false;
   DeferredFiles deferredFiles;
+  startParallelInput();
 
   for (const Arg *arg : args) {
     const Option &opt = arg->getOption();
@@ -1625,14 +1820,22 @@ static void createFiles(const InputArgList &args) {
       if (loadedObjectFrameworks.contains(file.path))
         continue;
 
+      ParseContext *ctx = nullptr;
+      if (parallelInput.active) {
+        parallelInput.contexts.emplace_back();
+        ctx = &parallelInput.contexts.back();
+        ctx->fileOrdinal = parallelInput.nextOrdinal++;
+      }
+      bool holdParse = beginHeldInput(file.buffer, file.isLazy, ctx);
       auto inputFile = processFile(file.buffer, &archiveContents, file.path,
                                    file.loadType, file.isLazy, file.isExplicit,
                                    /*isBundleLoader=*/false, file.isHidden);
+      endHeldInput(inputFile, holdParse, ctx);
       applyDylibMetadata(inputFile, file.isNeeded, file.isWeak,
                          file.isReexport);
       checkAndCacheFramework(inputFile, file.path);
 
-      if (ArchiveFile *archive = dyn_cast<ArchiveFile>(inputFile))
+      if (ArchiveFile *archive = dyn_cast_or_null<ArchiveFile>(inputFile))
         archive->addLazySymbols();
     }
 
@@ -1642,6 +1845,9 @@ static void createFiles(const InputArgList &args) {
     pageInQueue.stopAllWork = true;
   }
 #endif
+
+  // Anything still held back is parsed now, before createFiles() returns.
+  finishParallelInput();
 }
 
 namespace {
@@ -2181,6 +2387,12 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     config->thinLTOJobs = arg->getValue();
   if (!get_threadpool_strategy(config->thinLTOJobs))
     error("--thinlto-jobs: invalid job count: " + config->thinLTOJobs);
+
+  // The parallel input phase needs the sharded symbol table from the very first
+  // symbol, because each of its slots carries a hidden header. At one thread
+  // nothing is sharded and the input phase is bit-for-bit the old one.
+  if (parallel::strategy.ThreadsRequested != 1)
+    symtab->enableSharding();
 
   for (const Arg *arg : args.filtered(OPT_u)) {
     config->explicitUndefineds.push_back(symtab->addUndefined(

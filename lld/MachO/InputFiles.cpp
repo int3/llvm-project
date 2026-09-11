@@ -73,6 +73,7 @@
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/StringSaver.h"
 #include "llvm/Support/TarWriter.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/TextAPI/Architecture.h"
@@ -89,6 +90,25 @@ using namespace lld;
 using namespace lld::macho;
 
 // Returns "<internal>", "foo.a(bar.o)", or "baz.o".
+namespace {
+// make<T>() outside a parallel parse, makeThreadLocal<T>() inside one.
+template <typename T, typename... Args> T *makeInput(Args &&...args) {
+  if (parallelParseActive)
+    return makeThreadLocal<T>(std::forward<Args>(args)...);
+  return make<T>(std::forward<Args>(args)...);
+}
+
+// saver() writes to one shared allocator, so a worker uses its own. Neither
+// saver deduplicates, so the strings are the same either way.
+StringRef saveInput(const Twine &s) {
+  if (!parallelParseActive)
+    return saver().save(s);
+  thread_local llvm::BumpPtrAllocator alloc;
+  thread_local llvm::StringSaver localSaver{alloc};
+  return localSaver.save(s);
+}
+} // namespace
+
 std::string lld::toString(const InputFile *f) {
   if (!f)
     return "<internal>";
@@ -353,7 +373,8 @@ void ObjFile::parseSections(ArrayRef<SectionHeader> sectionHeaders) {
         StringRef(sec.sectname, strnlen(sec.sectname, sizeof(sec.sectname)));
     StringRef segname =
         StringRef(sec.segname, strnlen(sec.segname, sizeof(sec.segname)));
-    sections.push_back(make<Section>(this, segname, name, sec.flags, sec.addr));
+    sections.push_back(
+        makeInput<Section>(this, segname, name, sec.flags, sec.addr));
     if (sec.align >= 32) {
       error("alignment " + std::to_string(sec.align) + " of section " + name +
             " is too large");
@@ -371,7 +392,7 @@ void ObjFile::parseSections(ArrayRef<SectionHeader> sectionHeaders) {
       Subsections &subsections = section.subsections;
       subsections.reserve(data.size() / recordSize);
       for (uint64_t off = 0; off < data.size(); off += recordSize) {
-        auto *isec = make<ConcatInputSection>(
+        auto *isec = makeInput<ConcatInputSection>(
             section,
             data.slice(off, std::min<uint64_t>(data.size() - off, recordSize)),
             align);
@@ -387,7 +408,8 @@ void ObjFile::parseSections(ArrayRef<SectionHeader> sectionHeaders) {
       bool dedupLiterals =
           name == section_names::objcMethname || config->dedupStrings;
       InputSection *isec =
-          make<CStringInputSection>(section, data, align, dedupLiterals);
+          makeInput<CStringInputSection>(section, data, align,
+                                              dedupLiterals);
       // FIXME: parallelize this?
       cast<CStringInputSection>(isec)->splitIntoPieces();
       section.subsections.push_back({0, isec});
@@ -395,7 +417,8 @@ void ObjFile::parseSections(ArrayRef<SectionHeader> sectionHeaders) {
       if (sec.nreloc)
         fatal(toString(this) + ": " + sec.segname + "," + sec.sectname +
               " contains relocations, which is unsupported");
-      InputSection *isec = make<WordLiteralInputSection>(section, data, align);
+      InputSection *isec =
+          makeInput<WordLiteralInputSection>(section, data, align);
       section.subsections.push_back({0, isec});
     } else if (auto recordSize = getRecordSize(segname, name)) {
       splitRecords(*recordSize);
@@ -418,7 +441,7 @@ void ObjFile::parseSections(ArrayRef<SectionHeader> sectionHeaders) {
       if (name == section_names::addrSig)
         addrSigSection = sections.back();
 
-      auto *isec = make<ConcatInputSection>(section, data, align);
+      auto *isec = makeInput<ConcatInputSection>(section, data, align);
       if (isDebugSection(isec->getFlags()) &&
           isec->getSegName() == segment_names::dwarf) {
         // Instead of emitting DWARF sections, we emit STABS symbols to the
@@ -451,7 +474,7 @@ void ObjFile::splitEhFrames(ArrayRef<uint8_t> data, Section &ehFrameSection) {
     // Note that we still want to preserve the alignment of the overall section,
     // just not of the individual EH frames.
     ehFrameSection.subsections.push_back(
-        {frameOff, make<ConcatInputSection>(ehFrameSection,
+        {frameOff, makeInput<ConcatInputSection>(ehFrameSection,
                                             data.slice(frameOff, fullLength),
                                             /*align=*/1)});
   }
@@ -759,13 +782,14 @@ static macho::Symbol *createDefined(const NList &sym, StringRef name,
       isWeakDefCanBeHidden = false;
     else if (isWeakDefCanBeHidden)
       isPrivateExtern = true;
-    return symtab->addDefined(
-        name, isec->getFile(), isec, value, size, sym.n_desc & N_WEAK_DEF,
-        isPrivateExtern, sym.n_desc & REFERENCED_DYNAMICALLY,
-        sym.n_desc & N_NO_DEAD_STRIP, isWeakDefCanBeHidden, isCold);
+    return symtab->addDefinedRecord(
+        {/*ordinal=*/0, name, isec->getFile(), isec, value, size,
+         (sym.n_desc & N_WEAK_DEF) != 0, isPrivateExtern,
+         (sym.n_desc & REFERENCED_DYNAMICALLY) != 0,
+         (sym.n_desc & N_NO_DEAD_STRIP) != 0, isWeakDefCanBeHidden, isCold});
   }
   bool includeInSymtab = !isPrivateLabel(name) && !isEhFrameSection(isec);
-  auto *defined = make<Defined>(
+  auto *defined = makeInput<Defined>(
       name, isec->getFile(), isec, value, size, sym.n_desc & N_WEAK_DEF,
       /*isExternal=*/false, /*isPrivateExtern=*/false, includeInSymtab,
       sym.n_desc & REFERENCED_DYNAMICALLY, sym.n_desc & N_NO_DEAD_STRIP);
@@ -783,13 +807,14 @@ static macho::Symbol *createAbsolute(const NList &sym, InputFile *file,
 
   if (sym.n_type & N_EXT) {
     bool isPrivateExtern = sym.n_type & N_PEXT || forceHidden;
-    return symtab->addDefined(name, file, nullptr, sym.n_value, /*size=*/0,
-                              /*isWeakDef=*/false, isPrivateExtern,
-                              /*isReferencedDynamically=*/false,
-                              sym.n_desc & N_NO_DEAD_STRIP,
-                              /*isWeakDefCanBeHidden=*/false, isCold);
+    return symtab->addDefinedRecord(
+        {/*ordinal=*/0, name, file, nullptr, sym.n_value, /*size=*/0,
+         /*isWeakDef=*/false, isPrivateExtern,
+         /*isReferencedDynamically=*/false,
+         (sym.n_desc & N_NO_DEAD_STRIP) != 0,
+         /*isWeakDefCanBeHidden=*/false, isCold});
   }
-  auto *defined = make<Defined>(name, file, nullptr, sym.n_value, /*size=*/0,
+  auto *defined = makeInput<Defined>(name, file, nullptr, sym.n_value, /*size=*/0,
                                 /*isWeakDef=*/false,
                                 /*isExternal=*/false, /*isPrivateExtern=*/false,
                                 /*includeInSymtab=*/true,
@@ -822,7 +847,8 @@ macho::Symbol *ObjFile::parseNonSectionSymbol(const NList &sym,
     StringRef aliasedName = StringRef(strtab + sym.n_value);
     // isPrivateExtern is the only symbol flag that has an impact on the final
     // aliased symbol.
-    auto *alias = make<AliasSymbol>(this, name, aliasedName, isPrivateExtern);
+    auto *alias =
+        makeInput<AliasSymbol>(this, name, aliasedName, isPrivateExtern);
     aliases.push_back(alias);
     return alias;
   }
@@ -1001,7 +1027,7 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
       }
       auto *concatIsec = cast<ConcatInputSection>(isec);
 
-      auto *nextIsec = make<ConcatInputSection>(*concatIsec);
+      auto *nextIsec = makeInput<ConcatInputSection>(*concatIsec);
       nextIsec->wasCoalesced = false;
       if (isZeroFill(isec->getFlags())) {
         // Zero-fill sections have NULL data.data() non-zero data.size()
@@ -1061,6 +1087,9 @@ void ObjFile::parseLinkerOptions(SmallVectorImpl<StringRef> &LCLinkerOptions) {
 }
 
 SmallVector<StringRef> macho::unprocessedLCLinkerOptions;
+bool macho::deferDirectObjParse = false;
+bool macho::parallelParseActive = false;
+
 ObjFile::ObjFile(MemoryBufferRef mb, uint32_t modTime, StringRef archiveName,
                  bool lazy, bool forceHidden, bool compatArch,
                  bool builtFromBitcode)
@@ -1073,12 +1102,16 @@ ObjFile::ObjFile(MemoryBufferRef mb, uint32_t modTime, StringRef archiveName,
       parseLazy<LP64>();
     else
       parseLazy<ILP32>();
-  } else {
-    if (target->wordSize == 8)
-      parse<LP64>();
-    else
-      parse<ILP32>();
+  } else if (!deferDirectObjParse) {
+    parseFile();
   }
+}
+
+void ObjFile::parseFile() {
+  if (target->wordSize == 8)
+    parse<LP64>();
+  else
+    parse<ILP32>();
 }
 
 template <class LP> void ObjFile::parse() {
@@ -1100,7 +1133,10 @@ template <class LP> void ObjFile::parse() {
   // LTO is finished.
   SmallVector<StringRef, 4> LCLinkerOptions;
   parseLinkerOptions<LP>(LCLinkerOptions);
-  unprocessedLCLinkerOptions.append(LCLinkerOptions);
+  if (parseCtx)
+    parseCtx->lcLinkerOptions.append(LCLinkerOptions);
+  else
+    unprocessedLCLinkerOptions.append(LCLinkerOptions);
 
   ArrayRef<SectionHeader> sectionHeaders;
   if (const load_command *cmd = findCommand(hdr, LP::segmentLCType)) {
@@ -1133,6 +1169,13 @@ template <class LP> void ObjFile::parse() {
 
   parseDebugInfo();
 
+  // Unwind registration reads definitions that other files own, so under the
+  // parallel input phase it runs later, from registerUnwind().
+  if (!deferUnwindRegistration)
+    registerUnwind();
+}
+
+void ObjFile::registerUnwind() {
   Section *ehFrameSection = nullptr;
   Section *compactUnwindSection = nullptr;
   for (Section *sec : sections) {
@@ -1216,7 +1259,7 @@ void ObjFile::parseDebugInfo() {
 
   // We do not re-use the context from getDwarf() here as that function
   // constructs an expensive DWARFCache object.
-  auto *ctx = make<DWARFContext>(
+  auto *ctx = makeInput<DWARFContext>(
       std::move(dObj), "",
       [&](Error err) {
         warn(toString(this) + ": " + toString(std::move(err)));
@@ -1332,8 +1375,8 @@ void ObjFile::registerCompactUnwind(Section &compactUnwindSection) {
           continue;
         }
 
-        d = make<Defined>(saver().save(Twine("Lcu.") + referentIsec->getName() +
-                                       "." + Twine::utohexstr(add)),
+        d = makeInput<Defined>(saveInput(Twine("Lcu.") + referentIsec->getName() +
+                                        "." + Twine::utohexstr(add)),
                           this, referentIsec, add,
                           /*size=*/0, /*isWeakDef=*/false,
                           /*isExternal=*/false, /*isPrivateExtern=*/false,
@@ -1559,7 +1602,7 @@ void ObjFile::registerEhFrames(Section &ehFrameSection) {
     // that all EH frames have an associated symbol so that we can generate
     // subtractor relocs that reference them.
     if (isec->symbols.size() == 0)
-      make<Defined>("EH_Frame", isec->getFile(), isec, /*value=*/0,
+      makeInput<Defined>("EH_Frame", isec->getFile(), isec, /*value=*/0,
                     isec->getSize(), /*isWeakDef=*/false, /*isExternal=*/false,
                     /*isPrivateExtern=*/false, /*includeInSymtab=*/false,
                     /*isReferencedDynamically=*/false,

@@ -51,7 +51,25 @@ void ErrorHandler::flushStreams() {
 
 ErrorHandler &lld::errorHandler() { return context().e; }
 
-void lld::error(const Twine &msg) { errorHandler().error(msg); }
+thread_local DeferredDiagnostics *lld::deferredDiagnostics = nullptr;
+
+void lld::replayDiagnostics(const DeferredDiagnostics &deferred) {
+  assert(!deferredDiagnostics && "replay must run outside a deferred region");
+  for (const DeferredDiagnostics::Entry &entry : deferred.entries) {
+    if (entry.kind == DeferredDiagnostics::Kind::Error)
+      errorHandler().error(entry.msg);
+    else
+      errorHandler().warn(entry.msg);
+  }
+}
+
+void lld::error(const Twine &msg) {
+  if (DeferredDiagnostics *deferred = deferredDiagnostics) {
+    deferred->entries.push_back({DeferredDiagnostics::Kind::Error, msg.str()});
+    return;
+  }
+  errorHandler().error(msg);
+}
 void lld::error(const Twine &msg, ErrorTag tag, ArrayRef<StringRef> args) {
   errorHandler().error(msg, tag, args);
 }
@@ -60,7 +78,13 @@ void lld::log(const Twine &msg) { errorHandler().log(msg); }
 void lld::message(const Twine &msg, llvm::raw_ostream &s) {
   errorHandler().message(msg, s);
 }
-void lld::warn(const Twine &msg) { errorHandler().warn(msg); }
+void lld::warn(const Twine &msg) {
+  if (DeferredDiagnostics *deferred = deferredDiagnostics) {
+    deferred->entries.push_back({DeferredDiagnostics::Kind::Warn, msg.str()});
+    return;
+  }
+  errorHandler().warn(msg);
+}
 uint64_t lld::errorCount() { return errorHandler().errorCount; }
 
 raw_ostream &lld::outs() {
