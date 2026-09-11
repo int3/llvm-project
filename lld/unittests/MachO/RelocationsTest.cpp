@@ -9,9 +9,12 @@
 
 #include "../../MachO/Relocations.h"
 #include "../../MachO/InputSection.h"
+#include "../../MachO/Symbols.h"
 #include "lld/Common/CommonLinkerContext.h"
 
 #include "gtest/gtest.h"
+
+#include <memory>
 
 using namespace lld;
 using namespace lld::macho;
@@ -19,8 +22,14 @@ using namespace lld::macho;
 namespace {
 class RelocationTest : public testing::Test {
 protected:
-  void SetUp() override { new CommonLinkerContext; }
-  void TearDown() override { CommonLinkerContext::destroy(); }
+  void SetUp() override {
+    new CommonLinkerContext;
+    config = std::make_unique<Configuration>();
+  }
+  void TearDown() override {
+    config.reset();
+    CommonLinkerContext::destroy();
+  }
 };
 
 static Symbol *symbol(uintptr_t value) {
@@ -135,5 +144,105 @@ TEST_F(RelocationTest, MetadataSettersPreserveTarget) {
   EXPECT_EQ(9U, r.getOffset());
   EXPECT_EQ(-19, r.getAddend());
   EXPECT_EQ(section(0x2000), llvm::cast<InputSection *>(r.getReferent()));
+}
+
+TEST_F(RelocationTest, SymbolQueriesFollowCurrentKind) {
+  Defined absolute("absolute", nullptr, nullptr, 0x1234, 0,
+                   /*isWeakDef=*/true, /*isExternal=*/true,
+                   /*isPrivateExtern=*/false, /*includeInSymtab=*/true,
+                   /*isReferencedDynamically=*/false, /*noDeadStrip=*/false);
+  Symbol *sym = &absolute;
+  EXPECT_EQ(0x1234U, sym->getVA());
+  EXPECT_TRUE(sym->isWeakDef());
+  EXPECT_FALSE(sym->isWeakRef());
+  EXPECT_FALSE(sym->isTlv());
+
+  Undefined undefined("undefined", nullptr, RefState::Weak,
+                      /*wasBitcodeSymbol=*/false);
+  sym = &undefined;
+  EXPECT_EQ(0U, sym->getVA());
+  EXPECT_FALSE(sym->isWeakDef());
+  EXPECT_TRUE(sym->isWeakRef());
+  EXPECT_FALSE(sym->isTlv());
+
+  DylibSymbol dylib(nullptr, "dylib", /*isWeakDef=*/true, RefState::Weak,
+                    /*isTlv=*/true);
+  sym = &dylib;
+  EXPECT_EQ(0U, sym->getVA());
+  EXPECT_TRUE(sym->isWeakDef());
+  EXPECT_TRUE(sym->isWeakRef());
+  EXPECT_TRUE(sym->isTlv());
+
+  CommonSymbol common("common", nullptr, 4, 4, false);
+  sym = &common;
+  EXPECT_EQ(0U, sym->getVA());
+  EXPECT_FALSE(sym->isWeakDef());
+  EXPECT_FALSE(sym->isWeakRef());
+  EXPECT_FALSE(sym->isTlv());
+
+  AliasSymbol alias(nullptr, "alias", "absolute", false);
+  sym = &alias;
+  EXPECT_EQ(0U, sym->getVA());
+  EXPECT_FALSE(sym->isWeakDef());
+  EXPECT_FALSE(sym->isWeakRef());
+  EXPECT_FALSE(sym->isTlv());
+
+  Section section(nullptr, "__DATA", "__thread_vars",
+                  llvm::MachO::S_THREAD_LOCAL_VARIABLES, 0);
+  ConcatInputSection isec(section, {});
+  Defined tlv("tlv", nullptr, &isec, 0, 0, /*isWeakDef=*/false,
+              /*isExternal=*/true, /*isPrivateExtern=*/false,
+              /*includeInSymtab=*/true, /*isReferencedDynamically=*/false,
+              /*noDeadStrip=*/false);
+  EXPECT_TRUE(static_cast<Symbol *>(&tlv)->isTlv());
+}
+
+TEST_F(RelocationTest, SymbolUnionReplacementKeepsQueriesAndFlags) {
+  config->deadStrip = true;
+  DylibFile file(nullptr);
+  SymbolUnion storage;
+  Symbol *sym = new (&storage) Undefined("undefined", &file,
+                                          RefState::Strong, false);
+  EXPECT_FALSE(sym->isLive());
+  EXPECT_FALSE(sym->isUsedInRegularObj);
+  EXPECT_FALSE(sym->isWeakRef());
+  sym->isUsedInRegularObj = true;
+  sym->used.store(true, std::memory_order_relaxed);
+
+  Symbol *const address = sym;
+  sym = replaceSymbol<DylibSymbol>(sym, &file, "dylib",
+                                   /*isWeakDef=*/true, RefState::Weak,
+                                   /*isTlv=*/true);
+  EXPECT_EQ(address, sym);
+  EXPECT_TRUE(sym->isUsedInRegularObj);
+  EXPECT_TRUE(sym->isLive());
+  EXPECT_EQ(0U, sym->getVA());
+  EXPECT_TRUE(sym->isWeakDef());
+  EXPECT_TRUE(sym->isWeakRef());
+  EXPECT_TRUE(sym->isTlv());
+
+  sym = replaceSymbol<Defined>(sym, "defined", &file, nullptr, 0x5678, 0,
+                               /*isWeakDef=*/false, /*isExternal=*/true,
+                               /*isPrivateExtern=*/false,
+                               /*includeInSymtab=*/true,
+                               /*isReferencedDynamically=*/false,
+                               /*noDeadStrip=*/false);
+  EXPECT_EQ(address, sym);
+  EXPECT_TRUE(sym->isUsedInRegularObj);
+  EXPECT_TRUE(sym->isLive());
+  EXPECT_EQ(0x5678U, sym->getVA());
+  EXPECT_FALSE(sym->isWeakDef());
+  EXPECT_FALSE(sym->isWeakRef());
+  EXPECT_FALSE(sym->isTlv());
+
+  sym = replaceSymbol<Undefined>(sym, "undefined-again", &file,
+                                 RefState::Weak, false);
+  EXPECT_EQ(address, sym);
+  EXPECT_TRUE(sym->isUsedInRegularObj);
+  EXPECT_TRUE(sym->isLive());
+  EXPECT_EQ(0U, sym->getVA());
+  EXPECT_FALSE(sym->isWeakDef());
+  EXPECT_TRUE(sym->isWeakRef());
+  EXPECT_FALSE(sym->isTlv());
 }
 } // namespace

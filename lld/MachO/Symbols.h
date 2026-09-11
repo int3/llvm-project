@@ -18,6 +18,7 @@
 #include "llvm/Support/MathExtras.h"
 
 #include <atomic>
+#include <type_traits>
 
 namespace lld {
 namespace macho {
@@ -45,7 +46,7 @@ public:
     Thunk // The function body is folded into a single branch thunk.
   };
 
-  virtual ~Symbol() {}
+  ~Symbol() = default;
 
   Kind kind() const { return symbolKind; }
 
@@ -56,16 +57,16 @@ public:
     return symbolKind == LazyArchiveKind || symbolKind == LazyObjectKind;
   }
 
-  virtual uint64_t getVA() const { return 0; }
+  uint64_t getVA() const;
 
-  virtual bool isWeakDef() const { return false; }
+  bool isWeakDef() const;
 
   // Only undefined or dylib symbols can be weak references. A weak reference
   // need not be satisfied at runtime, e.g. due to the symbol not being
   // available on a given target platform.
-  virtual bool isWeakRef() const { return false; }
+  bool isWeakRef() const;
 
-  virtual bool isTlv() const { return false; }
+  bool isTlv() const;
 
   // Whether this symbol has a non-lazy pointer slot.
   bool isInGot() const { return gotIndex != UINT32_MAX; }
@@ -120,17 +121,17 @@ public:
           bool canOverrideWeakDef = false, bool isWeakDefCanBeHidden = false,
           bool interposable = false, bool cold = false);
 
-  bool isWeakDef() const override { return weakDef; }
+  bool isWeakDef() const { return weakDef; }
   bool isExternalWeakDef() const {
     return isWeakDef() && isExternal() && !privateExtern;
   }
-  bool isTlv() const override;
+  bool isTlv() const;
 
   bool isExternal() const { return external; }
   bool isAbsolute() const { return originalIsec == nullptr; }
   bool isCold() const { return cold; }
 
-  uint64_t getVA() const override;
+  uint64_t getVA() const;
 
   // Returns the object file that this symbol was defined in. This value differs
   // from `getFile()` if the symbol originated from a bitcode file.
@@ -217,7 +218,7 @@ public:
     assert(refState != RefState::Unreferenced);
   }
 
-  bool isWeakRef() const override { return refState == RefState::Weak; }
+  bool isWeakRef() const { return refState == RefState::Weak; }
 
   static bool classof(const Symbol *s) { return s->kind() == UndefinedKind; }
 
@@ -267,16 +268,16 @@ public:
       file->numReferencedSymbols++;
   }
 
-  uint64_t getVA() const override;
-  bool isWeakDef() const override { return weakDef; }
+  uint64_t getVA() const;
+  bool isWeakDef() const { return weakDef; }
 
   // Symbols from weak libraries/frameworks are also weakly-referenced.
-  bool isWeakRef() const override {
+  bool isWeakRef() const {
     return refState == RefState::Weak ||
            (file && getFile()->umbrella->forceWeakImport);
   }
   bool isReferenced() const { return refState != RefState::Unreferenced; }
-  bool isTlv() const override { return tlv; }
+  bool isTlv() const { return tlv; }
   bool isDynamicLookup() const { return file == nullptr; }
   bool hasStubsHelper() const { return stubsHelperIndex != UINT32_MAX; }
 
@@ -359,6 +360,50 @@ public:
 private:
   StringRef aliasedName;
 };
+
+inline uint64_t Symbol::getVA() const {
+  switch (kind()) {
+  case DefinedKind:
+    return cast<Defined>(this)->getVA();
+  case DylibKind:
+    return cast<DylibSymbol>(this)->getVA();
+  default:
+    return 0;
+  }
+}
+
+inline bool Symbol::isWeakDef() const {
+  switch (kind()) {
+  case DefinedKind:
+    return cast<Defined>(this)->isWeakDef();
+  case DylibKind:
+    return cast<DylibSymbol>(this)->isWeakDef();
+  default:
+    return false;
+  }
+}
+
+inline bool Symbol::isWeakRef() const {
+  switch (kind()) {
+  case UndefinedKind:
+    return cast<Undefined>(this)->isWeakRef();
+  case DylibKind:
+    return cast<DylibSymbol>(this)->isWeakRef();
+  default:
+    return false;
+  }
+}
+
+inline bool Symbol::isTlv() const {
+  switch (kind()) {
+  case DefinedKind:
+    return cast<Defined>(this)->isTlv();
+  case DylibKind:
+    return cast<DylibSymbol>(this)->isTlv();
+  default:
+    return false;
+  }
+}
 
 union SymbolUnion {
   alignas(Defined) char a[sizeof(Defined)];

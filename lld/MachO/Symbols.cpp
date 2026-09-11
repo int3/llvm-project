@@ -15,15 +15,19 @@ using namespace llvm;
 using namespace lld;
 using namespace lld::macho;
 
-static_assert(sizeof(void *) != 8 || sizeof(Symbol) == 48,
+static_assert(sizeof(void *) != 8 || sizeof(Symbol) == 40,
               "Try to minimize Symbol's size; we create many instances");
 
 // The Microsoft ABI doesn't support using parent class tail padding for child
 // members, hence the _MSC_VER check.
 #if !defined(_MSC_VER)
-static_assert(sizeof(void *) != 8 || sizeof(Defined) == 80,
+static_assert(sizeof(void *) != 8 || sizeof(Defined) == 72,
               "Try to minimize Defined's size; we create many instances");
 #endif
+
+static_assert(!std::is_polymorphic_v<Symbol> &&
+                  std::is_trivially_destructible_v<Symbol>,
+              "Symbol must remain a compact placement-replaceable type");
 
 static_assert(sizeof(SymbolUnion) == sizeof(Defined),
               "Defined should be the largest Symbol kind");
@@ -126,7 +130,7 @@ ConcatInputSection *Defined::unwindEntry() const {
 }
 
 uint64_t DylibSymbol::getVA() const {
-  return isInStubs() ? getStubVA() : Symbol::getVA();
+  return isInStubs() ? getStubVA() : 0;
 }
 
 void LazyArchive::fetchArchiveMember() { getFile()->fetch(sym); }
