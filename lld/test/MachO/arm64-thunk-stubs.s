@@ -1,8 +1,14 @@
 # REQUIRES: aarch64
 
 # RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin %s -o %t.o
-# RUN: %lld -arch arm64 -U _extern_sym -o %t %t.o
-# RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t | FileCheck %s --implicit-check-not=.thunk.
+# RUN: mkdir -p %t.dir1 %t.dir8
+# RUN: %lld -arch arm64 -U _extern_sym --threads=1 -no_uuid \
+# RUN:   -o %t.dir1/linked-output %t.o
+# RUN: %lld -arch arm64 -U _extern_sym --threads=8 -no_uuid \
+# RUN:   -o %t.dir8/linked-output %t.o
+# RUN: cmp %t.dir1/linked-output %t.dir8/linked-output
+# RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t.dir1/linked-output \
+# RUN:   | FileCheck %s --implicit-check-not=.thunk.
 
 # CHECK-LABEL: Disassembly of section __TEXT,__text:
 

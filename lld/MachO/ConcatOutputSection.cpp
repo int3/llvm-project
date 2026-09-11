@@ -268,8 +268,7 @@ void TextOutputSection::finalize() {
 
   const uint64_t slop = config->slopScale * target->thunkSize;
   // A waiting front is revisited after finalizeOne/current relocation scans,
-  // which may insert into thunkMap but cannot create thunks. Reuse only its
-  // failed lookup; keep no map reference because inserts may rehash.
+  // which do not insert into thunkMap. Reuse only its failed lookup.
   Relocation *checkedFront = nullptr;
   for (auto *isec : inputs) {
     while (!branchesToProcess.empty()) {
@@ -281,12 +280,14 @@ void TextOutputSection::finalize() {
         continue;
       }
       if (r != checkedFront) {
-        auto &thunkInfo = thunkMap[*r];
-        if (auto *thunk = getThunkInRange(*callerIsec, *r, thunkInfo)) {
-          deferredBranchRedirects.emplace_back(callerIsec, r, thunk);
-          branchesToProcess.pop_front();
-          checkedFront = nullptr;
-          continue;
+        auto it = thunkMap.find(*r);
+        if (it != thunkMap.end()) {
+          if (auto *thunk = getThunkInRange(*callerIsec, *r, it->second)) {
+            deferredBranchRedirects.emplace_back(callerIsec, r, thunk);
+            branchesToProcess.pop_front();
+            checkedFront = nullptr;
+            continue;
+          }
         }
         checkedFront = r;
       }
@@ -327,10 +328,12 @@ void TextOutputSection::finalize() {
         continue;
       if (isTargetKnownInRange(*isec, r))
         continue;
-      auto &thunkInfo = thunkMap[r];
-      if (auto *thunk = getThunkInRange(*isec, r, thunkInfo)) {
-        deferredBranchRedirects.emplace_back(isec, &r, thunk);
-        continue;
+      auto it = thunkMap.find(r);
+      if (it != thunkMap.end()) {
+        if (auto *thunk = getThunkInRange(*isec, r, it->second)) {
+          deferredBranchRedirects.emplace_back(isec, &r, thunk);
+          continue;
+        }
       }
       branchesToProcess.emplace_back(isec, &r);
     }
@@ -346,8 +349,9 @@ void TextOutputSection::finalize() {
   DenseSet<ThunkKey, ThunkMapKeyInfo> branchTargets;
   for (auto [callerIsec, r] : branchesToProcess) {
     ThunkKey thunkKey(*r);
-    auto &thunkInfo = thunkMap[thunkKey];
-    if (!getThunkInRange(*callerIsec, *r, thunkInfo))
+    auto it = thunkMap.find(thunkKey);
+    if (it == thunkMap.end() ||
+        !getThunkInRange(*callerIsec, *r, it->second))
       branchTargets.insert(thunkKey);
   }
 
