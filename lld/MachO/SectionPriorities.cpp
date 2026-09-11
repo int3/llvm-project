@@ -24,6 +24,7 @@
 #include "lld/Common/Utils.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/Support/Endian.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/raw_ostream.h"
@@ -75,6 +76,12 @@ private:
 // Maximum amount the combined cluster density can be worse than the original
 // cluster to consider merging.
 constexpr int MAX_DENSITY_DEGRADATION = 8;
+
+uint64_t getOrderFileNamePrefixBit(StringRef name) {
+  assert(name.size() >= 4);
+  uint32_t prefix = support::endian::read32le(name.data());
+  return uint64_t{1} << ((prefix * 0x9e3779b1u) >> 26);
+}
 } // end anonymous namespace
 
 // Take the edge list in callGraphProfile, resolve symbol names to Symbols, and
@@ -396,7 +403,25 @@ macho::PriorityBuilder::buildInputSectionPriorities() {
   if (priorities.empty())
     return sectionPriorities;
 
+  uint64_t orderFileNamePrefixMask = 0;
+  for (const auto &entry : priorities) {
+    // getRootSymbol() only removes suffixes, so its leading bytes match the
+    // raw symbol name. A short normalized key disables this conservative test.
+    if (entry.first.size() < 4) {
+      orderFileNamePrefixMask = ~uint64_t{0};
+      break;
+    }
+    orderFileNamePrefixMask |= getOrderFileNamePrefixBit(entry.first);
+  }
+
   auto addSym = [&](const Defined *sym) {
+    if (sym->isAbsolute())
+      return;
+    StringRef name = sym->getName();
+    if (orderFileNamePrefixMask != ~uint64_t{0} &&
+        (name.size() < 4 ||
+         !(orderFileNamePrefixMask & getOrderFileNamePrefixBit(name))))
+      return;
     std::optional<int> symbolPriority = getSymbolPriority(sym);
     if (!symbolPriority)
       return;
