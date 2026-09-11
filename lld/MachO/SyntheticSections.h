@@ -17,6 +17,7 @@
 #include "Target.h"
 #include "Writer.h"
 
+#include "llvm/ADT/CachedHashString.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
@@ -438,9 +439,9 @@ public:
   StringTableSection();
   // Returns the start offset of the added string.
   uint32_t addString(StringRef);
-  // Intern the strings in input order, assigning offsets without changing the
-  // resulting string-table order. This is only used for normal symbols before
-  // serial STABS emission.
+  // Intern the strings in input order, assigning exactly the offsets that
+  // addString() would have assigned for the same sequence. Used for normal
+  // symbol names and then for the STABS source/object paths.
   void addStringsInOrder(llvm::MutableArrayRef<llvm::CachedHashStringRef>,
                          llvm::MutableArrayRef<uint32_t>);
   uint64_t getRawSize() const override { return size; }
@@ -465,6 +466,10 @@ private:
              stringMapShards>
       stringMaps;
   size_t size = 2;
+  // Whether stringMaps already holds interned strings, in which case a
+  // subsequent addStringsInOrder() batch has to look them up separately: the
+  // map values are byte offsets by then, not batch indices.
+  bool mapsPopulated = false;
   std::vector<WriteChunk> writeChunks;
   size_t nextWriteChunk = 1024 * 1024;
   bool parallelWriteEnabled = false;
@@ -494,6 +499,33 @@ struct StabsFragment {
   std::vector<StabsEntry> entries;
 };
 
+// A symbol that needs a STABS entry, with the two things the emission needs
+// besides the symbol: its (already interned) name offset and the id of the
+// file its original input section came from, which is the sort key.
+struct StabsSymbol {
+  Symbol *sym;
+  uint32_t strx;
+  uint32_t fileId;
+};
+
+static_assert(sizeof(StabsSymbol) == 16,
+              "Keep StabsSymbol compact; there is one per STABS symbol");
+
+// One group of STABS symbols, all from the same object file. `path` and
+// `osoPath` are the N_SO and N_OSO strings; the string table stores StringRefs
+// into them, so a source file must not be destroyed or moved once they are
+// set.
+struct StabsSourceGroup {
+  ObjFile *file = nullptr;
+  size_t begin = 0;
+  size_t end = 0;
+  std::string path;
+  std::string osoPath;
+  llvm::CachedHashStringRef hashedPath{"", 0};
+  llvm::CachedHashStringRef hashedOsoPath{"", 0};
+  std::vector<StabsEntry> stabs;
+};
+
 // Symbols of the same type must be laid out contiguously: we choose to emit
 // all local symbols first, then external symbols, and finally undefined
 // symbols. For each symbol type, the LC_DYSYMTAB load command will record the
@@ -514,12 +546,17 @@ public:
   uint32_t getNumExternalSymbols() const { return externalSymbols.size(); }
   uint32_t getNumUndefinedSymbols() const { return undefinedSymbols.size(); }
 
+  // Gathers the symbols that need STABS entries, sorts them by file id and
+  // groups them by object file. Address-independent, so prepare() runs it.
+  void prepareStabs();
+
 private:
   void emitBeginSourceStab(StringRef);
   void emitEndSourceStab();
-  void emitObjectFileStab(ObjFile *);
+  void emitObjectFileStab(const StabsSourceGroup &);
   void emitEndFunStab(Defined *);
   Defined *getFuncBodySym(Defined *);
+  void gatherStabsSymbols();
   void emitStabs();
 
 protected:
@@ -538,12 +575,22 @@ protected:
   std::vector<SymtabEntry> localSymbols;
   std::vector<SymtabEntry> externalSymbols;
   std::vector<SymtabEntry> undefinedSymbols;
+  // Gathered by prepareStabs() and released at the end of emitStabs().
+  std::vector<StabsSymbol> stabsSymbols;
+  // Retained until writeTo(): the string table refers to the path strings,
+  // whose std::string storage this vector holds.
+  std::vector<StabsSourceGroup> stabsSourceFiles;
 
 private:
   void collectSymbols(llvm::ArrayRef<Symbol *> syms, bool isPrefix);
 
   std::vector<Symbol *> preparedSymbols;
   bool prepared = false;
+  // The symbol-table sizes prepareStabs() gathered from, so that
+  // finalizeContents() can check the symbols appended after it.
+  size_t preparedLocalSymbols = 0;
+  size_t preparedExternalSymbols = 0;
+  bool stabsPrepared = false;
 };
 
 template <class LP> SymtabSection *makeSymtabSection(StringTableSection &);

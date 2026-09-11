@@ -1220,9 +1220,10 @@ SymtabSection::SymtabSection(StringTableSection &stringTableSection)
     : LinkEditSection(segment_names::linkEdit, section_names::symbolTable),
       stringTableSection(stringTableSection) {}
 
+// `sourceFile` is owned by a StabsSourceGroup, which outlives writeTo().
 void SymtabSection::emitBeginSourceStab(StringRef sourceFile) {
   StabsEntry stab(N_SO);
-  stab.strx = stringTableSection.addString(saver().save(sourceFile));
+  stab.strx = stringTableSection.addString(sourceFile);
   stabs.emplace_back(std::move(stab));
 }
 
@@ -1232,24 +1233,35 @@ void SymtabSection::emitEndSourceStab() {
   stabs.emplace_back(std::move(stab));
 }
 
-void SymtabSection::emitObjectFileStab(ObjFile *file) {
-  StabsEntry stab(N_OSO);
-  stab.sect = target->cpuSubtype;
+// The N_OSO string: the object file's absolute path (with the archive member
+// appended for archive members), then with -oso_prefix stripped. `cwd` is the
+// working directory captured once by the caller; without it this falls back to
+// sys::fs::make_absolute(), which fetches (and may fail to fetch) the working
+// directory itself. Worker-safe when `haveCwd`.
+static std::string computeObjectFileStabPath(const ObjFile *file, StringRef cwd,
+                                             bool haveCwd) {
   SmallString<261> path(!file->archiveName.empty() ? file->archiveName
                                                    : file->getName());
-  std::error_code ec = sys::fs::make_absolute(path);
-  if (ec)
+  if (haveCwd) {
+    sys::path::make_absolute(cwd, path);
+  } else if (std::error_code ec = sys::fs::make_absolute(path)) {
     fatal("failed to get absolute path for " + path);
+  }
 
   if (!file->archiveName.empty())
     path.append({"(", file->getName(), ")"});
 
-  StringRef adjustedPath = saver().save(path.str());
+  StringRef adjustedPath = path.str();
   adjustedPath.consume_front(config->osoPrefix);
+  return adjustedPath.str();
+}
 
-  stab.strx = stringTableSection.addString(adjustedPath);
+void SymtabSection::emitObjectFileStab(const StabsSourceGroup &sourceFile) {
+  StabsEntry stab(N_OSO);
+  stab.sect = target->cpuSubtype;
+  stab.strx = stringTableSection.addString(sourceFile.osoPath);
   stab.desc = 1;
-  stab.value = file->modTime;
+  stab.value = sourceFile.file->modTime;
   stabs.emplace_back(std::move(stab));
 }
 
@@ -1259,84 +1271,151 @@ void SymtabSection::emitEndFunStab(Defined *defined) {
   stabs.emplace_back(std::move(stab));
 }
 
+// Decides whether a symbol-table entry needs a STABS entry, and returns the
+// Defined it describes. Reads only symbol flags, the original input section and
+// the object file behind it, all final before address assignment, so
+// prepareStabs() can run this during finalizeAddresses().
+static Defined *getStabsCandidate(Symbol *sym) {
+  auto *defined = dyn_cast<Defined>(sym);
+  if (!defined)
+    return nullptr;
+
+  // Excluded symbols should have been filtered out in finalizeContents().
+  assert(defined->includeInSymtab);
+
+  if (defined->isAbsolute())
+    return nullptr;
+
+  // Constant-folded symbols go in the executable's symbol table, but don't
+  // get a stabs entry unless --keep-icf-stabs flag is specified.
+  if (!config->keepICFStabs &&
+      defined->identicalCodeFoldingKind != Symbol::ICFFoldKind::None)
+    return nullptr;
+
+  ObjFile *file = defined->getObjectFile();
+  if (!file || !file->compileUnit)
+    return nullptr;
+
+  return defined;
+}
+
+// The sort keys are dense InputFile::id values, so a counting sort produces
+// exactly llvm::stable_sort()'s order in linear time.
+static void stableSortByFileId(std::vector<StabsSymbol> &syms) {
+  if (syms.size() < 2)
+    return;
+  uint32_t maxFileId = 0;
+  for (const StabsSymbol &sym : syms)
+    maxFileId = std::max(maxFileId, sym.fileId);
+  std::vector<uint32_t> starts(static_cast<size_t>(maxFileId) + 2, 0);
+  for (const StabsSymbol &sym : syms)
+    ++starts[sym.fileId + 1];
+  for (size_t i = 1, n = starts.size(); i != n; ++i)
+    starts[i] += starts[i - 1];
+  std::vector<StabsSymbol> sorted(syms.size());
+  for (const StabsSymbol &sym : syms)
+    sorted[starts[sym.fileId]++] = sym;
+  syms = std::move(sorted);
+}
+
+void SymtabSection::gatherStabsSymbols() {
+  stabsSymbols.clear();
+  for (const SymtabEntry &entry :
+       concat<SymtabEntry>(localSymbols, externalSymbols)) {
+    assert(entry.sym->isLive() &&
+           "dead symbols should not be in localSymbols, externalSymbols");
+    // We use the symbol's original InputSection to get the file id,
+    // even for ICF folded symbols, to ensure STABS entries point to the
+    // correct object file where the symbol was originally defined
+    if (Defined *defined = getStabsCandidate(entry.sym))
+      stabsSymbols.push_back(
+          {entry.sym, static_cast<uint32_t>(entry.strx),
+           static_cast<uint32_t>(defined->originalIsec->getFile()->id)});
+  }
+
+  stableSortByFileId(stabsSymbols);
+
+  // Group the ordered symbols by object. The records in each group can be
+  // constructed independently; source and object path strings still have to
+  // be interned in this order below. This vector is not resized again: the
+  // string table refers to the path strings it holds.
+  stabsSourceFiles.clear();
+  for (size_t begin = 0; begin < stabsSymbols.size();) {
+    size_t end = begin + 1;
+    while (end < stabsSymbols.size() &&
+           stabsSymbols[end].fileId == stabsSymbols[begin].fileId)
+      ++end;
+    Defined *defined = cast<Defined>(stabsSymbols[begin].sym);
+    stabsSourceFiles.emplace_back();
+    StabsSourceGroup &sourceFile = stabsSourceFiles.back();
+    sourceFile.file = cast<ObjFile>(defined->originalIsec->getFile());
+    sourceFile.begin = begin;
+    sourceFile.end = end;
+    begin = end;
+  }
+}
+
+// Runs on the prepareGroup worker during address assignment.
+void SymtabSection::prepareStabs() {
+  if (config->omitDebugInfo)
+    return;
+  gatherStabsSymbols();
+  preparedLocalSymbols = localSymbols.size();
+  preparedExternalSymbols = externalSymbols.size();
+  stabsPrepared = true;
+}
+
 void SymtabSection::emitStabs() {
   if (config->omitDebugInfo)
     return;
 
-  for (const std::string &s : config->astPaths) {
-    StabsEntry astStab(N_AST);
-    astStab.strx = stringTableSection.addString(s);
-    stabs.emplace_back(std::move(astStab));
+  if (stabsPrepared) {
+    // finalizeAddresses() only appends symbols (branch-range extension
+    // thunks), and they land after the prepared prefix of localSymbols and
+    // externalSymbols, so the gathered order still matches a full walk as long
+    // as none of them needs a STABS entry -- which no thunk does, since it has
+    // no object file. Enforce that instead of assuming it: if anything in the
+    // suffix passes the filter, the gathered order could be wrong, so rebuild.
+    auto suffixNeedsStabs = [](ArrayRef<SymtabEntry> suffix) {
+      for (const SymtabEntry &entry : suffix)
+        if (getStabsCandidate(entry.sym))
+          return true;
+      return false;
+    };
+    if (suffixNeedsStabs(
+            ArrayRef<SymtabEntry>(localSymbols).drop_front(preparedLocalSymbols)) ||
+        suffixNeedsStabs(ArrayRef<SymtabEntry>(externalSymbols)
+                             .drop_front(preparedExternalSymbols)))
+      gatherStabsSymbols();
+  } else {
+    gatherStabsSymbols();
   }
 
-  // Cache the file ID for each symbol in an std::pair for faster sorting.
-  using SortingPair = std::pair<const SymtabEntry *, int>;
-  std::vector<SortingPair> symbolsNeedingStabs;
-  for (const SymtabEntry &entry :
-       concat<SymtabEntry>(localSymbols, externalSymbols)) {
-    Symbol *sym = entry.sym;
-    assert(sym->isLive() &&
-           "dead symbols should not be in localSymbols, externalSymbols");
-    if (auto *defined = dyn_cast<Defined>(sym)) {
-      // Excluded symbols should have been filtered out in finalizeContents().
-      assert(defined->includeInSymtab);
-      if (defined->isAbsolute())
-        continue;
-
-      // Constant-folded symbols go in the executable's symbol table, but don't
-      // get a stabs entry unless --keep-icf-stabs flag is specified.
-      if (!config->keepICFStabs &&
-          defined->identicalCodeFoldingKind != Symbol::ICFFoldKind::None)
-        continue;
-
-      ObjFile *file = defined->getObjectFile();
-      if (!file || !file->compileUnit)
-        continue;
-
-      // We use the symbol's original InputSection to get the file id,
-      // even for ICF folded symbols, to ensure STABS entries point to the
-      // correct object file where the symbol was originally defined
-      symbolsNeedingStabs.emplace_back(&entry,
-                                       defined->originalIsec->getFile()->id);
-    }
-  }
-
-  llvm::stable_sort(symbolsNeedingStabs, llvm::less_second());
-
-  // Group the ordered symbols by object. The records in each group can be
-  // constructed independently; source and object path strings still have to
-  // be interned in this order below.
-  struct SourceFile {
-    ObjFile *file;
-    size_t begin;
-    size_t end;
-    std::string path;
-    std::vector<StabsEntry> stabs;
-  };
-  std::vector<SourceFile> sourceFiles;
-  for (size_t begin = 0; begin < symbolsNeedingStabs.size();) {
-    size_t end = begin + 1;
-    while (end < symbolsNeedingStabs.size() &&
-           symbolsNeedingStabs[end].second == symbolsNeedingStabs[begin].second)
-      ++end;
-    Defined *defined = cast<Defined>(symbolsNeedingStabs[begin].first->sym);
-    ObjFile *file = cast<ObjFile>(defined->originalIsec->getFile());
-    sourceFiles.push_back({file, begin, end, {}, {}});
-    begin = end;
-  }
+  // One working-directory lookup for the whole link instead of one per object
+  // file, taken here so that the diagnostic for a failure stays on this
+  // thread. On failure the per-file fallback below reproduces the old
+  // behaviour exactly, including which path it names.
+  SmallString<128> cwd;
+  bool haveCwd = !sys::fs::current_path(cwd);
 
   if (config->dedupSymbolStrings) {
-    auto buildStabs = [&](SourceFile &sourceFile) {
+    auto buildStabs = [&](StabsSourceGroup &sourceFile) {
       sourceFile.path = sourceFile.file->sourceFile();
+      sourceFile.hashedPath = CachedHashStringRef(sourceFile.path);
+      if (haveCwd) {
+        sourceFile.osoPath =
+            computeObjectFileStabPath(sourceFile.file, cwd, /*haveCwd=*/true);
+        sourceFile.hashedOsoPath = CachedHashStringRef(sourceFile.osoPath);
+      }
       sourceFile.stabs.reserve(2 * (sourceFile.end - sourceFile.begin));
       for (size_t i = sourceFile.begin; i != sourceFile.end; ++i) {
-        const SymtabEntry &entry = *symbolsNeedingStabs[i].first;
-        Defined *defined = cast<Defined>(entry.sym);
+        const StabsSymbol &stabsSym = stabsSymbols[i];
+        Defined *defined = cast<Defined>(stabsSym.sym);
         InputSection *isec = defined->originalIsec;
 
         StabsEntry symStab;
         symStab.sect = isec->parent->index;
-        symStab.strx = entry.strx;
+        symStab.strx = stabsSym.strx;
         if (defined->identicalCodeFoldingKind == Symbol::ICFFoldKind::Thunk)
           symStab.value = getBodyForThunkFoldedSym(defined)->getVA();
         else
@@ -1360,46 +1439,100 @@ void SymtabSection::emitStabs() {
 
     // Avoid creating worker tasks for the small links where their setup is
     // more expensive than the short serial loop.
-    if (sourceFiles.size() < 4)
-      for (SourceFile &sourceFile : sourceFiles)
+    if (stabsSourceFiles.size() < 4)
+      for (StabsSourceGroup &sourceFile : stabsSourceFiles)
         buildStabs(sourceFile);
     else
-      parallelForEach(sourceFiles, buildStabs);
+      parallelForEach(stabsSourceFiles, buildStabs);
 
-    size_t numMarkers = stabs.size() + sourceFiles.size() * 3;
-    if (sourceFiles.empty() && !stabs.empty())
-      ++numMarkers;
-    stabs.reserve(numMarkers);
-    stabsFragments.reserve(sourceFiles.size());
-    for (size_t i = 0; i != sourceFiles.size(); ++i) {
+    if (!haveCwd)
+      for (StabsSourceGroup &sourceFile : stabsSourceFiles) {
+        sourceFile.osoPath =
+            computeObjectFileStabPath(sourceFile.file, "", /*haveCwd=*/false);
+        sourceFile.hashedOsoPath = CachedHashStringRef(sourceFile.osoPath);
+      }
+
+    // Intern the AST, source and object paths in exactly the order the serial
+    // emission below consumes them, and before any other insertion: string
+    // table offsets depend on first-insertion order.
+    const size_t numAstPaths = config->astPaths.size();
+    std::vector<CachedHashStringRef> names;
+    names.reserve(numAstPaths + 2 * stabsSourceFiles.size());
+    for (const std::string &s : config->astPaths)
+      names.emplace_back(StringRef(s));
+    for (const StabsSourceGroup &sourceFile : stabsSourceFiles) {
+      names.push_back(sourceFile.hashedPath);
+      names.push_back(sourceFile.hashedOsoPath);
+    }
+    std::vector<uint32_t> offsets(names.size());
+    stringTableSection.addStringsInOrder(names, offsets);
+
+    stabs.reserve(numAstPaths + stabsSourceFiles.size() * 3 + 1);
+    for (size_t i = 0; i != numAstPaths; ++i) {
+      StabsEntry astStab(N_AST);
+      astStab.strx = offsets[i];
+      stabs.emplace_back(std::move(astStab));
+    }
+
+    stabsFragments.reserve(stabsSourceFiles.size());
+    for (size_t i = 0; i != stabsSourceFiles.size(); ++i) {
       if (i != 0)
         emitEndSourceStab();
-      SourceFile &sourceFile = sourceFiles[i];
-      emitBeginSourceStab(sourceFile.path);
-      emitObjectFileStab(sourceFile.file);
+      StabsSourceGroup &sourceFile = stabsSourceFiles[i];
+      StabsEntry sourceStab(N_SO);
+      sourceStab.strx = offsets[numAstPaths + 2 * i];
+      stabs.emplace_back(std::move(sourceStab));
+      StabsEntry objectStab(N_OSO);
+      objectStab.sect = target->cpuSubtype;
+      objectStab.strx = offsets[numAstPaths + 2 * i + 1];
+      objectStab.desc = 1;
+      objectStab.value = sourceFile.file->modTime;
+      stabs.emplace_back(std::move(objectStab));
       fragmentEntryCount += sourceFile.stabs.size();
       stabsFragments.push_back({stabs.size(), std::move(sourceFile.stabs)});
     }
 
     if (!stabs.empty())
       emitEndSourceStab();
+  // The symbols are only needed for this emission; the string table keeps no
+  // reference to them. Release the storage before writeTo().
+  stabsSymbols.clear();
+  stabsSymbols.shrink_to_fit();
     return;
   }
 
   // Keep the non-deduplicated path serial: its symbol strings are appended
-  // between the source/object entries and must retain that exact order.
-  parallelForEach(sourceFiles, [](SourceFile &sourceFile) {
+  // between the source/object entries and must retain that exact order. Only
+  // the path strings themselves are precomputed.
+  auto buildPaths = [&](StabsSourceGroup &sourceFile) {
     sourceFile.path = sourceFile.file->sourceFile();
-  });
+    if (haveCwd)
+      sourceFile.osoPath =
+          computeObjectFileStabPath(sourceFile.file, cwd, /*haveCwd=*/true);
+  };
+  if (stabsSourceFiles.size() < 4)
+    for (StabsSourceGroup &sourceFile : stabsSourceFiles)
+      buildPaths(sourceFile);
+  else
+    parallelForEach(stabsSourceFiles, buildPaths);
+  if (!haveCwd)
+    for (StabsSourceGroup &sourceFile : stabsSourceFiles)
+      sourceFile.osoPath =
+          computeObjectFileStabPath(sourceFile.file, "", /*haveCwd=*/false);
+
+  for (const std::string &s : config->astPaths) {
+    StabsEntry astStab(N_AST);
+    astStab.strx = stringTableSection.addString(s);
+    stabs.emplace_back(std::move(astStab));
+  }
 
   // Emit STABS symbols so that dsymutil and/or the debugger can map address
   // regions in the final binary to the source and object files from which they
   // originated.
   InputFile *lastFile = nullptr;
   size_t sourceFileIndex = 0;
-  for (SortingPair &pair : symbolsNeedingStabs) {
-    const SymtabEntry &entry = *pair.first;
-    Defined *defined = cast<Defined>(entry.sym);
+  for (const StabsSymbol &stabsSym : stabsSymbols) {
+    Defined *defined = cast<Defined>(stabsSym.sym);
     // When emitting STABS entries for a symbol, always use the original
     // InputSection of the defined symbol, not the section of the function body
     // (which might be a different function entirely if ICF folded this
@@ -1413,15 +1546,15 @@ void SymtabSection::emitStabs() {
         emitEndSourceStab();
       lastFile = file;
 
-      emitBeginSourceStab(sourceFiles[sourceFileIndex++].path);
-      emitObjectFileStab(file);
+      const StabsSourceGroup &sourceFile = stabsSourceFiles[sourceFileIndex++];
+      assert(sourceFile.file == file);
+      emitBeginSourceStab(sourceFile.path);
+      emitObjectFileStab(sourceFile);
     }
 
     StabsEntry symStab;
     symStab.sect = isec->parent->index;
-    symStab.strx = config->dedupSymbolStrings
-                       ? entry.strx
-                       : stringTableSection.addString(defined->getName());
+    symStab.strx = stringTableSection.addString(defined->getName());
 
     // When using --keep-icf-stabs, we need to use the VA of the actual function
     // body that the linker will place in the binary. This is the function that
@@ -1452,10 +1585,15 @@ void SymtabSection::emitStabs() {
     }
   }
 
-  assert(sourceFileIndex == sourceFiles.size());
+  assert(sourceFileIndex == stabsSourceFiles.size());
 
   if (!stabs.empty())
     emitEndSourceStab();
+
+  // The symbols are only needed for this emission; the string table keeps no
+  // reference to them. Release the storage before writeTo().
+  stabsSymbols.clear();
+  stabsSymbols.shrink_to_fit();
 }
 
 // Collects the symbol-table entries for `syms`: the whole symbol table on the
@@ -1570,6 +1708,7 @@ void SymtabSection::snapshotSymbols() {
 
 void SymtabSection::prepare() {
   collectSymbols(preparedSymbols, /*isPrefix=*/true);
+  prepareStabs();
 }
 
 void SymtabSection::finalizeContents() {
@@ -1773,6 +1912,7 @@ uint32_t StringTableSection::addString(StringRef str) {
     auto [it, inserted] = stringMap.try_emplace(hashedStr, strx);
     if (!inserted)
       return it->second;
+    mapsPopulated = true;
   }
 
   recordWriteChunk();
@@ -1793,18 +1933,42 @@ void StringTableSection::addStringsInOrder(
   for (uint32_t i = 0; i != count; ++i)
     occurrences[names[i].hash() >> 28].push_back(i);
 
+  // A shard map's values are byte offsets once a batch has finished, so a
+  // string already interned cannot be deduplicated through the same map entry
+  // as a batch index. When the maps can already hold strings, dedup within the
+  // batch in a scratch map and look the earlier ones up separately.
+  const bool haveInterned = mapsPopulated;
+  constexpr uint32_t alreadyInterned = UINT32_MAX;
+  static_assert(alreadyInterned != 0, "sentinel must not be a valid index");
+
   std::vector<uint32_t> firstOccurrence(names.size());
   parallelFor(0, stringMapShards, [&](size_t shard) {
     auto &stringMap = stringMaps[shard];
-    stringMap.reserve(occurrences[shard].size());
+    if (!haveInterned) {
+      stringMap.reserve(occurrences[shard].size());
+      for (uint32_t index : occurrences[shard]) {
+        auto [it, inserted] = stringMap.try_emplace(names[index], index);
+        firstOccurrence[index] = it->second;
+      }
+      return;
+    }
+    llvm::DenseMap<CachedHashStringRef, uint32_t> batchMap;
+    batchMap.reserve(occurrences[shard].size());
     for (uint32_t index : occurrences[shard]) {
-      auto [it, inserted] = stringMap.try_emplace(names[index], index);
-      firstOccurrence[index] = it->second;
+      auto it = stringMap.find(names[index]);
+      if (it != stringMap.end()) {
+        firstOccurrence[index] = alreadyInterned;
+        offsets[index] = it->second;
+        continue;
+      }
+      auto [batchIt, inserted] = batchMap.try_emplace(names[index], index);
+      firstOccurrence[index] = batchIt->second;
     }
   });
 
   // Preserve addString()'s exact first-occurrence order. STABS are emitted
-  // after this pass and use the completed shard maps through addString().
+  // after the normal-symbol pass and use the completed shard maps through
+  // addString().
   for (uint32_t i = 0; i != count; ++i) {
     if (firstOccurrence[i] != i)
       continue;
@@ -1816,10 +1980,21 @@ void StringTableSection::addStringsInOrder(
 
   parallelFor(0, stringMapShards, [&](size_t shard) {
     for (uint32_t index : occurrences[shard])
-      offsets[index] = offsets[firstOccurrence[index]];
-    for (auto &entry : stringMaps[shard])
-      entry.second = offsets[entry.second];
+      if (firstOccurrence[index] != alreadyInterned)
+        offsets[index] = offsets[firstOccurrence[index]];
+    if (!haveInterned) {
+      for (auto &entry : stringMaps[shard])
+        entry.second = offsets[entry.second];
+      return;
+    }
+    // Merge the batch's new strings, already carrying their byte offsets.
+    for (uint32_t index : occurrences[shard])
+      if (firstOccurrence[index] == index)
+        stringMaps[shard][names[index]] = offsets[index];
   });
+
+  if (count != 0)
+    mapsPopulated = true;
 }
 
 void StringTableSection::writeTo(uint8_t *buf) const {
