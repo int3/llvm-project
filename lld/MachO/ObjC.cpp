@@ -192,7 +192,7 @@ void ObjcCategoryChecker::parseMethods(const ConcatInputSection *methodsIsec,
                                        MethodKind mKind) {
   ObjcClass &klass = classMap[methodContainerSym];
   for (const Relocation &r : methodsIsec->relocs) {
-    if ((r.offset - listHeaderLayout.totalSize) % methodLayout.totalSize !=
+    if ((r.getOffset() - listHeaderLayout.totalSize) % methodLayout.totalSize !=
         methodLayout.nameOffset)
       continue;
 
@@ -262,7 +262,7 @@ void ObjcCategoryChecker::parseCategory(const ConcatInputSection *catIsec) {
   if (!classReloc)
     return;
 
-  auto *classSym = cast<Symbol *>(classReloc->referent);
+  auto *classSym = cast<Symbol *>(classReloc->getReferent());
   if (auto *d = dyn_cast<Defined>(classSym))
     if (!classMap.contains(d))
       parseClass(d);
@@ -543,18 +543,18 @@ ObjcCategoryMerger::tryGetSymbolReferenceAtIsecOffset(
   if (!reloc)
     return {nullptr, 0};
 
-  Symbol *sym = dyn_cast_if_present<Symbol *>(reloc->referent);
+  Symbol *sym = dyn_cast_if_present<Symbol *>(reloc->getReferent());
 
-  if (reloc->addend && sym) {
+  if (reloc->getAddend() && sym) {
     assert(isa<Defined>(sym) && "Expected defined for non-zero addend");
     Defined *definedSym = cast<Defined>(sym);
-    uint64_t targetOffset = definedSym->value + reloc->addend;
+    uint64_t targetOffset = definedSym->value + reloc->getAddend();
     if (Defined *targetSym =
             tryFindDefinedOnIsec(definedSym->isec(), targetOffset))
       return {targetSym, targetOffset - targetSym->value};
   }
 
-  return {sym, reloc->addend};
+  return {sym, reloc->getAddend()};
 }
 
 Symbol *
@@ -618,14 +618,15 @@ void ObjcCategoryMerger::tryEraseDefinedAtIsecOffset(
   if (!reloc)
     return;
 
-  Defined *sym = dyn_cast_or_null<Defined>(cast<Symbol *>(reloc->referent));
+  Defined *sym =
+      dyn_cast_or_null<Defined>(cast<Symbol *>(reloc->getReferent()));
   if (!sym)
     return;
 
   if (auto *cisec = dyn_cast_or_null<ConcatInputSection>(sym->isec()))
     eraseISec(cisec);
   else if (auto *csisec = dyn_cast_or_null<CStringInputSection>(sym->isec())) {
-    uint32_t totalOffset = sym->value + reloc->addend;
+    uint32_t totalOffset = sym->value + reloc->getAddend();
     StringPiece &piece = csisec->getStringPiece(totalOffset);
     piece.live = false;
   } else {
@@ -690,7 +691,8 @@ void ObjcCategoryMerger::parseProtocolListInfo(const ConcatInputSection *isec,
   if (!reloc)
     return;
 
-  auto *ptrListSym = dyn_cast_or_null<Defined>(cast<Symbol *>(reloc->referent));
+  auto *ptrListSym =
+      dyn_cast_or_null<Defined>(cast<Symbol *>(reloc->getReferent()));
   assert(ptrListSym && "Protocol list reloc does not have a valid Defined");
 
   // Theoretically protocol count can be either 32b or 64b, depending on
@@ -712,7 +714,8 @@ void ObjcCategoryMerger::parseProtocolListInfo(const ConcatInputSection *isec,
     const Relocation *reloc = ptrListSym->isec()->getRelocAt(off);
     assert(reloc && "No reloc found at protocol list offset");
 
-    auto *listSym = dyn_cast_or_null<Defined>(cast<Symbol *>(reloc->referent));
+    auto *listSym =
+        dyn_cast_or_null<Defined>(cast<Symbol *>(reloc->getReferent()));
     assert(listSym && "Protocol list reloc does not have a valid Defined");
 
     ptrList.allPtrs.push_back(listSym);
@@ -749,7 +752,8 @@ bool ObjcCategoryMerger::parsePointerListInfo(const ConcatInputSection *isec,
   if (!reloc)
     return true;
 
-  auto *ptrListSym = dyn_cast_or_null<Defined>(cast<Symbol *>(reloc->referent));
+  auto *ptrListSym =
+      dyn_cast_or_null<Defined>(cast<Symbol *>(reloc->getReferent()));
   assert(ptrListSym && "Reloc does not have a valid Defined");
 
   uint32_t thisStructSize = *reinterpret_cast<const uint32_t *>(
@@ -773,8 +777,8 @@ bool ObjcCategoryMerger::parsePointerListInfo(const ConcatInputSection *isec,
     const Relocation *reloc = ptrListSym->isec()->getRelocAt(off);
     assert(reloc && "No reloc found at pointer list offset");
 
-    auto *listSym =
-        dyn_cast_or_null<Defined>(reloc->referent.dyn_cast<Symbol *>());
+    auto *listSym = dyn_cast_or_null<Defined>(
+        reloc->getReferent().dyn_cast<Symbol *>());
     // Sometimes, the reloc points to a StringPiece (InputSection + addend)
     // instead of a symbol.
     // TODO: Skip these cases for now, but we should fix this.
@@ -1154,9 +1158,8 @@ void ObjcCategoryMerger::createSymbolReference(Defined *refFrom,
                                                const Relocation &relocTemplate,
                                                int64_t addend) {
   Relocation r = relocTemplate;
-  r.offset = offset;
-  r.addend = addend;
-  r.referent = const_cast<Symbol *>(refTo);
+  r.setOffset(offset);
+  r.setTarget(const_cast<Symbol *>(refTo), addend);
   refFrom->isec()->relocs.push_back(r);
 }
 
@@ -1171,7 +1174,7 @@ DenseSet<const Symbol *> ObjcCategoryMerger::collectNlCategories() {
       continue;
 
     for (auto &r : sec->relocs) {
-      const Symbol *sym = r.referent.dyn_cast<Symbol *>();
+      const Symbol *sym = r.getReferent().dyn_cast<Symbol *>();
       nlCategories.insert(sym);
     }
   }
@@ -1490,7 +1493,7 @@ void ObjcCategoryMerger::eraseSymbolAtIsecOffset(ConcatInputSection *isec,
 
   // Remove the relocs that refer to this symbol
   auto removeAtOff = [offset](Relocation const &r) {
-    return r.offset == offset;
+    return r.getOffset() == offset;
   };
   llvm::erase_if(isec->relocs, removeAtOff);
 

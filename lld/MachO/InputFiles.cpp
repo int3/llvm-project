@@ -591,14 +591,11 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
     int64_t embeddedAddend = target->getEmbeddedAddend(mb, sec.offset, relInfo);
     assert(!(embeddedAddend && pairedAddend));
     int64_t totalAddend = pairedAddend + embeddedAddend;
-    Relocation r;
-    r.type = relInfo.r_type;
-    r.pcrel = relInfo.r_pcrel;
-    r.length = relInfo.r_length;
-    r.offset = relInfo.r_address;
+    Relocation::Referent referent;
+    int64_t addend = totalAddend;
+    uint32_t offset = relInfo.r_address;
     if (relInfo.r_extern) {
-      r.referent = symbols[relInfo.r_symbolnum];
-      r.addend = isSubtrahend ? 0 : totalAddend;
+      referent = symbols[relInfo.r_symbolnum];
     } else {
       assert(!isSubtrahend);
       const SectionHeader &referentSecHead =
@@ -618,9 +615,9 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
         // The addend for a non-pcrel relocation is its absolute address.
         referentOffset = totalAddend - referentSecHead.addr;
       }
-      r.referent = findContainingSubsection(*sections[relInfo.r_symbolnum - 1],
-                                            &referentOffset);
-      r.addend = referentOffset;
+      referent = findContainingSubsection(*sections[relInfo.r_symbolnum - 1],
+                                          &referentOffset);
+      addend = referentOffset;
     }
 
     // Find the subsection that this relocation belongs to.
@@ -629,17 +626,17 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
     // unsorted relocations (in `-r` mode), so we have a fallback for that
     // uncommon case.
     InputSection *subsec;
-    while (subsecIt != subsections.rend() && subsecIt->offset > r.offset)
+    while (subsecIt != subsections.rend() && subsecIt->offset > offset)
       ++subsecIt;
     if (subsecIt == subsections.rend() ||
-        subsecIt->offset + subsecIt->isec->getSize() <= r.offset) {
-      subsec = findContainingSubsection(section, &r.offset);
+        subsecIt->offset + subsecIt->isec->getSize() <= offset) {
+      subsec = findContainingSubsection(section, &offset);
       // Now that we know the relocs are unsorted, avoid trying the 'fast path'
       // for the other relocations.
       subsecIt = subsections.rend();
     } else {
       subsec = subsecIt->isec;
-      r.offset -= subsecIt->offset;
+      offset -= subsecIt->offset;
       if (subsec->relocs.empty() && subsec->relocs.capacity() == 0) {
         uint64_t subsecStart = subsecIt->offset;
         uint64_t subsecEnd = subsecStart + subsec->getSize();
@@ -654,7 +651,10 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
           subsec->relocs.reserve(end - i);
       }
     }
-    subsec->relocs.push_back(r);
+    subsec->relocs.emplace_back(static_cast<uint8_t>(relInfo.r_type),
+                                 static_cast<bool>(relInfo.r_pcrel),
+                                 static_cast<uint8_t>(relInfo.r_length), offset,
+                                 isSubtrahend ? 0 : addend, referent);
 
     if (isSubtrahend) {
       relocation_info minuendInfo = relInfos[++i];
@@ -662,22 +662,22 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
       // attached to the same address.
       assert(target->hasAttr(minuendInfo.r_type, RelocAttrBits::UNSIGNED) &&
              relInfo.r_address == minuendInfo.r_address);
-      Relocation p;
-      p.type = minuendInfo.r_type;
-      p.pcrel = minuendInfo.r_pcrel;
-      p.length = minuendInfo.r_length;
-      p.offset = r.offset;
+      Relocation::Referent minuendReferent;
+      int64_t minuendAddend = totalAddend;
       if (minuendInfo.r_extern) {
-        p.referent = symbols[minuendInfo.r_symbolnum];
-        p.addend = totalAddend;
+        minuendReferent = symbols[minuendInfo.r_symbolnum];
       } else {
         uint64_t referentOffset =
             totalAddend - sectionHeaders[minuendInfo.r_symbolnum - 1].addr;
-        p.referent = findContainingSubsection(
+        minuendReferent = findContainingSubsection(
             *sections[minuendInfo.r_symbolnum - 1], &referentOffset);
-        p.addend = referentOffset;
+        minuendAddend = referentOffset;
       }
-      subsec->relocs.push_back(p);
+      subsec->relocs.emplace_back(static_cast<uint8_t>(minuendInfo.r_type),
+                                   static_cast<bool>(minuendInfo.r_pcrel),
+                                   static_cast<uint8_t>(minuendInfo.r_length),
+                                   offset,
+                                   minuendAddend, minuendReferent);
     }
   }
 }
@@ -1288,12 +1288,13 @@ void ObjFile::registerCompactUnwind(Section &compactUnwindSection) {
     for (auto it = isec->relocs.begin(); it != isec->relocs.end();) {
       Relocation &r = *it;
       // CUE::functionAddress is at offset 0. Skip personality & LSDA relocs.
-      if (r.offset != 0) {
+      if (r.getOffset() != 0) {
         ++it;
         continue;
       }
-      uint64_t add = r.addend;
-      if (auto *sym = cast_or_null<Defined>(dyn_cast<Symbol *>(r.referent))) {
+      uint64_t add = r.getAddend();
+      if (auto *sym =
+              cast_or_null<Defined>(r.getReferent().dyn_cast<Symbol *>())) {
         // Check whether the symbol defined in this file is the prevailing one.
         // Skip if it is e.g. a weak def that didn't prevail.
         if (sym->getFile() != this) {
@@ -1304,7 +1305,7 @@ void ObjFile::registerCompactUnwind(Section &compactUnwindSection) {
         referentIsec = cast<ConcatInputSection>(sym->isec());
       } else {
         referentIsec =
-            cast<ConcatInputSection>(dyn_cast<InputSection *>(r.referent));
+            cast<ConcatInputSection>(r.getReferent().dyn_cast<InputSection *>());
       }
       // Unwind info lives in __DATA, and finalization of __TEXT will occur
       // before finalization of __DATA. Moreover, the finalization of unwind
@@ -1312,7 +1313,7 @@ void ObjFile::registerCompactUnwind(Section &compactUnwindSection) {
       // for compact unwind to reference addresses in __TEXT, but not addresses
       // in any other segment.
       if (referentIsec->getSegName() != segment_names::text)
-        error(isec->getLocation(r.offset) + " references section " +
+        error(isec->getLocation(r.getOffset()) + " references section " +
               referentIsec->getName() + " which is not in segment __TEXT");
       // The functionAddress relocations are typically section relocations.
       // However, unwind info operates on a per-symbol basis, so we search for
@@ -1442,7 +1443,8 @@ static CIE parseCIE(const InputSection *isec, const EhReader &reader,
     const auto *personalityReloc = isec->getRelocAt(personalityAddrOff);
     if (!personalityReloc)
       reader.failOn(off, "Failed to locate relocation for personality symbol");
-    cie.personalitySymbol = cast<macho::Symbol *>(personalityReloc->referent);
+    cie.personalitySymbol =
+        cast<macho::Symbol *>(personalityReloc->getReferent());
   }
   return cie;
 }
@@ -1485,22 +1487,24 @@ targetSymFromCanonicalSubtractor(const InputSection *isec,
                                  std::vector<Relocation>::iterator relocIt) {
   Relocation &subtrahend = *relocIt;
   Relocation &minuend = *std::next(relocIt);
-  assert(target->hasAttr(subtrahend.type, RelocAttrBits::SUBTRAHEND));
-  assert(target->hasAttr(minuend.type, RelocAttrBits::UNSIGNED));
+  assert(target->hasAttr(subtrahend.getType(), RelocAttrBits::SUBTRAHEND));
+  assert(target->hasAttr(minuend.getType(), RelocAttrBits::UNSIGNED));
   // Note: pcSym may *not* be exactly at the PC; there's usually a non-zero
   // addend.
-  auto *pcSym = cast<Defined>(cast<macho::Symbol *>(subtrahend.referent));
+  auto *pcSym =
+      cast<Defined>(cast<macho::Symbol *>(subtrahend.getReferent()));
   Defined *target =
-      cast_or_null<Defined>(minuend.referent.dyn_cast<macho::Symbol *>());
+      cast_or_null<Defined>(minuend.getReferent().dyn_cast<macho::Symbol *>());
   if (!pcSym) {
     auto *targetIsec =
-        cast<ConcatInputSection>(cast<InputSection *>(minuend.referent));
-    target = findSymbolAtOffset(targetIsec, minuend.addend);
+        cast<ConcatInputSection>(cast<InputSection *>(minuend.getReferent()));
+    target = findSymbolAtOffset(targetIsec, minuend.getAddend());
   }
   if (Invert)
     std::swap(pcSym, target);
   if (pcSym->isec() == isec) {
-    if (pcSym->value - (Invert ? -1 : 1) * minuend.addend != subtrahend.offset)
+    if (pcSym->value - (Invert ? -1 : 1) * minuend.getAddend() !=
+        subtrahend.getOffset())
       fatal("invalid FDE relocation in __eh_frame");
   } else {
     // Ensure the pcReloc points to a symbol within the current EH frame.
@@ -1510,9 +1514,15 @@ targetSymFromCanonicalSubtractor(const InputSection *isec,
     // have an easy way to access the offsets from this point in the code; some
     // refactoring is needed for that.
     Relocation &pcReloc = Invert ? minuend : subtrahend;
-    pcReloc.referent = isec->symbols[0];
     assert(isec->symbols[0]->value == 0);
-    minuend.addend = pcReloc.offset * (Invert ? 1LL : -1LL);
+    const int64_t adjustedAddend =
+        pcReloc.getOffset() * (Invert ? 1LL : -1LL);
+    if constexpr (Invert)
+      minuend.setTarget(isec->symbols[0], adjustedAddend);
+    else {
+      subtrahend.setReferent(isec->symbols[0]);
+      minuend.setAddend(adjustedAddend);
+    }
   }
   return target;
 }
@@ -1565,7 +1575,7 @@ void ObjFile::registerEhFrames(Section &ehFrameSection) {
 
     EhRelocator ehRelocator(isec);
     auto cieOffRelocIt = llvm::find_if(isec->relocs, [=](const Relocation &r) {
-      return r.offset == cieOffOff;
+      return r.getOffset() == cieOffOff;
     });
     InputSection *cieIsec = nullptr;
     if (cieOffRelocIt != isec->relocs.end()) {
@@ -1618,9 +1628,9 @@ void ObjFile::registerEhFrames(Section &ehFrameSection) {
     auto funcAddrRelocIt = isec->relocs.end();
     auto lsdaAddrRelocIt = isec->relocs.end();
     for (auto it = isec->relocs.begin(); it != isec->relocs.end(); ++it) {
-      if (it->offset == funcAddrOff)
+      if (it->getOffset() == funcAddrOff)
         funcAddrRelocIt = it++; // Found subtrahend; skip over minuend reloc
-      else if (lsdaAddrOpt && it->offset == lsdaAddrOff)
+      else if (lsdaAddrOpt && it->getOffset() == lsdaAddrOff)
         lsdaAddrRelocIt = it++; // Found subtrahend; skip over minuend reloc
     }
 

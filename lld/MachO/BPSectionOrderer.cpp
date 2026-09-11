@@ -70,13 +70,15 @@ struct BPOrdererMachO : lld::BPOrderer<BPOrdererMachO> {
 
     // Calculate relocation hashes
     for (const auto &r : sec.relocs) {
-      uint32_t relocLength = 1 << r.length;
-      if (r.referent.isNull() || r.offset + relocLength > data.size())
+      uint32_t relocLength = 1 << r.getLength();
+      if (r.getReferent().isNull() ||
+          r.getOffset() + relocLength > data.size())
         continue;
 
       uint64_t relocHash = getRelocHash(r, sectionToIdx);
-      uint32_t start = (r.offset < windowSize) ? 0 : r.offset - windowSize + 1;
-      for (uint32_t i = start; i < r.offset + relocLength; i++) {
+      uint32_t start =
+          (r.getOffset() < windowSize) ? 0 : r.getOffset() - windowSize + 1;
+      for (uint32_t i = start; i < r.getOffset() + relocLength; i++) {
         auto window = data.drop_front(i).take_front(windowSize);
         hashes.push_back(xxh3_64bits(window) ^ relocHash);
       }
@@ -104,13 +106,13 @@ private:
     if (isec)
       kind = uint64_t(isec->kind());
 
-    if (auto *sym = dyn_cast<Symbol *>(reloc.referent)) {
+    if (auto *sym = reloc.getReferent().dyn_cast<Symbol *>()) {
       kind = (kind << 8) | uint8_t(sym->kind());
       if (auto *d = llvm::dyn_cast<Defined>(sym))
         value = d->value;
     }
     return llvm::stable_hash_combine(kind, sectionIdx.value_or(0), value,
-                                     reloc.addend);
+                                     reloc.getAddend());
   }
 };
 } // namespace

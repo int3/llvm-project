@@ -828,7 +828,7 @@ void ObjCSelRefsHelper::initialize() {
     // might be aggregated.
     assert(isec->relocs.size() == 1);
     auto Reloc = isec->relocs[0];
-    if (const auto *sym = Reloc.referent.dyn_cast<Symbol *>()) {
+    if (const auto *sym = Reloc.getReferent().dyn_cast<Symbol *>()) {
       if (const auto *d = dyn_cast<Defined>(sym)) {
         auto *cisec = cast<CStringInputSection>(d->isec());
         auto methname = cisec->getStringRefAtOffset(d->value);
@@ -2190,18 +2190,18 @@ void InitOffsetsSection::writeTo(uint8_t *buf) const {
   // FIXME: Add function specified by -init when that argument is implemented.
   for (ConcatInputSection *isec : sections) {
     for (const Relocation &rel : isec->relocs) {
-      const Symbol *referent = cast<Symbol *>(rel.referent);
+      const Symbol *referent = cast<Symbol *>(rel.getReferent());
       assert(referent && "section relocation should have been rejected");
       uint64_t offset = referent->getVA() - in.header->addr;
       // FIXME: Can we handle this gracefully?
       if (offset > UINT32_MAX)
-        fatal(isec->getLocation(rel.offset) + ": offset to initializer " +
+        fatal(isec->getLocation(rel.getOffset()) + ": offset to initializer " +
               referent->getName() + " (" + utohexstr(offset) +
               ") does not fit in 32 bits");
 
       // Entries need to be added in the order they appear in the section, but
       // relocations aren't guaranteed to be sorted.
-      size_t index = rel.offset >> target->p2WordSize;
+      size_t index = rel.getOffset() >> target->p2WordSize;
       write32le(&buf[index * sizeof(uint32_t)], offset);
     }
     buf += isec->relocs.size() * sizeof(uint32_t);
@@ -2215,20 +2215,20 @@ void InitOffsetsSection::writeTo(uint8_t *buf) const {
 void InitOffsetsSection::setUp() {
   for (const ConcatInputSection *isec : sections) {
     for (const Relocation &rel : isec->relocs) {
-      RelocAttrs attrs = target->getRelocAttrs(rel.type);
+      RelocAttrs attrs = target->getRelocAttrs(rel.getType());
       if (!attrs.hasAttr(RelocAttrBits::UNSIGNED))
-        error(isec->getLocation(rel.offset) +
+        error(isec->getLocation(rel.getOffset()) +
               ": unsupported relocation type: " + attrs.name);
-      if (rel.addend != 0)
-        error(isec->getLocation(rel.offset) +
+      if (rel.getAddend() != 0)
+        error(isec->getLocation(rel.getOffset()) +
               ": relocation addend is not representable in __init_offsets");
-      if (isa<InputSection *>(rel.referent))
-        error(isec->getLocation(rel.offset) +
+      if (isa<InputSection *>(rel.getReferent()))
+        error(isec->getLocation(rel.getOffset()) +
               ": unexpected section relocation");
 
-      Symbol *sym = dyn_cast<Symbol *>(rel.referent);
+      Symbol *sym = rel.getReferent().dyn_cast<Symbol *>();
       if (auto *undefined = dyn_cast<Undefined>(sym))
-        treatUndefinedSymbol(*undefined, isec, rel.offset);
+        treatUndefinedSymbol(*undefined, isec, rel.getOffset());
       if (needsBinding(sym))
         in.stubs->addEntry(sym);
     }
@@ -2368,13 +2368,13 @@ void ObjCMethListSection::writeRelativeOffsetForIsec(
     symVA = selRef->getVA();
     assert(selRef->data.size() == target->wordSize &&
            "Expected one selref per ConcatInputSection");
-  } else if (auto *sym = dyn_cast<Symbol *>(reloc->referent)) {
+  } else if (auto *sym = dyn_cast<Symbol *>(reloc->getReferent())) {
     auto *def = dyn_cast_or_null<Defined>(sym);
     assert(def && "Expected all syms in __objc_methlist to be defined");
     symVA = def->getVA();
   } else {
-    auto *isec = cast<InputSection *>(reloc->referent);
-    symVA = isec->getVA(reloc->addend);
+    auto *isec = cast<InputSection *>(reloc->getReferent());
+    symVA = isec->getVA(reloc->getAddend());
   }
 
   uint32_t currentVA = isec->getVA() + outSecOff;

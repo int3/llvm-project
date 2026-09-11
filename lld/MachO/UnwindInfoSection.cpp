@@ -258,21 +258,21 @@ void UnwindInfoSectionImpl::prepareRelocations(ConcatInputSection *isec) {
   // live, it wouldn't reduce number of got entries.
   for (size_t i = 0; i < isec->relocs.size(); ++i) {
     Relocation &r = isec->relocs[i];
-    assert(target->hasAttr(r.type, RelocAttrBits::UNSIGNED));
+    assert(target->hasAttr(r.getType(), RelocAttrBits::UNSIGNED));
     // Since compact unwind sections aren't part of the inputSections vector,
     // they don't get canonicalized by scanRelocations(), so we have to do the
     // canonicalization here.
-    if (auto *referentIsec = r.referent.dyn_cast<InputSection *>())
-      r.referent = referentIsec->canonical();
+    if (auto *referentIsec = r.getReferent().dyn_cast<InputSection *>())
+      r.setReferent(referentIsec->canonical());
 
     // Functions and LSDA entries always reside in the same object file as the
     // compact unwind entries that references them, and thus appear as section
     // relocs. There is no need to prepare them. We only prepare relocs for
     // personality functions.
-    if (r.offset != cuLayout.personalityOffset)
+    if (r.getOffset() != cuLayout.personalityOffset)
       continue;
 
-    if (auto *s = r.referent.dyn_cast<Symbol *>()) {
+    if (auto *s = r.getReferent().dyn_cast<Symbol *>()) {
       // Personality functions are nearly always system-defined (e.g.,
       // ___gxx_personality_v0 for C++) and relocated as dylib symbols.  When an
       // application provides its own personality function, it might be
@@ -289,10 +289,10 @@ void UnwindInfoSectionImpl::prepareRelocations(ConcatInputSection *isec) {
         if (!defined->isExternal())
           if (Symbol *sym = symtab->find(defined->getName()))
             if (!sym->isLazy())
-              r.referent = s = sym;
+              r.setReferent(s = sym);
       }
       if (auto *undefined = dyn_cast<Undefined>(s)) {
-        treatUndefinedSymbol(*undefined, isec, r.offset);
+        treatUndefinedSymbol(*undefined, isec, r.getOffset());
         // treatUndefinedSymbol() can replace s with a DylibSymbol; re-check.
         if (isa<Undefined>(s))
           continue;
@@ -307,7 +307,7 @@ void UnwindInfoSectionImpl::prepareRelocations(ConcatInputSection *isec) {
           personality = defined;
           in.got->addEntry(defined);
         } else if (personality != defined) {
-          r.referent = personality;
+          r.setReferent(personality);
         }
         continue;
       }
@@ -317,7 +317,7 @@ void UnwindInfoSectionImpl::prepareRelocations(ConcatInputSection *isec) {
       continue;
     }
 
-    if (auto *referentIsec = r.referent.dyn_cast<InputSection *>()) {
+    if (auto *referentIsec = r.getReferent().dyn_cast<InputSection *>()) {
       assert(!isCoalescedWeak(referentIsec));
       // Personality functions can be referenced via section relocations
       // if they live in the same object file. Create placeholder synthetic
@@ -325,11 +325,11 @@ void UnwindInfoSectionImpl::prepareRelocations(ConcatInputSection *isec) {
       // in the GOT, use that to avoid creating a duplicate entry. All GOT
       // entries needed by non-unwind sections will have already been added
       // by this point.
-      Symbol *&s = personalityTable[{referentIsec, r.addend}];
+      Symbol *&s = personalityTable[{referentIsec, r.getAddend()}];
       if (s == nullptr) {
         Defined *const *gotEntry =
             llvm::find_if(referentIsec->symbols, [&](Defined const *d) {
-              return d->value == static_cast<uint64_t>(r.addend) &&
+              return d->value == static_cast<uint64_t>(r.getAddend()) &&
                      d->isInGot();
             });
         if (gotEntry != referentIsec->symbols.end()) {
@@ -338,7 +338,7 @@ void UnwindInfoSectionImpl::prepareRelocations(ConcatInputSection *isec) {
           // This runs after dead stripping, so the noDeadStrip argument does
           // not matter.
           s = make<Defined>("<internal>", /*file=*/nullptr, referentIsec,
-                            r.addend, /*size=*/0, /*isWeakDef=*/false,
+                            r.getAddend(), /*size=*/0, /*isWeakDef=*/false,
                             /*isExternal=*/false, /*isPrivateExtern=*/false,
                             /*includeInSymtab=*/true,
                             /*isReferencedDynamically=*/false,
@@ -347,8 +347,7 @@ void UnwindInfoSectionImpl::prepareRelocations(ConcatInputSection *isec) {
           in.got->addEntry(s);
         }
       }
-      r.referent = s;
-      r.addend = 0;
+      r.setTarget(s, 0);
     }
   }
 }
@@ -412,9 +411,9 @@ void UnwindInfoSectionImpl::relocateCompactUnwind(
         support::endian::read32le(buf + cuLayout.functionLengthOffset);
     cu.encoding = support::endian::read32le(buf + cuLayout.encodingOffset);
     for (const Relocation &r : d->unwindEntry()->relocs) {
-      if (r.offset == cuLayout.personalityOffset)
-        cu.personality = cast<Symbol *>(r.referent);
-      else if (r.offset == cuLayout.lsdaOffset)
+      if (r.getOffset() == cuLayout.personalityOffset)
+        cu.personality = cast<Symbol *>(r.getReferent());
+      else if (r.getOffset() == cuLayout.lsdaOffset)
         cu.lsda = r.getReferentInputSection();
     }
   });

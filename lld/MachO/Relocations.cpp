@@ -13,36 +13,52 @@
 #include "Target.h"
 
 #include "lld/Common/ErrorHandler.h"
+#include "lld/Common/CommonLinkerContext.h"
 
 using namespace llvm;
 using namespace lld;
 using namespace lld::macho;
 
-static_assert(sizeof(void *) != 8 || sizeof(Relocation) == 24,
+static_assert(sizeof(void *) != 8 || sizeof(Relocation) == 16,
               "Try to minimize Reloc's size; we create many instances");
+static_assert(alignof(Symbol) >= 4 && alignof(InputSection) >= 4,
+              "RelocationReferent must preserve one spare tag bit");
+
+void Relocation::setTarget(Referent referent, int64_t addend) {
+  if (referent == getReferent() && addend == getAddend())
+    return;
+  if (llvm::isInt<21>(addend)) {
+    metadata = packMetadata(getType(), isPCRel(), getLength(), addend);
+    target = referent;
+    return;
+  }
+  void *storage = lld::context().relocationAlloc.Allocate(sizeof(Extended),
+                                                           alignof(Extended));
+  target = new (storage) Extended{referent, addend};
+}
 
 InputSection *Relocation::getReferentInputSection() const {
-  if (const auto *sym = dyn_cast<Symbol *>(referent)) {
+  if (const auto *sym = getReferent().dyn_cast<Symbol *>()) {
     if (const auto *d = dyn_cast<Defined>(sym))
       return d->isec();
     return nullptr;
   } else {
-    return cast<InputSection *>(referent);
+    return cast<InputSection *>(getReferent());
   }
 }
 
 StringRef Relocation::getReferentString() const {
-  if (auto *isec = dyn_cast<InputSection *>(referent)) {
+  if (auto *isec = dyn_cast<InputSection *>(getReferent())) {
     const auto *cisec = dyn_cast<CStringInputSection>(isec);
     assert(cisec && "referent must be a CStringInputSection");
-    return cisec->getStringRefAtOffset(addend);
+    return cisec->getStringRefAtOffset(getAddend());
   }
 
-  auto *sym = dyn_cast<Defined>(cast<Symbol *>(referent));
+  auto *sym = dyn_cast<Defined>(cast<Symbol *>(getReferent()));
   assert(sym && "referent must be a Defined symbol");
 
   auto *symIsec = sym->isec();
-  auto symOffset = sym->value + addend;
+  auto symOffset = sym->value + getAddend();
 
   if (auto *s = dyn_cast_or_null<CStringInputSection>(symIsec))
     return s->getStringRefAtOffset(symOffset);
@@ -59,11 +75,11 @@ StringRef Relocation::getReferentString() const {
 bool macho::validateSymbolRelocation(const Symbol *sym,
                                      const InputSection *isec,
                                      const Relocation &r) {
-  const RelocAttrs &relocAttrs = target->getRelocAttrs(r.type);
+  const RelocAttrs &relocAttrs = target->getRelocAttrs(r.getType());
   bool valid = true;
   auto message = [&](const Twine &diagnostic) {
     valid = false;
-    return (isec->getLocation(r.offset) + ": " + relocAttrs.name +
+    return (isec->getLocation(r.getOffset()) + ": " + relocAttrs.name +
             " relocation " + diagnostic)
         .str();
   };
@@ -152,9 +168,9 @@ void macho::reportRangeError(void *loc, const Relocation &r, const Twine &v,
   uint64_t off = reinterpret_cast<const uint8_t *>(loc) - in.bufferStart;
   const InputSection *isec = offsetToInputSection(&off);
   std::string locStr = isec ? isec->getLocation(off) : "(invalid location)";
-  if (auto *sym = r.referent.dyn_cast<Symbol *>())
+  if (auto *sym = r.getReferent().dyn_cast<Symbol *>())
     hint = "; references " + toString(*sym);
-  error(locStr + ": relocation " + target->getRelocAttrs(r.type).name +
+  error(locStr + ": relocation " + target->getRelocAttrs(r.getType()).name +
         " is out of range: " + v + " is not in [" + Twine(min) + ", " +
         Twine(max) + "]" + hint);
 }

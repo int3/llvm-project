@@ -196,10 +196,10 @@ Symbol *ARM64::getThunkBranchTarget(InputSection *thunk) const {
   assert(thunk->relocs.size() == 1 &&
          "expected a single reloc on ARM64 ICF thunk");
   auto &reloc = thunk->relocs[0];
-  assert(isa<Symbol *>(reloc.referent) &&
+  assert(isa<Symbol *>(reloc.getReferent()) &&
          "ARM64 thunk reloc is expected to point to a Symbol");
 
-  return cast<Symbol *>(reloc.referent);
+  return cast<Symbol *>(reloc.getReferent());
 }
 
 uint32_t ARM64::getICFSafeThunkSize() const { return sizeof(icfSafeThunkCode); }

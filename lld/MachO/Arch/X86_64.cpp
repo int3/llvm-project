@@ -104,21 +104,21 @@ int64_t X86_64::getEmbeddedAddend(MemoryBufferRef mb, uint64_t offset,
 
 void X86_64::relocateOne(uint8_t *loc, const Relocation &r, uint64_t value,
                          uint64_t relocVA) const {
-  if (r.pcrel) {
-    uint64_t pc = relocVA + (1ull << r.length) + pcrelOffset(r.type);
+  if (r.isPCRel()) {
+    uint64_t pc = relocVA + (1ull << r.getLength()) + pcrelOffset(r.getType());
     value -= pc;
   }
 
-  switch (r.length) {
+  switch (r.getLength()) {
   case 0:
-    if (r.type == X86_64_RELOC_UNSIGNED)
+    if (r.getType() == X86_64_RELOC_UNSIGNED)
       checkUInt(loc, r, value, 8);
     else
       checkInt(loc, r, value, 8);
     *loc = value;
     break;
   case 2:
-    if (r.type == X86_64_RELOC_UNSIGNED)
+    if (r.getType() == X86_64_RELOC_UNSIGNED)
       checkUInt(loc, r, value, 32);
     else
       checkInt(loc, r, value, 32);
@@ -243,7 +243,7 @@ TargetInfo *macho::createX86_64TargetInfo() {
 
 void X86_64::handleDtraceReloc(const Symbol *sym, const Relocation &r,
                                uint8_t *loc) const {
-  assert(r.type == X86_64_RELOC_BRANCH);
+  assert(r.getType() == X86_64_RELOC_BRANCH);
 
   if (config->outputType == MH_OBJECT)
     return;

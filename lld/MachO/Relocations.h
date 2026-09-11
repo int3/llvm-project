@@ -13,15 +13,39 @@
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/Support/Endian.h"
+#include "llvm/Support/MathExtras.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace lld::macho {
 LLVM_ENABLE_BITMASK_ENUMS_IN_NAMESPACE();
 
 class Symbol;
 class InputSection;
+
+// Keep the existing referent union nestable without forcing Relocations.h to
+// include complete Symbol and InputSection definitions merely to calculate its
+// spare tag bits. Both pointee types are checked to be at least 4-byte aligned
+// where they are complete in Relocations.cpp.
+using RelocationReferent = llvm::PointerUnion<Symbol *, InputSection *>;
+
+} // namespace lld::macho
+
+namespace llvm {
+template <> struct PointerLikeTypeTraits<lld::macho::RelocationReferent> {
+  static void *getAsVoidPointer(lld::macho::RelocationReferent referent) {
+    return referent.getOpaqueValue();
+  }
+  static lld::macho::RelocationReferent getFromVoidPointer(void *pointer) {
+    return lld::macho::RelocationReferent::getFromOpaqueValue(pointer);
+  }
+  static constexpr int NumLowBitsAvailable = 1;
+};
+} // namespace llvm
+
+namespace lld::macho {
 
 enum class RelocAttrBits {
   _0 = 0,              // invalid
@@ -52,24 +76,91 @@ struct RelocAttrs {
 };
 
 struct Relocation {
-  uint8_t type = llvm::MachO::GENERIC_RELOC_INVALID;
-  bool pcrel = false;
-  uint8_t length = 0;
+  using Referent = RelocationReferent;
+
+private:
+  // Most addends fit in 21 bits. Keep the uncommon wide addends with their
+  // referent in an immutable, shared payload; copies can then stay trivial and
+  // mutations allocate only when they actually diverge.
+  struct Extended {
+    Referent referent;
+    int64_t addend;
+  };
+  static_assert(sizeof(void *) != 8 || sizeof(Extended) == 16);
+  static_assert(alignof(Extended) >= alignof(int64_t));
+  using Target = llvm::PointerUnion<Referent, const Extended *>;
+
+  // type: 8 bits, pcrel: 1 bit, length: 2 bits, inline addend: 21 bits.
+  uint32_t metadata = llvm::MachO::GENERIC_RELOC_INVALID;
   // The offset from the start of the subsection that this relocation belongs
   // to.
   uint32_t offset = 0;
-  // Adding this offset to the address of the referent symbol or subsection
-  // gives the destination that this relocation refers to.
-  int64_t addend = 0;
-  llvm::PointerUnion<Symbol *, InputSection *> referent = nullptr;
+  Target target = Referent(nullptr);
+
+  static constexpr uint32_t typeMask = 0xff;
+  static constexpr uint32_t pcrelMask = 1u << 8;
+  static constexpr uint32_t lengthMask = 3u << 9;
+  static constexpr unsigned addendShift = 11;
+  static constexpr uint32_t addendMask = (1u << 21) - 1;
+
+  static uint32_t packMetadata(uint8_t type, bool pcrel, uint8_t length,
+                               int64_t addend) {
+    assert(length < 4);
+    assert(llvm::isInt<21>(addend));
+    return type | (static_cast<uint32_t>(pcrel) << 8) |
+           (static_cast<uint32_t>(length) << 9) |
+           ((static_cast<uint32_t>(addend) & addendMask) << addendShift);
+  }
+
+  bool hasExtendedTarget() const {
+    return llvm::isa<const Extended *>(target);
+  }
+  const Extended *getExtendedTarget() const {
+    return llvm::cast<const Extended *>(target);
+  }
+
+public:
 
   Relocation() = default;
 
   Relocation(uint8_t type, bool pcrel, uint8_t length, uint32_t offset,
              int64_t addend,
-             llvm::PointerUnion<Symbol *, InputSection *> referent)
-      : type(type), pcrel(pcrel), length(length), offset(offset),
-        addend(addend), referent(referent) {}
+             Referent referent)
+      : metadata(packMetadata(type, pcrel, length, /*addend=*/0)),
+        offset(offset) {
+    setTarget(referent, addend);
+  }
+
+  uint8_t getType() const { return metadata & typeMask; }
+  bool isPCRel() const { return metadata & pcrelMask; }
+  uint8_t getLength() const { return (metadata & lengthMask) >> 9; }
+  uint32_t getOffset() const { return offset; }
+  int64_t getAddend() const {
+    if (hasExtendedTarget())
+      return getExtendedTarget()->addend;
+    return llvm::SignExtend64<21>(metadata >> addendShift);
+  }
+  Referent getReferent() const {
+    if (hasExtendedTarget())
+      return getExtendedTarget()->referent;
+    return llvm::cast<Referent>(target);
+  }
+
+  void setType(uint8_t type) {
+    metadata = (metadata & ~typeMask) | type;
+  }
+  void setPCRel(bool pcrel) {
+    metadata = (metadata & ~pcrelMask) |
+               (static_cast<uint32_t>(pcrel) << 8);
+  }
+  void setLength(uint8_t length) {
+    assert(length < 4);
+    metadata = (metadata & ~lengthMask) | (static_cast<uint32_t>(length) << 9);
+  }
+  void setOffset(uint32_t value) { offset = value; }
+  void setAddend(int64_t addend) { setTarget(getReferent(), addend); }
+  void setReferent(Referent referent) { setTarget(referent, getAddend()); }
+  void setTarget(Referent referent, int64_t addend);
 
   InputSection *getReferentInputSection() const;
 
@@ -77,6 +168,8 @@ struct Relocation {
   // ConcatInputSection.
   llvm::StringRef getReferentString() const;
 };
+
+static_assert(std::is_trivially_copyable_v<Relocation>);
 
 bool validateSymbolRelocation(const Symbol *, const InputSection *,
                               const Relocation &);

@@ -22,6 +22,7 @@
 #include "lld/Common/ErrorHandler.h"
 #include "lld/Common/Memory.h"
 #include "llvm/Support/StringSaver.h"
+#include "llvm/Support/ThreadSafeAllocator.h"
 
 namespace llvm {
 class raw_ostream;
@@ -37,6 +38,10 @@ public:
   static void destroy();
 
   llvm::BumpPtrAllocator bAlloc;
+  // Relocations are initially decoded in parallel. Keep their rare out-of-line
+  // payloads in a link-owned allocator rather than lazily registering a
+  // SpecificAlloc from a worker.
+  llvm::ThreadSafeAllocator<llvm::BumpPtrAllocator> relocationAlloc;
   llvm::StringSaver saver{bAlloc};
   llvm::UniqueStringSaver uniqueSaver{bAlloc};
   llvm::DenseMap<void *, SpecificAllocBase *> instances;

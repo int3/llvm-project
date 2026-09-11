@@ -204,7 +204,9 @@ std::string InputSection::getSourceLocation(uint64_t off) const {
 
 const Relocation *InputSection::getRelocAt(uint32_t off) const {
   auto it = llvm::find_if(relocs,
-                          [=](const Relocation &r) { return r.offset == off; });
+                          [=](const Relocation &r) {
+                            return r.getOffset() == off;
+                          });
   if (it == relocs.end())
     return nullptr;
   return &*it;
@@ -245,34 +247,35 @@ void ConcatInputSection::writeTo(uint8_t *buf) {
 
   for (size_t i = 0; i < relocs.size(); i++) {
     const Relocation &r = relocs[i];
-    uint8_t *loc = buf + r.offset;
+    uint8_t *loc = buf + r.getOffset();
     uint64_t referentVA = 0;
 
     const bool needsFixup = config->emitChainedFixups &&
-                            target->hasAttr(r.type, RelocAttrBits::UNSIGNED);
-    if (target->hasAttr(r.type, RelocAttrBits::SUBTRAHEND)) {
-      const Symbol *fromSym = cast<Symbol *>(r.referent);
+                            target->hasAttr(r.getType(), RelocAttrBits::UNSIGNED);
+    if (target->hasAttr(r.getType(), RelocAttrBits::SUBTRAHEND)) {
+      const Symbol *fromSym = cast<Symbol *>(r.getReferent());
       const Relocation &minuend = relocs[++i];
       uint64_t minuendVA;
-      if (const Symbol *toSym = dyn_cast<Symbol *>(minuend.referent))
-        minuendVA = toSym->getVA() + minuend.addend;
+      if (const Symbol *toSym = minuend.getReferent().dyn_cast<Symbol *>())
+        minuendVA = toSym->getVA() + minuend.getAddend();
       else {
-        auto *referentIsec = cast<InputSection *>(minuend.referent);
+        auto *referentIsec = cast<InputSection *>(minuend.getReferent());
         assert(!::shouldOmitFromOutput(referentIsec));
-        minuendVA = referentIsec->getVA(minuend.addend);
+        minuendVA = referentIsec->getVA(minuend.getAddend());
       }
       referentVA = minuendVA - fromSym->getVA();
-    } else if (auto *referentSym = r.referent.dyn_cast<Symbol *>()) {
-      if (target->hasAttr(r.type, RelocAttrBits::LOAD) &&
+    } else if (auto *referentSym = r.getReferent().dyn_cast<Symbol *>()) {
+      if (target->hasAttr(r.getType(), RelocAttrBits::LOAD) &&
           !referentSym->isInGot())
-        target->relaxGotLoad(loc, r.type);
+        target->relaxGotLoad(loc, r.getType());
       // For dtrace symbols, do not handle them as normal undefined symbols
       if (referentSym->getName().starts_with("___dtrace_")) {
         // Change dtrace call site to pre-defined instructions
         target->handleDtraceReloc(referentSym, r, loc);
         continue;
       }
-      referentVA = resolveSymbolOffsetVA(referentSym, r.type, r.addend);
+      referentVA =
+          resolveSymbolOffsetVA(referentSym, r.getType(), r.getAddend());
 
       if (isThreadLocalVariables(getFlags()) && isa<Defined>(referentSym)) {
         // References from thread-local variable sections are treated as offsets
@@ -281,19 +284,20 @@ void ConcatInputSection::writeTo(uint8_t *buf) {
         // contiguous).
         referentVA -= firstTLVDataSection->addr;
       } else if (needsFixup) {
-        writeChainedFixup(loc, referentSym, r.addend);
+        writeChainedFixup(loc, referentSym, r.getAddend());
         continue;
       }
-    } else if (auto *referentIsec = r.referent.dyn_cast<InputSection *>()) {
+    } else if (auto *referentIsec =
+                   r.getReferent().dyn_cast<InputSection *>()) {
       assert(!::shouldOmitFromOutput(referentIsec));
-      referentVA = referentIsec->getVA(r.addend);
+      referentVA = referentIsec->getVA(r.getAddend());
 
       if (needsFixup) {
         writeChainedRebase(loc, referentVA);
         continue;
       }
     }
-    target->relocateOne(loc, r, referentVA, getVA() + r.offset);
+    target->relocateOne(loc, r, referentVA, getVA() + r.getOffset());
   }
 }
 

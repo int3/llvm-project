@@ -674,14 +674,14 @@ static void prepareSymbolRelocation(Symbol *sym, const InputSection *isec,
     if (Defined *defined = dyn_cast<Defined>(sym)) {
       if (config->emitInitOffsets &&
           defined->isec()->getName() == section_names::moduleInitFunc)
-        fatal(isec->getLocation(r.offset) + ": cannot reference " +
+        fatal(isec->getLocation(r.getOffset()) + ": cannot reference " +
               sym->getName() +
               " defined in __mod_init_func when -init_offsets is used");
     }
     assert(false && "referenced symbol must be live");
   }
 
-  const RelocAttrs &relocAttrs = target->getRelocAttrs(r.type);
+  const RelocAttrs &relocAttrs = target->getRelocAttrs(r.getType());
 
   if (relocAttrs.hasAttr(RelocAttrBits::BRANCH)) {
     if (needsBinding(sym))
@@ -697,7 +697,7 @@ static void prepareSymbolRelocation(Symbol *sym, const InputSection *isec,
     // relative to the start of the referent section, and therefore have no
     // need of rebase opcodes.
     if (!(isThreadLocalVariables(isec->getFlags()) && isa<Defined>(sym)))
-      addNonLazyBindingEntries(sym, isec, r.offset, r.addend);
+      addNonLazyBindingEntries(sym, isec, r.getOffset(), r.getAddend());
   }
 }
 
@@ -719,22 +719,22 @@ struct SymbolScanCandidate {
 };
 
 static void canonicalizeReferent(Relocation &r) {
-  if (auto *referentIsec = dyn_cast_if_present<InputSection *>(r.referent))
-    r.referent = referentIsec->canonical();
+  if (auto *referentIsec = dyn_cast_if_present<InputSection *>(r.getReferent()))
+    r.setReferent(referentIsec->canonical());
 }
 
 static void replayRelocation(ConcatInputSection *isec, Relocation &r) {
-  if (auto *sym = dyn_cast_if_present<Symbol *>(r.referent)) {
+  if (auto *sym = dyn_cast_if_present<Symbol *>(r.getReferent())) {
     if (auto *undefined = dyn_cast<Undefined>(sym))
-      treatUndefinedSymbol(*undefined, isec, r.offset);
+      treatUndefinedSymbol(*undefined, isec, r.getOffset());
     // treatUndefinedSymbol() can replace sym with a DylibSymbol; re-check.
     if (!isa<Undefined>(sym) && validateSymbolRelocation(sym, isec, r))
       prepareSymbolRelocation(sym, isec, r);
-  } else if (!r.pcrel) {
+  } else if (!r.isPCRel()) {
     if (config->emitChainedFixups)
-      in.chainedFixups->addRebase(isec, r.offset);
+      in.chainedFixups->addRebase(isec, r.getOffset());
     else
-      in.rebase->addEntry(isec, r.offset);
+      in.rebase->addEntry(isec, r.getOffset());
   }
 }
 
@@ -745,7 +745,7 @@ static void scanSectionRelocations(ConcatInputSection *isec) {
   for (size_t index = 0; index < isec->relocs.size(); ++index) {
     Relocation &r = isec->relocs[index];
     canonicalizeReferent(r);
-    if (target->hasAttr(r.type, RelocAttrBits::SUBTRAHEND)) {
+    if (target->hasAttr(r.getType(), RelocAttrBits::SUBTRAHEND)) {
       // The following UNSIGNED relocation is only the minuend. It has no
       // ordinary UNSIGNED semantics and must not emit a rebase opcode.
       canonicalizeReferent(isec->relocs[++index]);
@@ -757,13 +757,13 @@ static void scanSectionRelocations(ConcatInputSection *isec) {
 
 static bool isCompletedRelocation(const ConcatInputSection *isec,
                                   const Relocation &r) {
-  if (auto *sym = dyn_cast_if_present<Symbol *>(r.referent)) {
+  if (auto *sym = dyn_cast_if_present<Symbol *>(r.getReferent())) {
     // Keep all cases that can diagnose or mutate global linker state in the
     // ordered replay below.
     if ((!isa<Defined>(sym) && !isa<DylibSymbol>(sym)) || !sym->isLive())
       return false;
 
-    const RelocAttrs &relocAttrs = target->getRelocAttrs(r.type);
+    const RelocAttrs &relocAttrs = target->getRelocAttrs(r.getType());
     if (relocAttrs.hasAttr(RelocAttrBits::TLV) != sym->isTlv())
       return false;
     if (relocAttrs.hasAttr(RelocAttrBits::BRANCH))
@@ -778,7 +778,7 @@ static bool isCompletedRelocation(const ConcatInputSection *isec,
     return true;
   }
 
-  return r.pcrel;
+  return r.isPCRel();
 }
 
 void Writer::scanRelocations() {
@@ -803,7 +803,7 @@ void Writer::scanRelocations() {
       for (size_t index = 0; index < isec->relocs.size(); ++index) {
         Relocation &r = isec->relocs[index];
         canonicalizeReferent(r);
-        if (target->hasAttr(r.type, RelocAttrBits::SUBTRAHEND)) {
+        if (target->hasAttr(r.getType(), RelocAttrBits::SUBTRAHEND)) {
           canonicalizeReferent(isec->relocs[++index]);
           continue;
         }
@@ -1106,9 +1106,9 @@ static void orderObjCStubsByCallerPriority(
     if (prio == priorities.end())
       continue;
     for (const Relocation &r : isec->relocs) {
-      if (!target->hasAttr(r.type, RelocAttrBits::BRANCH))
+      if (!target->hasAttr(r.getType(), RelocAttrBits::BRANCH))
         continue;
-      auto *stub = dyn_cast_if_present<Symbol *>(r.referent);
+      auto *stub = dyn_cast_if_present<Symbol *>(r.getReferent());
       if (!stub || !ObjCStubsSection::isObjCStubSymbol(stub))
         continue;
       auto [it, inserted] = stubPriority.try_emplace(stub, prio->second);

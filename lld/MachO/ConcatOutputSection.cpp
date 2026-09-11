@@ -114,13 +114,14 @@ void ConcatOutputSection::finalizeContents() {
 
 bool TextOutputSection::isTargetKnownInRange(const ConcatInputSection &isec,
                                              const Relocation &r) const {
-  uint64_t callVA = isec.getVA() + r.offset;
+  uint64_t callVA = isec.getVA() + r.getOffset();
   uint64_t lowVA = target->backwardBranchRange < callVA
                        ? callVA - target->backwardBranchRange
                        : 0;
   uint64_t highVA = callVA + target->forwardBranchRange;
-  auto *funcSym = cast<Symbol *>(r.referent);
-  uint64_t funcVA = resolveSymbolOffsetVA(funcSym, r.type, r.addend);
+  auto *funcSym = cast<Symbol *>(r.getReferent());
+  uint64_t funcVA =
+      resolveSymbolOffsetVA(funcSym, r.getType(), r.getAddend());
   // Check if the referent is reachable with a simple call instruction.
   return lowVA <= funcVA && funcVA <= highVA;
 }
@@ -131,7 +132,7 @@ Defined *TextOutputSection::getThunkInRange(const ConcatInputSection &isec,
   assert(!isTargetKnownInRange(isec, r));
   if (!thunkInfo.sym)
     return nullptr;
-  uint64_t callVA = isec.getVA() + r.offset;
+  uint64_t callVA = isec.getVA() + r.getOffset();
   uint64_t lowVA = target->backwardBranchRange < callVA
                        ? callVA - target->backwardBranchRange
                        : 0;
@@ -144,10 +145,9 @@ Defined *TextOutputSection::getThunkInRange(const ConcatInputSection &isec,
 
 void TextOutputSection::updateBranchTargetToThunk(Relocation &r,
                                                   Defined *thunk) {
-  r.referent = thunk;
   // The thunk itself bakes in the addend, so the call-site reloc must
   // branch to the thunk start with no extra offset.
-  r.addend = 0;
+  r.setTarget(thunk, 0);
   ++thunkCallCount;
 }
 
@@ -155,7 +155,8 @@ void TextOutputSection::createThunk(const ConcatInputSection &isec,
                                     Relocation &r, ThunkInfo &thunkInfo) {
   assert(getThunkInRange(isec, r, thunkInfo) == nullptr);
   assert(isec.isFinal);
-  uint64_t highVA = isec.getVA() + r.offset + target->forwardBranchRange;
+  uint64_t highVA =
+      isec.getVA() + r.getOffset() + target->forwardBranchRange;
   if (addr + size > highVA) {
     // There were too many consecutive branch instructions for `slop`
     // below. If you hit this: For the current algorithm, just bumping up
@@ -170,10 +171,10 @@ void TextOutputSection::createThunk(const ConcatInputSection &isec,
   assert(thunkInfo.isec->live);
 
   std::string addendSuffix;
-  if (r.addend != 0)
-    addendSuffix = "+" + std::to_string(r.addend);
+  if (r.getAddend() != 0)
+    addendSuffix = "+" + std::to_string(r.getAddend());
   size_t thunkSize = target->thunkSize;
-  auto *funcSym = cast<Symbol *>(r.referent);
+  auto *funcSym = cast<Symbol *>(r.getReferent());
   StringRef thunkName =
       saver().save(funcSym->getName() + addendSuffix + ".thunk." +
                    std::to_string(thunkInfo.sequence++));
@@ -191,7 +192,7 @@ void TextOutputSection::createThunk(const ConcatInputSection &isec,
         /*noDeadStrip=*/false, /*isWeakDefCanBeHidden=*/false);
   }
   thunkInfo.sym->used = true;
-  target->populateThunk(thunkInfo.isec, funcSym, r.addend);
+  target->populateThunk(thunkInfo.isec, funcSym, r.getAddend());
   updateBranchTargetToThunk(r, thunkInfo.sym);
   finalizeOne(thunkInfo.isec);
   thunks.push_back(thunkInfo.isec);
@@ -238,13 +239,14 @@ bool TextOutputSection::isTargetStubsAndInRange(
     std::optional<uint64_t> estimatedStubsEnd) const {
   if (!estimatedStubsEnd.has_value())
     return false;
-  auto *funcSym = cast<Symbol *>(r.referent);
+  auto *funcSym = cast<Symbol *>(r.getReferent());
   if (!funcSym->isInStubs() && !(in.objcStubs && in.objcStubs->isNeeded() &&
                                  ObjCStubsSection::isObjCStubSymbol(funcSym)))
     return false;
-  if (r.addend)
+  if (r.getAddend())
     return false;
-  uint64_t highVA = isec.getVA() + r.offset + target->forwardBranchRange;
+  uint64_t highVA =
+      isec.getVA() + r.getOffset() + target->forwardBranchRange;
   return *estimatedStubsEnd <= highVA;
 }
 
@@ -289,7 +291,7 @@ void TextOutputSection::finalize() {
         checkedFront = r;
       }
       uint64_t highVA =
-          callerIsec->getVA() + r->offset + target->forwardBranchRange;
+          callerIsec->getVA() + r->getOffset() + target->forwardBranchRange;
       uint64_t nextEnd =
           alignToPowerOf2(addr + size, isec->align) + isec->getSize();
       // If we were to emit this section, would we have enough space for more
@@ -309,7 +311,7 @@ void TextOutputSection::finalize() {
     // TODO: Remove this check and the assert below. In fact, I don't believe
     // the relocation iteration order matters for correctness.
     bool hasCallsite = llvm::any_of(isec->relocs, [](Relocation &r) {
-      return target->hasAttr(r.type, RelocAttrBits::BRANCH);
+      return target->hasAttr(r.getType(), RelocAttrBits::BRANCH);
     });
     if (!hasCallsite)
       continue;
@@ -318,10 +320,10 @@ void TextOutputSection::finalize() {
     // FIXME: This property does not hold for object files produced by ld64's
     // `-r` mode.
     assert(is_sorted(isec->relocs, [](Relocation &a, Relocation &b) {
-      return a.offset > b.offset;
+      return a.getOffset() > b.getOffset();
     }));
     for (Relocation &r : reverse(isec->relocs)) {
-      if (!target->hasAttr(r.type, RelocAttrBits::BRANCH))
+      if (!target->hasAttr(r.getType(), RelocAttrBits::BRANCH))
         continue;
       if (isTargetKnownInRange(*isec, r))
         continue;
@@ -382,16 +384,16 @@ void ConcatOutputSection::writeTo(uint8_t *buf) const {
 
 static std::optional<uint64_t>
 getArm64RelocationWriteSize(const Relocation &reloc) {
-  switch (reloc.type) {
+  switch (reloc.getType()) {
   case ARM64_RELOC_UNSIGNED:
     if (config->emitChainedFixups)
       return 8;
     [[fallthrough]];
   case ARM64_RELOC_SUBTRACTOR:
   case ARM64_RELOC_POINTER_TO_GOT:
-    if (reloc.length == 2)
+    if (reloc.getLength() == 2)
       return 4;
-    if (reloc.length == 3)
+    if (reloc.getLength() == 3)
       return 8;
     return std::nullopt;
   case ARM64_RELOC_BRANCH26:
@@ -436,20 +438,20 @@ static bool canWriteTextInputsInParallel(
       for (size_t relocIndex = 0; relocIndex < isec->relocs.size();
            ++relocIndex) {
         const Relocation &reloc = isec->relocs[relocIndex];
-        if (target->hasAttr(reloc.type, RelocAttrBits::SUBTRAHEND)) {
+        if (target->hasAttr(reloc.getType(), RelocAttrBits::SUBTRAHEND)) {
           if (++relocIndex == isec->relocs.size())
             return false;
           const Relocation &minuend = isec->relocs[relocIndex];
-          if (!target->hasAttr(minuend.type, RelocAttrBits::UNSIGNED) ||
-              minuend.offset != reloc.offset)
+          if (!target->hasAttr(minuend.getType(), RelocAttrBits::UNSIGNED) ||
+              minuend.getOffset() != reloc.getOffset())
             return false;
         }
 
         uint64_t fileSize = isec->getFileSize();
         std::optional<uint64_t> writeSize =
             getArm64RelocationWriteSize(reloc);
-        if (!writeSize || reloc.offset > fileSize ||
-            *writeSize > fileSize - reloc.offset)
+        if (!writeSize || reloc.getOffset() > fileSize ||
+            *writeSize > fileSize - reloc.getOffset())
           return false;
       }
       continue;

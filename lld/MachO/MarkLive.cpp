@@ -150,10 +150,10 @@ void MarkLiveImpl<RecordWhyLive>::markTransitively() {
         auto *isec = cast<ConcatInputSection>(getInputSection(entry));
         assert(isec->live && "We mark as live when pushing onto the worklist!");
         for (const Relocation &r : isec->relocs) {
-          if (auto *s = r.referent.dyn_cast<Symbol *>())
+          if (auto *s = r.getReferent().dyn_cast<Symbol *>())
             addSym(s, entry);
           else
-            enqueue(cast<InputSection *>(r.referent), r.addend, entry);
+            enqueue(cast<InputSection *>(r.getReferent()), r.getAddend(), entry);
         }
         for (Defined *d : getInputSection(entry)->symbols)
           addSym(d, entry);
@@ -163,7 +163,7 @@ void MarkLiveImpl<RecordWhyLive>::markTransitively() {
         if (!(isec->getFlags() & S_ATTR_LIVE_SUPPORT) || isec->live)
           continue;
         for (const Relocation &r : isec->relocs) {
-          if (auto *s = r.referent.dyn_cast<Symbol *>()) {
+          if (auto *s = r.getReferent().dyn_cast<Symbol *>()) {
             if (s->isLive()) {
               InputSection *referentIsec = nullptr;
               if (auto *d = dyn_cast<Defined>(s))
@@ -171,8 +171,8 @@ void MarkLiveImpl<RecordWhyLive>::markTransitively() {
               enqueue(isec, 0, makeEntry(referentIsec, nullptr));
             }
           } else {
-            auto *referentIsec = cast<InputSection *>(r.referent);
-            if (referentIsec->isLive(r.addend))
+            auto *referentIsec = cast<InputSection *>(r.getReferent());
+            if (referentIsec->isLive(r.getAddend()))
               enqueue(isec, 0, makeEntry(referentIsec, nullptr));
           }
         }
@@ -213,10 +213,10 @@ void MarkLiveImpl<RecordWhyLive>::markTransitively() {
                      SmallVectorImpl<WorklistEntry *> &next,
                      SmallVectorImpl<LiteralEntry> &literals) {
       for (const Relocation &r : isec->relocs) {
-        if (auto *s = r.referent.dyn_cast<Symbol *>())
+        if (auto *s = r.getReferent().dyn_cast<Symbol *>())
           addSymParallel(s, next, literals);
         else
-          enqueueParallel(cast<InputSection *>(r.referent), r.addend, next,
+          enqueueParallel(cast<InputSection *>(r.getReferent()), r.getAddend(), next,
                           literals);
       }
       for (Defined *d : isec->symbols)
@@ -265,7 +265,7 @@ void MarkLiveImpl<RecordWhyLive>::markTransitively() {
         if (!(isec->getFlags() & S_ATTR_LIVE_SUPPORT) || isec->live)
           continue;
         for (const Relocation &r : isec->relocs) {
-          if (auto *s = r.referent.dyn_cast<Symbol *>()) {
+          if (auto *s = r.getReferent().dyn_cast<Symbol *>()) {
             if (s->isLive()) {
               InputSection *referentIsec = nullptr;
               if (auto *d = dyn_cast<Defined>(s))
@@ -273,8 +273,8 @@ void MarkLiveImpl<RecordWhyLive>::markTransitively() {
               enqueue(isec, 0, makeEntry(referentIsec, nullptr));
             }
           } else {
-            auto *referentIsec = cast<InputSection *>(r.referent);
-            if (referentIsec->isLive(r.addend))
+            auto *referentIsec = cast<InputSection *>(r.getReferent());
+            if (referentIsec->isLive(r.getAddend()))
               enqueue(isec, 0, makeEntry(referentIsec, nullptr));
           }
         }

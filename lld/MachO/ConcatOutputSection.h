@@ -155,7 +155,8 @@ struct ThunkKey {
       referent = sym;
     }
   }
-  ThunkKey(Relocation &r) : ThunkKey(cast<Symbol *>(r.referent), r.addend) {}
+  ThunkKey(Relocation &r)
+      : ThunkKey(cast<Symbol *>(r.getReferent()), r.getAddend()) {}
 
   bool operator==(const ThunkKey &other) const {
     return referent == other.referent && value == other.value &&

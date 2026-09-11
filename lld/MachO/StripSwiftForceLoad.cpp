@@ -35,7 +35,7 @@ static bool isSwiftForceLoadSection(const ConcatInputSection *isec) {
     return false;
 
   for (const Relocation &r : isec->relocs) {
-    auto *sym = dyn_cast_if_present<Symbol *>(r.referent);
+    auto *sym = dyn_cast_if_present<Symbol *>(r.getReferent());
     auto *dylibSym = dyn_cast_or_null<DylibSymbol>(sym);
     if (!dylibSym || dylibSym->isDynamicLookup() ||
         !dylibSym->getName().starts_with(forceLoadPrefix))

@@ -104,10 +104,10 @@ static void getNormalizedData(const ConcatInputSection *isec,
   buf.assign(isec->data.begin(), isec->data.end());
   for (size_t i = 0; i < isec->relocs.size(); ++i) {
     const Relocation &r = isec->relocs[i];
-    size_t size = 1ULL << r.length;
-    if (r.offset + size <= buf.size())
-      memset(buf.data() + r.offset, 0, size);
-    if (target->hasAttr(r.type, RelocAttrBits::SUBTRAHEND))
+    size_t size = 1ULL << r.getLength();
+    if (r.getOffset() + size <= buf.size())
+      memset(buf.data() + r.getOffset(), 0, size);
+    if (target->hasAttr(r.getType(), RelocAttrBits::SUBTRAHEND))
       ++i; // Skip the paired minuend relocation
   }
 }
@@ -140,44 +140,45 @@ bool ICF::equalsConstant(const ConcatInputSection *ia,
   if (!compareData(ia, ib))
     return false;
   auto f = [](const Relocation &ra, const Relocation &rb) {
-    if (ra.type != rb.type)
+    if (ra.getType() != rb.getType())
       return false;
-    if (ra.pcrel != rb.pcrel)
+    if (ra.isPCRel() != rb.isPCRel())
       return false;
-    if (ra.length != rb.length)
+    if (ra.getLength() != rb.getLength())
       return false;
-    if (ra.offset != rb.offset)
+    if (ra.getOffset() != rb.getOffset())
       return false;
-    if (isa<Symbol *>(ra.referent) != isa<Symbol *>(rb.referent))
+    if (isa<Symbol *>(ra.getReferent()) !=
+        isa<Symbol *>(rb.getReferent()))
       return false;
 
     InputSection *isecA, *isecB;
 
     uint64_t valueA = 0;
     uint64_t valueB = 0;
-    if (isa<Symbol *>(ra.referent)) {
-      const auto *sa = cast<Symbol *>(ra.referent);
-      const auto *sb = cast<Symbol *>(rb.referent);
+    if (isa<Symbol *>(ra.getReferent())) {
+      const auto *sa = cast<Symbol *>(ra.getReferent());
+      const auto *sb = cast<Symbol *>(rb.getReferent());
       if (sa->kind() != sb->kind())
         return false;
       // ICF runs before Undefineds are treated (and potentially converted into
       // DylibSymbols).
       if (isa<DylibSymbol>(sa) || isa<Undefined>(sa))
-        return sa == sb && ra.addend == rb.addend;
+        return sa == sb && ra.getAddend() == rb.getAddend();
       assert(isa<Defined>(sa));
       const auto *da = cast<Defined>(sa);
       const auto *db = cast<Defined>(sb);
       if (!da->isec() || !db->isec()) {
         assert(da->isAbsolute() && db->isAbsolute());
-        return da->value + ra.addend == db->value + rb.addend;
+        return da->value + ra.getAddend() == db->value + rb.getAddend();
       }
       isecA = da->isec();
       valueA = da->value;
       isecB = db->isec();
       valueB = db->value;
     } else {
-      isecA = cast<InputSection *>(ra.referent);
-      isecB = cast<InputSection *>(rb.referent);
+      isecA = cast<InputSection *>(ra.getReferent());
+      isecB = cast<InputSection *>(rb.getReferent());
     }
 
     // Typically, we should not encounter sections marked with `keepUnique` at
@@ -197,18 +198,19 @@ bool ICF::equalsConstant(const ConcatInputSection *ia,
     assert(isecA->kind() == isecB->kind());
     // We will compare ConcatInputSection contents in equalsVariable.
     if (isa<ConcatInputSection>(isecA))
-      return valueA + ra.addend == valueB + rb.addend;
+      return valueA + ra.getAddend() == valueB + rb.getAddend();
     // Else we have two literal sections. References to them are equal iff their
     // offsets in the output section are equal.
-    if (isa<Symbol *>(ra.referent))
+    if (isa<Symbol *>(ra.getReferent()))
       // For symbol relocs, we compare the contents at the symbol address. We
       // don't do `getOffset(value + addend)` because value + addend may not be
       // a valid offset in the literal section.
       return isecA->getOffset(valueA) == isecB->getOffset(valueB) &&
-             ra.addend == rb.addend;
+             ra.getAddend() == rb.getAddend();
     assert(valueA == 0 && valueB == 0);
     // For section relocs, we compare the content at the section offset.
-    return isecA->getOffset(ra.addend) == isecB->getOffset(rb.addend);
+    return isecA->getOffset(ra.getAddend()) ==
+           isecB->getOffset(rb.getAddend());
   };
   if (!llvm::equal(ia->relocs, ib->relocs, f))
     return false;
@@ -248,15 +250,15 @@ bool ICF::equalsVariable(const ConcatInputSection *ia,
   assert(ia->relocs.size() == ib->relocs.size());
   auto f = [this](const Relocation &ra, const Relocation &rb) {
     // We already filtered out mismatching values/addends in equalsConstant.
-    if (ra.referent == rb.referent)
+    if (ra.getReferent() == rb.getReferent())
       return true;
     const ConcatInputSection *isecA, *isecB;
-    if (isa<Symbol *>(ra.referent)) {
+    if (isa<Symbol *>(ra.getReferent())) {
       // Matching DylibSymbols are already filtered out by the
       // identical-referent check above. Non-matching DylibSymbols were filtered
       // out in equalsConstant(). So we can safely cast to Defined here.
-      const auto *da = cast<Defined>(cast<Symbol *>(ra.referent));
-      const auto *db = cast<Defined>(cast<Symbol *>(rb.referent));
+      const auto *da = cast<Defined>(cast<Symbol *>(ra.getReferent()));
+      const auto *db = cast<Defined>(cast<Symbol *>(rb.getReferent()));
       if (da->isAbsolute())
         return true;
       isecA = dyn_cast<ConcatInputSection>(da->isec());
@@ -264,8 +266,8 @@ bool ICF::equalsVariable(const ConcatInputSection *ia,
         return true; // literal sections were checked in equalsConstant.
       isecB = cast<ConcatInputSection>(db->isec());
     } else {
-      const auto *sa = cast<InputSection *>(ra.referent);
-      const auto *sb = cast<InputSection *>(rb.referent);
+      const auto *sa = cast<InputSection *>(ra.getReferent());
+      const auto *sb = cast<InputSection *>(rb.getReferent());
       isecA = dyn_cast<ConcatInputSection>(sa);
       if (!isecA)
         return true;
@@ -426,7 +428,7 @@ void ICF::run() {
     parallelForEach(icfInputs, [&](ConcatInputSection *isec) {
       uint32_t hash = isec->icfEqClass[icfPass % 2];
       for (const Relocation &r : isec->relocs) {
-        if (auto *sym = r.referent.dyn_cast<Symbol *>()) {
+        if (auto *sym = r.getReferent().dyn_cast<Symbol *>()) {
           if (auto *defined = dyn_cast<Defined>(sym)) {
             if (defined->isec()) {
               if (auto *referentIsec =
@@ -561,7 +563,7 @@ void macho::markAddrSigSymbols() {
     const InputSection *isec = addrSigSection->subsections[0].isec;
 
     for (const Relocation &r : isec->relocs) {
-      if (auto *sym = r.referent.dyn_cast<Symbol *>())
+      if (auto *sym = r.getReferent().dyn_cast<Symbol *>())
         markSymAsAddrSig(sym);
       else
         error(toString(isec) + ": unexpected section relocation");
