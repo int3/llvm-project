@@ -33,6 +33,7 @@
 #include "llvm/Support/xxhash.h"
 
 #include <algorithm>
+#include <optional>
 
 using namespace llvm;
 using namespace llvm::MachO;
@@ -49,6 +50,7 @@ public:
 
   void treatSpecialUndefineds();
   void scanRelocations();
+  void joinPrepare();
   void scanSymbols();
   template <class LP> void createOutputSections();
   template <class LP> void createLoadCommands();
@@ -71,6 +73,9 @@ public:
   uint64_t fileOff = 0;
   MachHeaderSection *header = nullptr;
   StringTableSection *stringTableSection = nullptr;
+  // Holds the address-independent __LINKEDIT preparation tasks spawned before
+  // finalizeAddresses(); destroying or resetting it joins them.
+  std::optional<llvm::parallel::TaskGroup> prepareGroup;
   SymtabSection *symtabSection = nullptr;
   IndirectSymtabSection *indirectSymtabSection = nullptr;
   CodeSignatureSection *codeSignatureSection = nullptr;
@@ -1312,7 +1317,10 @@ void Writer::finalizeAddresses() {
   }
 }
 
+void Writer::joinPrepare() { prepareGroup.reset(); }
+
 void Writer::finalizeLinkEditSegment() {
+  joinPrepare();
   TimeTraceScope timeScope("Finalize __LINKEDIT segment");
   // Fill __LINKEDIT contents.
   std::array<LinkEditSection *, 10> linkEditSections{
@@ -1528,6 +1536,23 @@ template <class LP> void Writer::run() {
   // the ordinary __TEXT,_text InputSections.
   sortSegmentsAndSections();
   createLoadCommands<LP>();
+
+  // The prefixes of the symbol-table and function-starts computations read
+  // only names, symbol flags and section kinds, all of which are final here,
+  // so they can overlap address assignment. The only symbols created in
+  // between are branch-range extension thunks, which are appended: the
+  // prepared pass works from a snapshot taken now and finalizeContents()
+  // walks the symbols appended afterwards.
+#if LLVM_ENABLE_THREADS
+  if (parallel::strategy.ThreadsRequested != 1) {
+    symtabSection->snapshotSymbols();
+    prepareGroup.emplace();
+    prepareGroup->spawn([this] { symtabSection->prepare(); });
+    if (functionStartsSection)
+      prepareGroup->spawn([this] { functionStartsSection->prepare(); });
+  }
+#endif
+
   finalizeAddresses();
 
   llvm::thread mapFileWriter([&] {

@@ -1141,9 +1141,12 @@ void DataInCodeSection::writeTo(uint8_t *buf) const {
 FunctionStartsSection::FunctionStartsSection()
     : LinkEditSection(segment_names::linkEdit, section_names::functionStarts) {}
 
-void FunctionStartsSection::finalizeContents() {
-  raw_svector_ostream os{contents};
-  std::vector<uint64_t> addrs;
+// Visits the live code symbols whose addresses the table records. This reads
+// only symbol flags and section kinds, all final before address assignment, so
+// prepare() can collect them there; getVA(), the sort and the ULEB encoding
+// stay in __LINKEDIT finalization. Without preparation the addresses are taken
+// in this same walk, exactly as before.
+template <class AddFn> static void forEachFunctionStart(AddFn add) {
   // A resolved external symbol is present in every referring ObjFile. In
   // alias-free links, only its original ObjFile should contribute it; this is
   // intentionally not the canonical section owner, which may differ after
@@ -1169,10 +1172,30 @@ void FunctionStartsSection::finalizeContents() {
           if (!defined->isec() || !isCodeSection(defined->isec()) ||
               !defined->isLive())
             continue;
-          addrs.push_back(defined->getVA());
+          add(defined);
         }
       }
     }
+  }
+}
+
+void FunctionStartsSection::prepare() {
+  forEachFunctionStart([&](const Defined *defined) {
+    candidates.push_back(defined);
+  });
+  prepared = true;
+}
+
+void FunctionStartsSection::finalizeContents() {
+  raw_svector_ostream os{contents};
+  std::vector<uint64_t> addrs;
+  if (prepared) {
+    addrs.reserve(candidates.size());
+    for (const Defined *defined : candidates)
+      addrs.push_back(defined->getVA());
+  } else {
+    forEachFunctionStart(
+        [&](const Defined *defined) { addrs.push_back(defined->getVA()); });
   }
   llvm::sort(addrs);
   uint64_t addr = in.header->addr;
@@ -1184,6 +1207,9 @@ void FunctionStartsSection::finalizeContents() {
     addr = nextAddr;
   }
   os << '\0';
+
+  candidates.clear();
+  candidates.shrink_to_fit();
 }
 
 void FunctionStartsSection::writeTo(uint8_t *buf) const {
@@ -1432,10 +1458,17 @@ void SymtabSection::emitStabs() {
     emitEndSourceStab();
 }
 
-void SymtabSection::finalizeContents() {
+// Collects the symbol-table entries for `syms`: the whole symbol table on the
+// prefix pass, or only the symbols appended after snapshotSymbols() on the tail
+// pass. The prefix pass also walks the object files for local symbols and
+// interns the deduplicated normal-symbol strings in one batch. The tail pass
+// interns its names with addString(), which appends them in exactly the
+// first-occurrence order that a single batch over all symbols would have.
+void SymtabSection::collectSymbols(ArrayRef<Symbol *> syms, bool isPrefix) {
+  const bool deferStrings = isPrefix && config->dedupSymbolStrings;
   size_t normalSymbolOrdinal = 0;
   auto addSymbol = [&](std::vector<SymtabEntry> &symbols, Symbol *sym) {
-    size_t strx = config->dedupSymbolStrings
+    size_t strx = deferStrings
                       ? normalSymbolOrdinal++
                       : stringTableSection.addString(sym->getName());
     symbols.push_back({sym, strx});
@@ -1463,32 +1496,34 @@ void SymtabSection::finalizeContents() {
     break;
   }
 
-  // Local symbols aren't in the SymbolTable, so we walk the list of object
-  // files to gather them.
-  // But if `-x` is set, then we don't need to. localSymbolsHandler() will do
-  // the right thing regardless, but this check is a perf optimization because
-  // iterating through all the input files and their symbols is expensive.
-  if (config->localSymbolsPresence != SymtabPresence::None) {
-    for (const InputFile *file : inputFiles) {
-      if (auto *objFile = dyn_cast<ObjFile>(file)) {
-        for (Symbol *sym : objFile->symbols) {
-          if (auto *defined = dyn_cast_or_null<Defined>(sym)) {
-            if (defined->isExternal() || !defined->isLive() ||
-                !defined->includeInSymtab)
-              continue;
-            localSymbolsHandler(sym);
+  if (isPrefix) {
+    // Local symbols aren't in the SymbolTable, so we walk the list of object
+    // files to gather them.
+    // But if `-x` is set, then we don't need to. localSymbolsHandler() will do
+    // the right thing regardless, but this check is a perf optimization because
+    // iterating through all the input files and their symbols is expensive.
+    if (config->localSymbolsPresence != SymtabPresence::None) {
+      for (const InputFile *file : inputFiles) {
+        if (auto *objFile = dyn_cast<ObjFile>(file)) {
+          for (Symbol *sym : objFile->symbols) {
+            if (auto *defined = dyn_cast_or_null<Defined>(sym)) {
+              if (defined->isExternal() || !defined->isLive() ||
+                  !defined->includeInSymtab)
+                continue;
+              localSymbolsHandler(sym);
+            }
           }
         }
       }
     }
+
+    // __dyld_private is a local symbol too. It's linker-created and doesn't
+    // exist in any object file.
+    if (in.stubHelper && in.stubHelper->dyldPrivate)
+      localSymbolsHandler(in.stubHelper->dyldPrivate);
   }
 
-  // __dyld_private is a local symbol too. It's linker-created and doesn't
-  // exist in any object file.
-  if (in.stubHelper && in.stubHelper->dyldPrivate)
-    localSymbolsHandler(in.stubHelper->dyldPrivate);
-
-  for (Symbol *sym : symtab->getSymbols()) {
+  for (Symbol *sym : syms) {
     if (!sym->isLive())
       continue;
     if (auto *defined = dyn_cast<Defined>(sym)) {
@@ -1505,7 +1540,7 @@ void SymtabSection::finalizeContents() {
     }
   }
 
-  if (config->dedupSymbolStrings) {
+  if (deferStrings) {
     assert(normalSymbolOrdinal <= UINT32_MAX);
     std::vector<CachedHashStringRef> names(normalSymbolOrdinal,
                                             CachedHashStringRef("", 0));
@@ -1522,6 +1557,27 @@ void SymtabSection::finalizeContents() {
              localSymbols, externalSymbols, undefinedSymbols))
       entry.strx = offsets[entry.strx];
   }
+}
+
+// Takes the symbol-table snapshot that prepare() walks. Must run before
+// address assignment, which appends branch-range extension thunk symbols and
+// can therefore reallocate the symbol vector.
+void SymtabSection::snapshotSymbols() {
+  ArrayRef<Symbol *> syms = symtab->getSymbols();
+  preparedSymbols.assign(syms.begin(), syms.end());
+  prepared = true;
+}
+
+void SymtabSection::prepare() {
+  collectSymbols(preparedSymbols, /*isPrefix=*/true);
+}
+
+void SymtabSection::finalizeContents() {
+  if (prepared)
+    collectSymbols(symtab->getSymbols().drop_front(preparedSymbols.size()),
+                   /*isPrefix=*/false);
+  else
+    collectSymbols(symtab->getSymbols(), /*isPrefix=*/true);
 
   emitStabs();
   uint32_t symtabIndex = getNumStabs();
@@ -1530,6 +1586,9 @@ void SymtabSection::finalizeContents() {
     cast<Defined>(entry.sym)->setSymtabIndex(symtabIndex++);
   for (const SymtabEntry &entry : undefinedSymbols)
     cast<DylibSymbol>(entry.sym)->symtabIndex = symtabIndex++;
+
+  preparedSymbols.clear();
+  preparedSymbols.shrink_to_fit();
 }
 
 uint32_t SymtabSection::getNumSymbols() const {

@@ -419,12 +419,17 @@ private:
 class FunctionStartsSection final : public LinkEditSection {
 public:
   FunctionStartsSection();
+  // Gathers the symbols the table covers. Address-independent, so the writer
+  // runs it concurrently with address assignment.
+  void prepare();
   void finalizeContents() override;
   uint64_t getRawSize() const override { return contents.size(); }
   void writeTo(uint8_t *buf) const override;
 
 private:
   SmallVector<char, 128> contents;
+  std::vector<const Defined *> candidates;
+  bool prepared = false;
 };
 
 // Stores the strings referenced by the symbol table.
@@ -495,6 +500,12 @@ struct StabsFragment {
 // range (start index and total number) of those symbols in the symbol table.
 class SymtabSection : public LinkEditSection {
 public:
+  // Snapshots the symbol table, then gathers the symbol-table entries and
+  // interns their names. Address-independent, so the writer runs prepare()
+  // concurrently with address assignment; finalizeContents() then handles the
+  // symbols appended in between (branch-range extension thunks).
+  void snapshotSymbols();
+  void prepare();
   void finalizeContents() override;
   uint32_t getNumSymbols() const;
   uint32_t getNumLocalSymbols() const {
@@ -527,6 +538,12 @@ protected:
   std::vector<SymtabEntry> localSymbols;
   std::vector<SymtabEntry> externalSymbols;
   std::vector<SymtabEntry> undefinedSymbols;
+
+private:
+  void collectSymbols(llvm::ArrayRef<Symbol *> syms, bool isPrefix);
+
+  std::vector<Symbol *> preparedSymbols;
+  bool prepared = false;
 };
 
 template <class LP> SymtabSection *makeSymtabSection(StringTableSection &);
