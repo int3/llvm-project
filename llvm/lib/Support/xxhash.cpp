@@ -53,8 +53,24 @@
 #endif
 #endif
 
+#if !defined(LLVM_XXH_USE_SSE2)
+#if !LLVM_XXH_USE_NEON && !defined(_M_ARM64EC) &&                              \
+    (defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) ||           \
+     defined(_M_X64)) &&                                                       \
+    (defined(__SSE2__) || defined(_M_X64) ||                                   \
+     (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+#define LLVM_XXH_USE_SSE2 1
+#else
+#define LLVM_XXH_USE_SSE2 0
+#endif
+#endif
+
 #if LLVM_XXH_USE_NEON
 #include <arm_neon.h>
+#endif
+
+#if LLVM_XXH_USE_SSE2
+#include <emmintrin.h>
 #endif
 
 using namespace llvm;
@@ -386,6 +402,40 @@ static void XXH3_scrambleAcc_neon(uint64_t *acc, const uint8_t *secret) {
 
     /* xacc[i] = prod_hi + lo(data_key) * XXH_PRIME32_1; */
     xacc[i] = vmlal_u32(vreinterpretq_u64_u32(prod_hi), data_key_lo, kPrimeLo);
+  }
+}
+#elif LLVM_XXH_USE_SSE2
+
+#define XXH3_accumulate_512 XXH3_accumulate_512_sse2
+#define XXH3_scrambleAcc XXH3_scrambleAcc_sse2
+
+LLVM_ATTRIBUTE_ALWAYS_INLINE
+static void XXH3_accumulate_512_sse2(uint64_t *acc, const uint8_t *input,
+                                     const uint8_t *secret) {
+  for (size_t i = 0; i < XXH_ACC_NB / 2; ++i) {
+    __m128i data = _mm_loadu_si128((const __m128i *)(input + 16 * i));
+    __m128i key = _mm_loadu_si128((const __m128i *)(secret + 16 * i));
+    __m128i dataKey = _mm_xor_si128(data, key);
+    __m128i product = _mm_mul_epu32(dataKey, _mm_srli_epi64(dataKey, 32));
+    __m128i swapped = _mm_shuffle_epi32(data, _MM_SHUFFLE(1, 0, 3, 2));
+    __m128i accVec = _mm_loadu_si128((const __m128i *)(acc + 2 * i));
+    _mm_storeu_si128((__m128i *)(acc + 2 * i),
+                     _mm_add_epi64(accVec, _mm_add_epi64(swapped, product)));
+  }
+}
+
+LLVM_ATTRIBUTE_ALWAYS_INLINE
+static void XXH3_scrambleAcc_sse2(uint64_t *acc, const uint8_t *secret) {
+  const __m128i prime = _mm_set1_epi32(PRIME32_1);
+  for (size_t i = 0; i < XXH_ACC_NB / 2; ++i) {
+    __m128i accVec = _mm_loadu_si128((const __m128i *)(acc + 2 * i));
+    __m128i key = _mm_loadu_si128((const __m128i *)(secret + 16 * i));
+    __m128i dataKey =
+        _mm_xor_si128(_mm_xor_si128(accVec, _mm_srli_epi64(accVec, 47)), key);
+    __m128i lo = _mm_mul_epu32(dataKey, prime);
+    __m128i hi = _mm_mul_epu32(_mm_srli_epi64(dataKey, 32), prime);
+    _mm_storeu_si128((__m128i *)(acc + 2 * i),
+                     _mm_add_epi64(lo, _mm_slli_epi64(hi, 32)));
   }
 }
 #else

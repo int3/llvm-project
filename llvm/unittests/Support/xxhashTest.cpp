@@ -73,6 +73,26 @@ TEST(xxhashTest, xxh3) {
   F(2240, 0xd61d4d2a94e926a8);
   F(2243, 0x0979f786a24edde7);
 #undef F
+
+  uint8_t shifted[size + 15];
+  for (size_t offset = 0; offset != 16; ++offset) {
+    for (size_t i = 0; i != size; ++i)
+      shifted[offset + i] = a[i];
+    EXPECT_EQ(uint64_t(0xcefeb3ffa532ad8c),
+              xxh3_64bits(ArrayRef(shifted + offset, 403)));
+    EXPECT_EQ(uint64_t(0xcdfa6b6268e3650f),
+              xxh3_64bits(ArrayRef(shifted + offset, 512)));
+    EXPECT_EQ(uint64_t(0x4bb5d42742f9765f),
+              xxh3_64bits(ArrayRef(shifted + offset, 513)));
+    EXPECT_EQ(uint64_t(0x330ce110cbb79eae),
+              xxh3_64bits(ArrayRef(shifted + offset, 2048)));
+    EXPECT_EQ(uint64_t(0x3ba6afa0249fef9a),
+              xxh3_64bits(ArrayRef(shifted + offset, 2049)));
+    EXPECT_EQ(uint64_t(0xd61d4d2a94e926a8),
+              xxh3_64bits(ArrayRef(shifted + offset, 2240)));
+    EXPECT_EQ(uint64_t(0x0979f786a24edde7),
+              xxh3_64bits(ArrayRef(shifted + offset, 2243)));
+  }
 }
 
 TEST(xxhashTest, xxh3_128bits) {
@@ -122,4 +142,20 @@ TEST(xxhashTest, xxh3_128bits) {
         0xCB37AEB9E5D361EDULL,
         0xE89C0F6FF369B427ULL})); /* 3 blocks, last stripe is overlapping */
 #undef F
+
+  uint8_t shifted[SANITY_BUFFER_SIZE + 15];
+  for (size_t offset = 0; offset != 16; ++offset) {
+    for (size_t i = 0; i != SANITY_BUFFER_SIZE; ++i)
+      shifted[offset + i] = sanityBuffer[i];
+    EXPECT_EQ((XXH128_hash_t{0xCDEB804D65C6DEA4ULL, 0x1B6DE21E332DD73DULL}),
+              xxh3_128bits(ArrayRef(shifted + offset, 403)));
+    EXPECT_EQ((XXH128_hash_t{0x617E49599013CB6BULL, 0x18D2D110DCC9BCA1ULL}),
+              xxh3_128bits(ArrayRef(shifted + offset, 512)));
+    EXPECT_EQ((XXH128_hash_t{0xDD59E2C3A5F038E0ULL, 0xF736557FD47073A5ULL}),
+              xxh3_128bits(ArrayRef(shifted + offset, 2048)));
+    EXPECT_EQ((XXH128_hash_t{0x6E73A90539CF2948ULL, 0xCCB134FBFA7CE49DULL}),
+              xxh3_128bits(ArrayRef(shifted + offset, 2240)));
+    EXPECT_EQ((XXH128_hash_t{0xCB37AEB9E5D361EDULL, 0xE89C0F6FF369B427ULL}),
+              xxh3_128bits(ArrayRef(shifted + offset, 2367)));
+  }
 }
