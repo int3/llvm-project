@@ -123,6 +123,7 @@ using EncodingMap = DenseMap<compact_unwind_encoding_t, size_t>;
 
 struct SecondLevelPage {
   uint32_t kind;
+  uint32_t lsdaIndex;
   size_t entryIndex;
   size_t entryCount;
   size_t byteCount;
@@ -157,8 +158,6 @@ private:
       personalityTable;
   // Indices into cuEntries for CUEs with a non-null LSDA.
   std::vector<size_t> entriesWithLsda;
-  // Map of cuEntries index to an index within the LSDA array.
-  DenseMap<size_t, uint32_t> lsdaIndex;
   std::vector<SecondLevelPage> secondLevelPages;
   uint64_t level2PagesOffset = 0;
   // The highest-address function plus its size. The unwinder needs this to
@@ -615,10 +614,11 @@ void UnwindInfoSectionImpl::finalize() {
     }
   }
 
-  for (size_t i = 0; i < cuEntries.size(); ++i) {
-    lsdaIndex[i] = entriesWithLsda.size();
-    if (cuEntries[i].lsda)
-      entriesWithLsda.push_back(i);
+  for (SecondLevelPage &page : secondLevelPages) {
+    page.lsdaIndex = entriesWithLsda.size();
+    for (size_t i = page.entryIndex, end = i + page.entryCount; i != end; ++i)
+      if (cuEntries[i].lsda)
+        entriesWithLsda.push_back(i);
   }
 
   // compute size of __TEXT,__unwind_info section
@@ -675,8 +675,8 @@ void UnwindInfoSectionImpl::writeTo(uint8_t *buf) const {
     iep->functionOffset = cuEntries[idx].functionAddress - in.header->addr;
     iep->secondLevelPagesSectionOffset = l2PagesOffset;
     iep->lsdaIndexArraySectionOffset =
-        lsdaOffset + lsdaIndex.lookup(idx) *
-                         sizeof(unwind_info_section_header_lsda_index_entry);
+        lsdaOffset +
+        page.lsdaIndex * sizeof(unwind_info_section_header_lsda_index_entry);
     iep++;
     l2PagesOffset += SECOND_LEVEL_PAGE_BYTES;
   }
