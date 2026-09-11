@@ -36,6 +36,7 @@ public:
     LazyObjectKind,
     AliasKind,
   };
+  static_assert(AliasKind < 8);
 
   // Enum that describes the type of Identical Code Folding (ICF) applied to a
   // symbol. This information is crucial for accurately representing symbol
@@ -48,7 +49,7 @@ public:
 
   ~Symbol() = default;
 
-  Kind kind() const { return symbolKind; }
+  Kind kind() const { return static_cast<Kind>(symbolKind); }
 
   StringRef getName() const { return {nameData, nameSize}; }
 
@@ -90,20 +91,22 @@ public:
   // The index of this symbol's non-lazy pointer slot in __got.
   uint32_t gotIndex = UINT32_MAX;
   uint32_t stubsIndex = UINT32_MAX;
-  uint32_t symtabIndex = UINT32_MAX;
+  uint32_t getSymtabIndex() const;
 
   InputFile *getFile() const { return file; }
 
 protected:
   Symbol(Kind k, StringRef name, InputFile *file)
-      : symbolKind(k), nameData(name.data()), file(file), nameSize(name.size()),
+      : nameData(name.data()), file(file), nameSize(name.size()), symbolKind(k),
         isUsedInRegularObj(!file || isa<ObjFile>(file)),
         used(!config->deadStrip) {}
 
-  Kind symbolKind;
   const char *nameData;
   InputFile *file;
   uint32_t nameSize;
+
+  LLVM_PREFERRED_TYPE(Kind)
+  uint8_t symbolKind : 3;
 
 public:
   // True if this symbol was referenced by a regular (non-bitcode) object.
@@ -198,8 +201,28 @@ public:
   uint64_t value;
   // size is only calculated for regular (non-bitcode) symbols.
   uint64_t size;
-  // This can be a subsection of either __compact_unwind or __eh_frame.
-  ConcatInputSection *originalUnwindEntry = nullptr;
+  using UnwindOrSymtabStorage =
+      std::conditional_t<(sizeof(uintptr_t) >= sizeof(uint64_t)), uintptr_t,
+                         uint64_t>;
+
+  void setUnwindEntry(ConcatInputSection *isec) {
+    assert((reinterpret_cast<uintptr_t>(isec) & 1) == 0);
+    unwindOrSymtabIndex = reinterpret_cast<uintptr_t>(isec);
+  }
+  void setSymtabIndex(uint32_t index) {
+    unwindOrSymtabIndex = (UnwindOrSymtabStorage(index) << 1) | 1;
+  }
+  uint32_t getSymtabIndex() const {
+    return unwindOrSymtabIndex & 1
+               ? uint32_t(unwindOrSymtabIndex >> 1)
+               : UINT32_MAX;
+  }
+
+private:
+  // finalizeAddresses consumes unwind links before LINKEDIT reuses this word
+  // for a symtab index. An untagged (even non-null) pointer remains a missing
+  // index; the tag cannot share a flag read by concurrent LINKEDIT writers.
+  UnwindOrSymtabStorage unwindOrSymtabIndex = 0;
 };
 
 // This enum does double-duty: as a symbol property, it indicates whether & how
@@ -282,6 +305,7 @@ public:
   bool hasStubsHelper() const { return stubsHelperIndex != UINT32_MAX; }
 
   uint32_t stubsHelperIndex = UINT32_MAX;
+  uint32_t symtabIndex = UINT32_MAX;
 
   DylibFile *getFile() const {
     assert(!isDynamicLookup());
@@ -314,6 +338,14 @@ private:
   const bool weakDef : 1;
   const bool tlv : 1;
 };
+
+inline uint32_t Symbol::getSymtabIndex() const {
+  if (const auto *defined = dyn_cast<Defined>(this))
+    return defined->getSymtabIndex();
+  if (const auto *dylib = dyn_cast<DylibSymbol>(this))
+    return dylib->symtabIndex;
+  return UINT32_MAX;
+}
 
 class LazyArchive : public Symbol {
 public:

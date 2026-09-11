@@ -103,7 +103,7 @@ static void transplantSymbolsAtOffset(InputSection *fromIsec,
     // symbols in fromIsec since we will be adding another unwindEntry as we
     // finish parsing toIsec's file. (We can assume that toIsec has its own
     // unwindEntry because of the ODR.)
-    d->originalUnwindEntry = nullptr;
+    d->setUnwindEntry(nullptr);
     return true;
   });
 }

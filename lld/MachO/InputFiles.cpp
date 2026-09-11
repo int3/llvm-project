@@ -1343,7 +1343,7 @@ void ObjFile::registerCompactUnwind(Section &compactUnwindSection) {
         // Writer picks it up and registers it with UnwindInfoSection.
         symbols.push_back(d);
       }
-      d->originalUnwindEntry = isec;
+      d->setUnwindEntry(isec);
       // Now that the symbol points to the unwind entry, we can remove the reloc
       // that points from the unwind entry back to the symbol.
       //
@@ -1670,7 +1670,7 @@ void ObjFile::registerEhFrames(Section &ehFrameSection) {
     }
 
     fdes[isec] = {funcLength, cie.personalitySymbol, lsdaIsec};
-    funcSym->originalUnwindEntry = isec;
+    funcSym->setUnwindEntry(isec);
     ehRelocator.commit();
   }
 

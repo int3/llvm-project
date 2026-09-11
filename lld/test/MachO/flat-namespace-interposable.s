@@ -11,6 +11,10 @@
 # RUN: %lld -lSystem -flat_namespace -o %t/foo %t/foo.o
 # RUN: %lld -lSystem -flat_namespace -fixup_chains -o %t/chained %t/foo.o
 # RUN: %lld -lSystem -dylib -flat_namespace -o %t/foo.dylib %t/foo.o
+# RUN: mkdir -p %t/t1 %t/t8
+# RUN: %lld -lSystem -dylib -flat_namespace -unexported_symbol _extern -x -no_uuid -install_name @rpath/libfoo.dylib -map %t/t1/map -o %t/t1/linked-output %t/foo.o
+# RUN: %lld -lSystem -dylib -flat_namespace -unexported_symbol _extern -x -no_uuid -install_name @rpath/libfoo.dylib -map %t/t8/map -o %t/t8/linked-output %t/foo.o --threads=8
+# RUN: cmp %t/t1/linked-output %t/t8/linked-output
 # RUN: %lld -lSystem -dylib -flat_namespace -fixup_chains -o %t/chained.dylib %t/foo.o
 # RUN: %lld -lSystem -bundle -flat_namespace -o %t/foo.bundle %t/foo.o
 # RUN: %lld -lSystem -bundle -flat_namespace -fixup_chains -o %t/chained.bundle %t/foo.o
@@ -101,7 +105,9 @@
 .private_extern _private_extern
 
 _extern:
+.cfi_startproc
   retq
+.cfi_endproc
 _weak_extern:
   retq
 _private_extern:

@@ -1526,9 +1526,10 @@ void SymtabSection::finalizeContents() {
   emitStabs();
   uint32_t symtabIndex = getNumStabs();
   for (const SymtabEntry &entry :
-       concat<SymtabEntry>(localSymbols, externalSymbols, undefinedSymbols)) {
-    entry.sym->symtabIndex = symtabIndex++;
-  }
+       concat<SymtabEntry>(localSymbols, externalSymbols))
+    cast<Defined>(entry.sym)->setSymtabIndex(symtabIndex++);
+  for (const SymtabEntry &entry : undefinedSymbols)
+    cast<DylibSymbol>(entry.sym)->symtabIndex = symtabIndex++;
 }
 
 uint32_t SymtabSection::getNumSymbols() const {
@@ -1552,7 +1553,7 @@ template <class LP> uint64_t SymtabSectionImpl<LP>::getRawSize() const {
 template <class LP> void SymtabSectionImpl<LP>::writeTo(uint8_t *buf) const {
   auto *nList = reinterpret_cast<typename LP::nlist *>(buf);
   // Emit the stabs entries before the "real" symbols. We cannot emit them
-  // after as that would render Symbol::symtabIndex inaccurate.
+  // after as that would render Symbol::getSymtabIndex() inaccurate.
   auto writeStabs = [&](ArrayRef<StabsEntry> entries) {
     for (const StabsEntry &entry : entries) {
       nList->n_strx = entry.strx;
@@ -1659,9 +1660,9 @@ void IndirectSymtabSection::finalizeContents() {
 }
 
 static uint32_t indirectValue(const Symbol *sym) {
-  if (sym->symtabIndex == UINT32_MAX || !needsBinding(sym))
+  if (sym->getSymtabIndex() == UINT32_MAX || !needsBinding(sym))
     return INDIRECT_SYMBOL_LOCAL;
-  return sym->symtabIndex;
+  return sym->getSymtabIndex();
 }
 
 void IndirectSymtabSection::writeTo(uint8_t *buf) const {

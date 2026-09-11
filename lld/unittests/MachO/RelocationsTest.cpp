@@ -175,6 +175,8 @@ TEST_F(RelocationTest, SymbolQueriesFollowCurrentKind) {
   EXPECT_TRUE(sym->isWeakDef());
   EXPECT_TRUE(sym->isWeakRef());
   EXPECT_TRUE(sym->isTlv());
+  cast<DylibSymbol>(sym)->symtabIndex = UINT32_MAX;
+  EXPECT_EQ(UINT32_MAX, sym->getSymtabIndex());
 
   CommonSymbol common("common", nullptr, 4, 4, false);
   sym = &common;
@@ -198,6 +200,21 @@ TEST_F(RelocationTest, SymbolQueriesFollowCurrentKind) {
               /*includeInSymtab=*/true, /*isReferencedDynamically=*/false,
               /*noDeadStrip=*/false);
   EXPECT_TRUE(static_cast<Symbol *>(&tlv)->isTlv());
+
+  EXPECT_EQ(UINT32_MAX, tlv.getSymtabIndex());
+  tlv.setUnwindEntry(&isec);
+  EXPECT_EQ(&isec, tlv.unwindEntry());
+  EXPECT_EQ(UINT32_MAX, tlv.getSymtabIndex());
+  for (uint32_t index : {0U, 0x80000000U, UINT32_MAX - 1, UINT32_MAX}) {
+    tlv.setSymtabIndex(index);
+    EXPECT_EQ(index, tlv.getSymtabIndex());
+  }
+  EXPECT_EQ(UINT32_MAX, static_cast<Symbol *>(&undefined)->getSymtabIndex());
+  EXPECT_EQ(UINT32_MAX, static_cast<Symbol *>(&common)->getSymtabIndex());
+  dylib.symtabIndex = UINT32_MAX;
+  EXPECT_EQ(UINT32_MAX, static_cast<Symbol *>(&dylib)->getSymtabIndex());
+  dylib.symtabIndex = 0x80000000U;
+  EXPECT_EQ(0x80000000U, static_cast<Symbol *>(&dylib)->getSymtabIndex());
 }
 
 TEST_F(RelocationTest, SymbolUnionReplacementKeepsQueriesAndFlags) {
@@ -237,6 +254,7 @@ TEST_F(RelocationTest, SymbolUnionReplacementKeepsQueriesAndFlags) {
   EXPECT_FALSE(sym->isWeakDef());
   EXPECT_FALSE(sym->isWeakRef());
   EXPECT_FALSE(sym->isTlv());
+  EXPECT_EQ(UINT32_MAX, sym->getSymtabIndex());
 
   sym = replaceSymbol<Undefined>(sym, "undefined-again", &file,
                                  RefState::Weak, false);
@@ -264,7 +282,7 @@ TEST_F(RelocationTest, SymbolTableConstructsFreshSymbolsDirectly) {
     EXPECT_EQ(live, sym->isLive());
     EXPECT_EQ(regular, sym->isUsedInRegularObj);
     EXPECT_EQ(UINT32_MAX, sym->gotIndex);
-    EXPECT_EQ(UINT32_MAX, sym->symtabIndex);
+    EXPECT_EQ(UINT32_MAX, sym->getSymtabIndex());
     EXPECT_FALSE(sym->isInStubs());
   };
   for (bool deadStrip : {false, true}) {

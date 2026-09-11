@@ -15,13 +15,13 @@ using namespace llvm;
 using namespace lld;
 using namespace lld::macho;
 
-static_assert(sizeof(void *) != 8 || sizeof(Symbol) == 40,
+static_assert(sizeof(void *) != 8 || sizeof(Symbol) == 32,
               "Try to minimize Symbol's size; we create many instances");
 
 // The Microsoft ABI doesn't support using parent class tail padding for child
 // members, hence the _MSC_VER check.
 #if !defined(_MSC_VER)
-static_assert(sizeof(void *) != 8 || sizeof(Defined) == 72,
+static_assert(sizeof(void *) != 8 || sizeof(Defined) == 64,
               "Try to minimize Defined's size; we create many instances");
 #endif
 
@@ -126,7 +126,11 @@ InputSection *Defined::isec() const {
 
 // Get the canonical unwind entry of the symbol.
 ConcatInputSection *Defined::unwindEntry() const {
-  return originalUnwindEntry ? originalUnwindEntry->canonical() : nullptr;
+  static_assert(alignof(ConcatInputSection) >= 2);
+  assert((unwindOrSymtabIndex & 1) == 0);
+  auto *isec = reinterpret_cast<ConcatInputSection *>(
+      static_cast<uintptr_t>(unwindOrSymtabIndex));
+  return isec ? isec->canonical() : nullptr;
 }
 
 uint64_t DylibSymbol::getVA() const {

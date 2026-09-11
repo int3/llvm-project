@@ -231,7 +231,7 @@ void ConcatInputSection::foldIdentical(ConcatInputSection *copy,
     ++it;
   for (; it != copy->symbols.end(); ++it) {
     assert((*it)->value == 0);
-    (*it)->originalUnwindEntry = nullptr;
+    (*it)->setUnwindEntry(nullptr);
   }
   symbols.insert(symbols.end(), copy->symbols.begin(), copy->symbols.end());
   copy->symbols.clear();
