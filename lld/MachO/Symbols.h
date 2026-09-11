@@ -88,8 +88,6 @@ public:
 
   // The index of this symbol's non-lazy pointer slot in __got.
   uint32_t gotIndex = UINT32_MAX;
-  uint32_t lazyBindOffset = UINT32_MAX;
-  uint32_t stubsHelperIndex = UINT32_MAX;
   uint32_t stubsIndex = UINT32_MAX;
   uint32_t symtabIndex = UINT32_MAX;
 
@@ -281,6 +279,8 @@ public:
   bool isTlv() const override { return tlv; }
   bool isDynamicLookup() const { return file == nullptr; }
   bool hasStubsHelper() const { return stubsHelperIndex != UINT32_MAX; }
+
+  uint32_t stubsHelperIndex = UINT32_MAX;
 
   DylibFile *getFile() const {
     assert(!isDynamicLookup());

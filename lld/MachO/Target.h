@@ -67,6 +67,7 @@ public:
                          uint64_t pointerVA) const = 0;
   virtual void writeStubHelperHeader(uint8_t *buf) const = 0;
   virtual void writeStubHelperEntry(uint8_t *buf, const Symbol &,
+                                    uint32_t bindOffset,
                                     uint64_t entryAddr) const = 0;
 
   virtual void writeObjCMsgSendStub(uint8_t *buf, Symbol *sym,

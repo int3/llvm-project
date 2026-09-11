@@ -774,8 +774,11 @@ bool StubHelperSection::isNeeded() const { return in.lazyBinding->isNeeded(); }
 void StubHelperSection::writeTo(uint8_t *buf) const {
   target->writeStubHelperHeader(buf);
   size_t off = target->stubHelperHeaderSize;
-  for (const Symbol *sym : in.lazyBinding->getEntries()) {
-    target->writeStubHelperEntry(buf + off, *sym, addr + off);
+  const auto &entries = in.lazyBinding->getEntries();
+  ArrayRef<uint32_t> bindOffsets = in.lazyBinding->getBindOffsets();
+  assert(entries.size() == bindOffsets.size());
+  for (auto [sym, bindOffset] : llvm::zip(entries, bindOffsets)) {
+    target->writeStubHelperEntry(buf + off, *sym, bindOffset, addr + off);
     off += target->stubHelperEntrySize;
   }
 }
@@ -1002,8 +1005,10 @@ LazyBindingSection::LazyBindingSection()
 void LazyBindingSection::finalizeContents() {
   // TODO: Just precompute output size here instead of writing to a temporary
   // buffer
+  bindOffsets.clear();
+  bindOffsets.reserve(entries.size());
   for (Symbol *sym : entries)
-    sym->lazyBindOffset = encode(*sym);
+    bindOffsets.push_back(encode(*sym));
 }
 
 void LazyBindingSection::writeTo(uint8_t *buf) const {
@@ -1013,7 +1018,8 @@ void LazyBindingSection::writeTo(uint8_t *buf) const {
 void LazyBindingSection::addEntry(Symbol *sym) {
   assert(!config->emitChainedFixups && "Chained fixups always bind eagerly");
   if (entries.insert(sym)) {
-    sym->stubsHelperIndex = entries.size() - 1;
+    if (auto *dysym = dyn_cast<DylibSymbol>(sym))
+      dysym->stubsHelperIndex = entries.size() - 1;
     in.rebase->addEntry(in.lazyPointers->isec,
                         sym->stubsIndex * target->wordSize);
   }

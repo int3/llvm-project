@@ -35,7 +35,7 @@ struct X86_64 : TargetInfo {
                  uint64_t pointerVA) const override;
   void writeStubHelperHeader(uint8_t *buf) const override;
   void writeStubHelperEntry(uint8_t *buf, const Symbol &,
-                            uint64_t entryAddr) const override;
+                            uint32_t bindOffset, uint64_t entryAddr) const override;
 
   void writeObjCMsgSendStub(uint8_t *buf, Symbol *sym, uint64_t stubsAddr,
                             uint64_t &stubOffset, uint64_t selrefVA,
@@ -184,9 +184,10 @@ static constexpr uint8_t stubHelperEntry[] = {
 };
 
 void X86_64::writeStubHelperEntry(uint8_t *buf, const Symbol &sym,
+                                  uint32_t bindOffset,
                                   uint64_t entryAddr) const {
   memcpy(buf, stubHelperEntry, sizeof(stubHelperEntry));
-  write32le(buf + 1, sym.lazyBindOffset);
+  write32le(buf + 1, bindOffset);
   writeRipRelative({&sym, "stub helper"}, buf, entryAddr,
                    sizeof(stubHelperEntry), in.stubHelper->addr);
 }

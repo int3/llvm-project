@@ -28,7 +28,7 @@ struct ARM64 : ARM64Common {
   void writeStub(uint8_t *buf, const Symbol &, uint64_t) const override;
   void writeStubHelperHeader(uint8_t *buf) const override;
   void writeStubHelperEntry(uint8_t *buf, const Symbol &,
-                            uint64_t entryAddr) const override;
+                            uint32_t bindOffset, uint64_t entryAddr) const override;
 
   void writeObjCMsgSendStub(uint8_t *buf, Symbol *sym, uint64_t stubsAddr,
                             uint64_t &stubOffset, uint64_t selrefVA,
@@ -100,8 +100,9 @@ static constexpr uint32_t stubHelperEntryCode[] = {
 };
 
 void ARM64::writeStubHelperEntry(uint8_t *buf8, const Symbol &sym,
+                                 uint32_t bindOffset,
                                  uint64_t entryVA) const {
-  ::writeStubHelperEntry(buf8, stubHelperEntryCode, sym, entryVA);
+  ::writeStubHelperEntry(buf8, stubHelperEntryCode, sym, bindOffset, entryVA);
 }
 
 static constexpr uint32_t objcStubsFastCode[] = {

@@ -372,11 +372,13 @@ public:
   // the StubHelperSection.
   void addEntry(Symbol *dysym);
   const llvm::SetVector<Symbol *> &getEntries() const { return entries; }
+  llvm::ArrayRef<uint32_t> getBindOffsets() const { return bindOffsets; }
 
 private:
   uint32_t encode(const Symbol &);
 
   llvm::SetVector<Symbol *> entries;
+  std::vector<uint32_t> bindOffsets;
   SmallVector<char, 128> contents;
   llvm::raw_svector_ostream os{contents};
 };
