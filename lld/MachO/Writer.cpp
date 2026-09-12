@@ -55,6 +55,10 @@ public:
   void joinExportTrie();
   void scanSymbols();
   template <class LP> void createOutputSections();
+  // Explicit input-section priorities, built before createOutputSections() so
+  // that its scatter can partition each output section's inputs.
+  llvm::DenseMap<const InputSection *, int> isecPriorities;
+  bool hasPositivePriority = false;
   template <class LP> void createLoadCommands();
   void finalizeAddresses();
   void finalizeLinkEditSegment();
@@ -1294,19 +1298,12 @@ static void orderObjCStubsByCallerPriority(
 // Sorting only can happen once all outputs have been collected. Here we sort
 // segments, output sections within each segment, and input sections within each
 // output segment.
-static void sortSegmentsAndSections() {
+static void
+sortSegmentsAndSections(const DenseMap<const InputSection *, int> &isecPriorities,
+                        bool hasPositivePriority) {
   TimeTraceScope timeScope("Sort segments and sections");
   sortOutputSegments();
 
-  DenseMap<const InputSection *, int> isecPriorities =
-      priorityBuilder.buildInputSectionPriorities();
-
-  orderObjCStubsByCallerPriority(isecPriorities);
-
-  bool hasPositivePriority =
-      llvm::any_of(isecPriorities, [](const auto &priority) {
-        return priority.second > 0;
-      });
   uint32_t sectionIndex = 0;
   for (OutputSegment *seg : outputSegments) {
     seg->sortOutputSections();
@@ -1334,26 +1331,23 @@ static void sortSegmentsAndSections() {
       }
 
       if (auto *merged = dyn_cast<ConcatOutputSection>(osec)) {
-        auto coldIt = std::stable_partition(
-            merged->inputs.begin(), merged->inputs.end(),
-            [](InputSection *isec) { return !isec->isCold; });
+        // createOutputSections() already laid the inputs down as the three runs
+        // the two stable_partition()s used to produce: negative explicit
+        // priority, ordinary, then cold, each in input order. Only the sort of
+        // the prioritized prefix is left. When some priority is positive the
+        // whole non-cold range is sorted; otherwise priorities default to zero
+        // and entries with an explicit zero are possible, so the zero-or-more
+        // tail stays in input order and only the negative run is sorted.
         if (!isecPriorities.empty()) {
           auto comparePriority = [&](InputSection *a, InputSection *b) {
             return isecPriorities.lookup(a) < isecPriorities.lookup(b);
           };
-          if (hasPositivePriority) {
-            std::stable_sort(merged->inputs.begin(), coldIt, comparePriority);
-          } else {
-            // Priorities default to zero, and entries with explicit zero values
-            // are possible. Keep that tail in input order; only negative
-            // priorities need sorting.
-            auto priorityEnd = std::stable_partition(
-                merged->inputs.begin(), coldIt, [&](InputSection *isec) {
-                  return isecPriorities.lookup(isec) < 0;
-                });
-            std::stable_sort(merged->inputs.begin(), priorityEnd,
-                             comparePriority);
-          }
+          std::stable_sort(merged->inputs.begin(),
+                           merged->inputs.begin() +
+                               (hasPositivePriority
+                                    ? merged->nonColdCount
+                                    : merged->negativePriorityCount),
+                           comparePriority);
         }
       }
     }
@@ -1383,6 +1377,18 @@ template <class LP> void Writer::createOutputSections() {
   default:
     llvm_unreachable("unhandled output file type");
   }
+
+  // The inputs are scattered into three per-output-section runs, which is where
+  // sortSegmentsAndSections()'s two stable_partition()s used to put them. Both
+  // classes are pure reads of state that is final here: `isCold` after
+  // buildInputSectionPriorities() has cleared it for order-file sections, and
+  // the priority map itself.
+  const bool splitNegative = !isecPriorities.empty() && !hasPositivePriority;
+  auto classOf = [&](const ConcatInputSection *isec) -> size_t {
+    if (isec->isCold)
+      return 2;
+    return splitNegative && isecPriorities.lookup(isec) < 0 ? 0 : 1;
+  };
 
   // Then add input sections to output sections. addInput() is a push_back plus
   // a max() over align and an | over a subset of the section flags, except that
@@ -1422,8 +1428,10 @@ template <class LP> void Writer::createOutputSections() {
     constexpr size_t sectionsPerChunk = 4096;
     const size_t numChunks =
         (sectionCount + sectionsPerChunk - 1) / sectionsPerChunk;
+    constexpr size_t numClasses = 3;
     struct OutputSectionFold {
-      uint32_t count = 0;
+      uint32_t count[numClasses] = {};
+      uint32_t total = 0;
       uint32_t align = 0;
       uint32_t firstFlags = 0;
       uint32_t flagsOr = 0;
@@ -1441,30 +1449,47 @@ template <class LP> void Writer::createOutputSections() {
           continue;
         OutputSectionFold &fold =
             folds[denseIndexOf(cast<ConcatOutputSection>(isec->parent))];
-        if (fold.count == 0)
+        if (fold.total == 0)
           fold.firstFlags = isec->getFlags();
-        ++fold.count;
+        ++fold.total;
+        ++fold.count[classOf(isec)];
         fold.align = std::max(fold.align, isec->align);
         fold.flagsOr |= ConcatOutputSection::flagsContribution(isec);
         fold.inputOrder =
             std::min(fold.inputOrder, static_cast<int>(isec->outSecOff));
       }
     });
+    // One prefix sum per (chunk, output section, class): a chunk's inputs of one
+    // class land contiguously inside that class's run, in chunk order, so each
+    // run reproduces the old stable_partition() output exactly.
     std::vector<std::vector<uint32_t>> chunkOffsets(numChunks);
-    SmallVector<uint32_t, 32> totals(numOsecs, 0);
+    SmallVector<uint32_t, 32> totals(numOsecs * numClasses, 0);
     for (size_t c = 0; c != numChunks; ++c) {
-      chunkOffsets[c].resize(numOsecs);
-      for (size_t o = 0; o != numOsecs; ++o) {
-        chunkOffsets[c][o] = totals[o];
-        totals[o] += chunkFolds[c][o].count;
-      }
+      chunkOffsets[c].resize(numOsecs * numClasses);
+      for (size_t o = 0; o != numOsecs; ++o)
+        for (size_t k = 0; k != numClasses; ++k) {
+          chunkOffsets[c][o * numClasses + k] = totals[o * numClasses + k];
+          totals[o * numClasses + k] += chunkFolds[c][o].count[k];
+        }
     }
-    for (size_t o = 0; o != numOsecs; ++o)
-      if (totals[o] != 0)
-        denseOsecs[o]->inputs.resize(totals[o]);
+    SmallVector<uint32_t, 32> classBase(numOsecs * numClasses, 0);
+    for (size_t o = 0; o != numOsecs; ++o) {
+      const uint32_t negative = totals[o * numClasses];
+      const uint32_t ordinary = totals[o * numClasses + 1];
+      const uint32_t cold = totals[o * numClasses + 2];
+      classBase[o * numClasses] = 0;
+      classBase[o * numClasses + 1] = negative;
+      classBase[o * numClasses + 2] = negative + ordinary;
+      ConcatOutputSection *osec = denseOsecs[o];
+      osec->negativePriorityCount = negative;
+      osec->nonColdCount = negative + ordinary;
+      if (negative + ordinary + cold != 0)
+        osec->inputs.resize(negative + ordinary + cold);
+    }
     parallelFor(0, numChunks, [&](size_t chunkIndex) {
-      SmallVector<uint32_t, 32> cursors(chunkOffsets[chunkIndex].begin(),
-                                        chunkOffsets[chunkIndex].end());
+      SmallVector<uint32_t, 32> cursors(numOsecs * numClasses, 0);
+      for (size_t i = 0; i != cursors.size(); ++i)
+        cursors[i] = classBase[i] + chunkOffsets[chunkIndex][i];
       const size_t begin = chunkIndex * sectionsPerChunk;
       const size_t end = std::min(begin + sectionsPerChunk, sectionCount);
       for (size_t i = begin; i != end; ++i) {
@@ -1472,7 +1497,8 @@ template <class LP> void Writer::createOutputSections() {
         if (isec->shouldOmitFromOutput())
           continue;
         auto *osec = cast<ConcatOutputSection>(isec->parent);
-        osec->inputs[cursors[denseIndexOf(osec)]++] = isec;
+        osec->inputs[cursors[denseIndexOf(osec) * numClasses + classOf(isec)]++] =
+            isec;
       }
     });
 #ifndef NDEBUG
@@ -1488,7 +1514,7 @@ template <class LP> void Writer::createOutputSections() {
     for (size_t c = 0; c != numChunks; ++c) {
       for (size_t o = 0; o != numOsecs; ++o) {
         const OutputSectionFold &fold = chunkFolds[c][o];
-        if (fold.count == 0)
+        if (fold.total == 0)
           continue;
         ConcatOutputSection *osec = denseOsecs[o];
         if (!seen[o]) {
@@ -1857,6 +1883,20 @@ template <class LP> void Writer::run() {
 
   // At this point, we should know exactly which output sections are needed,
   // courtesy of scanSymbols() and scanRelocations().
+  // Input-section priorities read only symbols and sections that are final
+  // after markLive() and ICF, and clearing `isCold` for order-file sections is
+  // their only mutation. Building them here lets createOutputSections() scatter
+  // each output section's inputs into their final cold/priority partitions.
+  {
+    TimeTraceScope timeScope("Build input section priorities");
+    isecPriorities = priorityBuilder.buildInputSectionPriorities();
+    orderObjCStubsByCallerPriority(isecPriorities);
+    hasPositivePriority =
+        llvm::any_of(isecPriorities, [](const auto &priority) {
+          return priority.second > 0;
+        });
+  }
+
   createOutputSections<LP>();
 
   // After this point, we create no new segments; HOWEVER, we might
@@ -1864,7 +1904,7 @@ template <class LP> void Writer::run() {
   // hardware call instructions have limited range, e.g., ARM(64).
   // The thunks are created as InputSections interspersed among
   // the ordinary __TEXT,_text InputSections.
-  sortSegmentsAndSections();
+  sortSegmentsAndSections(isecPriorities, hasPositivePriority);
   createLoadCommands<LP>();
 
   // The prefixes of the symbol-table and function-starts computations read

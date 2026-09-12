@@ -61,6 +61,11 @@ public:
   static ConcatOutputSection *getOrCreateForInput(const InputSection *);
 
   std::vector<ConcatInputSection *> inputs;
+  // createOutputSections() lays `inputs` down already partitioned into three
+  // runs -- negative explicit priority, ordinary, cold -- each in input order.
+  // These are the two boundaries; see sortSegmentsAndSections().
+  uint32_t negativePriorityCount = 0;
+  uint32_t nonColdCount = 0;
 
 protected:
   size_t size = 0;
