@@ -93,7 +93,8 @@ public:
   // Between these two calls, add*() records that carry a ParseContext are
   // folded into the shards by rank and ordinal instead of being applied in
   // arrival order. endParallelInput() rebuilds symVector in the order the
-  // serial linker would have created the slots.
+  // serial linker would have created the slots. It leaves the shards in place:
+  // they are the name map for the rest of the link.
   void beginParallelInput();
   void endParallelInput();
   bool isFolding() const { return folding; }
@@ -183,10 +184,14 @@ private:
   std::pair<Symbol *, bool> insert(StringRef name, const InputFile *);
   std::pair<Symbol *, bool> insert(llvm::CachedHashStringRef name,
                                    const InputFile *);
+  // Used only when the parallel input phase never ran: once enableSharding() has
+  // been called the shards serve every lookup and insert for the rest of the
+  // link, and this map stays empty.
   llvm::DenseMap<llvm::CachedHashStringRef, Symbol *> symMap;
   std::vector<Symbol *> symVector;
   std::unique_ptr<Shard[]> shards;
-  // The sharded map replaces symMap for the rest of the link once it is built.
+  // The sharded map replaces symMap for the rest of the link once it is built,
+  // and keeps it for good: endParallelInput() ends the fold, not the sharding.
   bool sharded = false;
   // True only while workers may be folding records.
   bool folding = false;

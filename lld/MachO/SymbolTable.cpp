@@ -102,19 +102,13 @@ void SymbolTable::endParallelInput() {
   for (const auto &[ordinal, sym] : created)
     symVector.push_back(sym);
 
-  // Everything from here on is serial -- archive members, LTO output, synthetics
-  // -- and on an archive-heavy link that is most of the names. The shards exist
-  // only to let workers resolve concurrently, so they go back into one map and
-  // every later insert and lookup takes the original path.
-  size_t names = 0;
-  for (unsigned i = 0; i != numShards; ++i)
-    names += shards[i].map.size();
-  symMap.reserve(names);
-  for (unsigned i = 0; i != numShards; ++i)
-    for (const auto &entry : shards[i].map)
-      symMap.insert(entry);
-  sharded = false;
-  shards.reset();
+  // The shards stay. Nothing reads the name map's iteration order -- symVector is
+  // the iteration structure, and symMap has no reader other than find() and
+  // insert(), both of which route by hash while sharded -- so merging the 64
+  // shard maps back into one only to serve the rest of the link's lookups is a
+  // pass over every name for nothing. On an archive-heavy link it was the serial
+  // half of "Compact symbol vector" (109 ms of Chromium's 148 before the -ObjC
+  // walker, more after it).
 }
 
 std::pair<Symbol *, bool> SymbolTable::insert(StringRef name,
