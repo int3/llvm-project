@@ -607,61 +607,102 @@ void macho::foldIdenticalSections(bool onlyCfStrings) {
   // coexist with equivalence-class IDs, this is not necessary, but might help
   // someone keep the numbers straight in case we ever need to debug the
   // ICF::segregate()
-  std::vector<ConcatInputSection *> foldable;
-  uint64_t icfUniqueID = inputSections.size();
   // Reset the thunk counter for each run of ICF.
   icfThunkCounter = 0;
-  for (ConcatInputSection *isec : inputSections) {
-    bool isUnconditionallyCoalescedData = isCfStringSection(isec) ||
-                                          isClassRefsSection(isec) ||
-                                          isSelRefsSection(isec);
-    // NOTE: __objc_selrefs is typically marked as no_dead_strip by MC, but we
-    // can still fold it.
-    bool hasFoldableFlags = (isSelRefsSection(isec) ||
-                             sectionType(isec->getFlags()) == MachO::S_REGULAR);
+  // Classification is a pure function of each section, so run it over chunks of
+  // the section table on workers. Each chunk collects its foldable sections and
+  // its ICF-ineligible sections separately; the foldable lists are then
+  // concatenated in chunk order so ICF() sees exactly the serial walk's
+  // sequence, and the unique IDs are assigned from a prefix sum over the
+  // ineligible lists so each section receives exactly the ID the serial
+  // ++icfUniqueID walk gave it. (The IDs are not merely compared for equality:
+  // ICF::run() folds a referent's equivalence class into the referrer's hash,
+  // so changing their values would permute the icfInputs sort.)
+  constexpr size_t sectionsPerChunk = 4096;
+  const size_t sectionCount = inputSections.size();
+  const size_t numChunks =
+      (sectionCount + sectionsPerChunk - 1) / sectionsPerChunk;
+  std::vector<std::vector<ConcatInputSection *>> chunkFoldable(numChunks);
+  std::vector<std::vector<ConcatInputSection *>> chunkUnique(numChunks);
+  parallelFor(0, numChunks, [&](size_t chunkIndex) {
+    std::vector<ConcatInputSection *> &foldable = chunkFoldable[chunkIndex];
+    std::vector<ConcatInputSection *> &uniqueIds = chunkUnique[chunkIndex];
+    const size_t chunkBegin = chunkIndex * sectionsPerChunk;
+    const size_t chunkEnd =
+        std::min(chunkBegin + sectionsPerChunk, sectionCount);
+    for (size_t sectionIndex = chunkBegin; sectionIndex != chunkEnd;
+         ++sectionIndex) {
+      ConcatInputSection *isec = inputSections[sectionIndex];
+      bool isUnconditionallyCoalescedData = isCfStringSection(isec) ||
+                                            isClassRefsSection(isec) ||
+                                            isSelRefsSection(isec);
+      // NOTE: __objc_selrefs is typically marked as no_dead_strip by MC, but we
+      // can still fold it.
+      bool hasFoldableFlags =
+          (isSelRefsSection(isec) ||
+           sectionType(isec->getFlags()) == MachO::S_REGULAR);
 
-    bool isCodeSec = isCodeSection(isec);
+      bool isCodeSec = isCodeSection(isec);
 
-    // Determine whether keepUnique forbids folding this section.
-    //   - __cfstring / __objc_classrefs / __objc_selrefs always fold
-    //     regardless of keepUnique. Compilers currently emit over-broad
-    //     __llvm_addrsig entries that can cover non-address-significant data
-    //     symbols in these sections; ld64 coalesces them unconditionally, and
-    //     we match that behavior.
-    //   - Under safe_thunks, keepUnique code sections still fold; the
-    //     safe_thunks logic is applied later at merge time based on the
-    //     keepUnique flag.
-    //   - Otherwise, keepUnique sections are not foldable.
-    bool isSafeThunksCode =
-        config->icfLevel == ICFLevel::safe_thunks && isCodeSec;
-    bool keepUniqueAllowsFolding =
-        !isec->keepUnique || isUnconditionallyCoalescedData || isSafeThunksCode;
+      // Determine whether keepUnique forbids folding this section.
+      //   - __cfstring / __objc_classrefs / __objc_selrefs always fold
+      //     regardless of keepUnique. Compilers currently emit over-broad
+      //     __llvm_addrsig entries that can cover non-address-significant data
+      //     symbols in these sections; ld64 coalesces them unconditionally, and
+      //     we match that behavior.
+      //   - Under safe_thunks, keepUnique code sections still fold; the
+      //     safe_thunks logic is applied later at merge time based on the
+      //     keepUnique flag.
+      //   - Otherwise, keepUnique sections are not foldable.
+      bool isSafeThunksCode =
+          config->icfLevel == ICFLevel::safe_thunks && isCodeSec;
+      bool keepUniqueAllowsFolding = !isec->keepUnique ||
+                                     isUnconditionallyCoalescedData ||
+                                     isSafeThunksCode;
 
-    // FIXME: consider non-code __text sections as foldable?
-    bool isFoldable = (!onlyCfStrings || isCfStringSection(isec)) &&
-                      (isCodeSec || isFoldableIgnoringRelocatedBytes(isec)) &&
-                      keepUniqueAllowsFolding && !isec->hasAltEntry &&
-                      !isec->shouldOmitFromOutput() && hasFoldableFlags;
-    if (isFoldable) {
-      foldable.push_back(isec);
-      for (Defined *d : isec->symbols)
-        if (d->unwindEntry())
-          foldable.push_back(d->unwindEntry());
-    } else if (isEhFrameSection(isec)) {
-      // __eh_frame contains two types of records: FDEs and CIEs.
-      // Functions point to FDEs, which are already collected above via
-      // unwindEntry(). CIEs are shared headers and are not attached to
-      // individual functions. Collect only CIEs here so they can also be hashed
-      // and deduplicated.
-      auto *obj = dyn_cast_or_null<ObjFile>(isec->getFile());
-      if (!onlyCfStrings && obj && !obj->fdes.contains(isec) &&
-          !isec->shouldOmitFromOutput())
+      // FIXME: consider non-code __text sections as foldable?
+      bool isFoldable = (!onlyCfStrings || isCfStringSection(isec)) &&
+                        (isCodeSec || isFoldableIgnoringRelocatedBytes(isec)) &&
+                        keepUniqueAllowsFolding && !isec->hasAltEntry &&
+                        !isec->shouldOmitFromOutput() && hasFoldableFlags;
+      if (isFoldable) {
         foldable.push_back(isec);
-    } else {
-      // Give a unique ID to everything else.
-      isec->icfEqClass[0] = ++icfUniqueID;
+        for (Defined *d : isec->symbols)
+          if (d->unwindEntry())
+            foldable.push_back(d->unwindEntry());
+      } else if (isEhFrameSection(isec)) {
+        // __eh_frame contains two types of records: FDEs and CIEs.
+        // Functions point to FDEs, which are already collected above via
+        // unwindEntry(). CIEs are shared headers and are not attached to
+        // individual functions. Collect only CIEs here so they can also be
+        // hashed and deduplicated.
+        auto *obj = dyn_cast_or_null<ObjFile>(isec->getFile());
+        if (!onlyCfStrings && obj && !obj->fdes.contains(isec) &&
+            !isec->shouldOmitFromOutput())
+          foldable.push_back(isec);
+      } else {
+        // Give a unique ID to everything else.
+        uniqueIds.push_back(isec);
+      }
     }
+  });
+  // Prefix sum over the per-chunk ineligible lists reproduces the serial
+  // ++icfUniqueID numbering exactly.
+  std::vector<uint64_t> uniqueBase(numChunks + 1, 0);
+  size_t foldableCount = 0;
+  for (size_t i = 0; i != numChunks; ++i) {
+    uniqueBase[i + 1] = uniqueBase[i] + chunkUnique[i].size();
+    foldableCount += chunkFoldable[i].size();
   }
+  parallelFor(0, numChunks, [&](size_t chunkIndex) {
+    uint64_t icfUniqueID = sectionCount + uniqueBase[chunkIndex];
+    for (ConcatInputSection *isec : chunkUnique[chunkIndex])
+      isec->icfEqClass[0] = ++icfUniqueID;
+  });
+  std::vector<ConcatInputSection *> foldable;
+  foldable.reserve(foldableCount);
+  for (const std::vector<ConcatInputSection *> &chunk : chunkFoldable)
+    foldable.insert(foldable.end(), chunk.begin(), chunk.end());
   parallelForEach(foldable, [](ConcatInputSection *isec) {
     assert(isec->icfEqClass[0] == 0); // don't overwrite a unique ID!
     uint64_t hash;

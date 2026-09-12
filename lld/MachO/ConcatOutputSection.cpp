@@ -27,18 +27,6 @@ using namespace lld::macho;
 
 MapVector<NamePair, ConcatOutputSection *> macho::concatOutputSections;
 
-void ConcatOutputSection::addInput(ConcatInputSection *input) {
-  assert(input->parent == this);
-  if (inputs.empty()) {
-    align = input->align;
-    flags = input->getFlags();
-  } else {
-    align = std::max(align, input->align);
-    finalizeFlags(input);
-  }
-  inputs.push_back(input);
-}
-
 // Branch-range extension can be implemented in two ways, either through ...
 //
 // (1) Branch islands: Single branch instructions (also of limited range),
@@ -494,7 +482,7 @@ void TextOutputSection::writeTo(uint8_t *buf) const {
   }
 }
 
-void ConcatOutputSection::finalizeFlags(InputSection *input) {
+uint32_t ConcatOutputSection::flagsContribution(const InputSection *input) {
   switch (sectionType(input->getFlags())) {
   default /*type-unspec'ed*/:
     // FIXME: Add additional logic here when supporting emitting obj files.
@@ -513,9 +501,9 @@ void ConcatOutputSection::finalizeFlags(InputSection *input) {
   case S_THREAD_LOCAL_VARIABLE_POINTERS:
   case S_NON_LAZY_SYMBOL_POINTERS:
   case S_SYMBOL_STUBS:
-    flags |= input->getFlags();
-    break;
+    return input->getFlags();
   }
+  return 0;
 }
 
 ConcatOutputSection *

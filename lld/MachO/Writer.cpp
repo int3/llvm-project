@@ -24,6 +24,7 @@
 
 #include "lld/Common/Arrays.h"
 #include "lld/Common/CommonLinkerContext.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Support/Parallel.h"
@@ -716,12 +717,33 @@ enum SymbolScanAction : uint8_t {
   globalUnwind = 1 << 1,
   dylibReference = 1 << 2,
   objcStub = 1 << 3,
+  unwindHasEntry = 1 << 4,
 };
 
 struct SymbolScanCandidate {
   Symbol *sym;
+  // Precomputed UnwindInfoSection::addSymbol() inputs; see UnwindScanCandidate.
+  ConcatInputSection *unwindIsec;
   uint8_t actions;
 };
+
+// A local function symbol to replay into UnwindInfoSection::addSymbol(). The
+// section pointer and the unwind-entry bit are resolved on the worker so the
+// serial replay reads only this array and one unwindSymbolIndex slot, instead
+// of chasing Defined::isec(), Defined::value and Defined::unwindEntry().
+struct UnwindScanCandidate {
+  const Defined *sym;
+  ConcatInputSection *isec;
+  bool hasUnwindEntry;
+};
+
+// Resolve the ConcatInputSection that owns this symbol's unwind index slot, or
+// null when addSymbol() must fall back to its (isec, value) map.
+static ConcatInputSection *unwindIndexSection(const Defined *d) {
+  if (d->value != 0)
+    return nullptr;
+  return dyn_cast_or_null<ConcatInputSection>(d->isec());
+}
 
 static void canonicalizeReferent(Relocation &r) {
   if (auto *referentIsec = dyn_cast_if_present<InputSection *>(r.getReferent()))
@@ -855,13 +877,18 @@ void Writer::scanSymbols() {
     for (size_t i = begin; i != end; ++i) {
       Symbol *sym = symbols[i];
       uint8_t actions = 0;
+      ConcatInputSection *unwindIsec = nullptr;
       if (auto *defined = dyn_cast<Defined>(sym)) {
         if (!defined->isLive())
           continue;
         if (defined->overridesWeakDef)
           actions |= nonWeakDefinition;
-        if (!defined->isAbsolute() && isCodeSection(defined->isec()))
+        if (!defined->isAbsolute() && isCodeSection(defined->isec())) {
           actions |= globalUnwind;
+          if (defined->unwindEntry())
+            actions |= unwindHasEntry;
+          unwindIsec = unwindIndexSection(defined);
+        }
       } else if (const auto *dysym = dyn_cast<DylibSymbol>(sym)) {
         // This branch intentionally doesn't check isLive().
         if (!dysym->isDynamicLookup())
@@ -872,7 +899,7 @@ void Writer::scanSymbols() {
         actions |= objcStub;
       }
       if (actions != 0)
-        candidates.push_back({sym, actions});
+        candidates.push_back({sym, unwindIsec, actions});
     }
   });
 
@@ -883,7 +910,9 @@ void Writer::scanSymbols() {
       if (candidate.actions & nonWeakDefinition)
         addNonWeakDefinition(cast<Defined>(candidate.sym));
       if (candidate.actions & globalUnwind)
-        in.unwindInfo->addSymbol(cast<Defined>(candidate.sym));
+        in.unwindInfo->addSymbol(cast<Defined>(candidate.sym),
+                                 candidate.unwindIsec,
+                                 (candidate.actions & unwindHasEntry) != 0);
       if (candidate.actions & dylibReference) {
         const auto *dysym = cast<DylibSymbol>(candidate.sym);
         dysym->getFile()->refState =
@@ -896,22 +925,25 @@ void Writer::scanSymbols() {
 
   // ObjC stub creation above can replace symbols and add input sections, so
   // classify local symbols only after every global side effect is complete.
-  std::vector<std::vector<const Defined *>> localCandidates(inputFiles.size());
+  std::vector<std::vector<UnwindScanCandidate>> localCandidates(
+      inputFiles.size());
   parallelFor(0, inputFiles.size(), [&](size_t fileIndex) {
     const auto *objFile = dyn_cast<ObjFile>(inputFiles[fileIndex]);
     if (!objFile)
       return;
-    std::vector<const Defined *> &candidates = localCandidates[fileIndex];
+    std::vector<UnwindScanCandidate> &candidates = localCandidates[fileIndex];
     for (Symbol *sym : objFile->symbols) {
       auto *defined = dyn_cast_or_null<Defined>(sym);
       if (defined && defined->isLive() && !defined->isExternal() &&
           !defined->isAbsolute() && isCodeSection(defined->isec()))
-        candidates.push_back(defined);
+        candidates.push_back({defined, unwindIndexSection(defined),
+                              defined->unwindEntry() != nullptr});
     }
   });
   for (const auto &candidates : localCandidates)
-    for (const Defined *defined : candidates)
-      in.unwindInfo->addSymbol(defined);
+    for (const UnwindScanCandidate &candidate : candidates)
+      in.unwindInfo->addSymbol(candidate.sym, candidate.isec,
+                               candidate.hasUnwindEntry);
 }
 
 // TODO: ld64 enforces the old load commands in a few other cases.
@@ -1220,14 +1252,127 @@ template <class LP> void Writer::createOutputSections() {
     llvm_unreachable("unhandled output file type");
   }
 
-  // Then add input sections to output sections.
-  for (ConcatInputSection *isec : inputSections) {
-    if (isec->shouldOmitFromOutput())
-      continue;
-    ConcatOutputSection *osec = cast<ConcatOutputSection>(isec->parent);
-    osec->addInput(isec);
-    osec->inputOrder =
-        std::min(osec->inputOrder, static_cast<int>(isec->outSecOff));
+  // Then add input sections to output sections. addInput() is a push_back plus
+  // a max() over align and an | over a subset of the section flags, except that
+  // the very first input assigns the output section's flags wholesale. So run
+  // the walk as two parallel passes over chunks of the section table -- count
+  // and fold, then scatter into preallocated slots -- with a serial prefix sum
+  // in between. Chunk order is preserved everywhere: the scatter reproduces the
+  // serial push_back sequence exactly, the flag fold consumes the first
+  // contributing chunk's first input for the wholesale assignment and then |s
+  // the remaining contributions in chunk order, and align and inputOrder are
+  // order-independent max/min reductions.
+  {
+    SmallVector<ConcatOutputSection *, 32> denseOsecs;
+    for (const auto &it : concatOutputSections) {
+      it.second->denseIndex = denseOsecs.size();
+      denseOsecs.push_back(it.second);
+    }
+#ifndef NDEBUG
+    // Every parent must have been handed a dense index above; denseIndex is
+    // otherwise still its default 0, which would silently alias the first
+    // output section's slots.
+    llvm::DenseSet<const ConcatOutputSection *> denseIndexed(denseOsecs.begin(),
+                                                            denseOsecs.end());
+    auto denseIndexOf = [&](const ConcatOutputSection *osec) {
+      assert(denseIndexed.contains(osec) &&
+             denseOsecs[osec->denseIndex] == osec &&
+             "input section's parent received no dense index");
+      return osec->denseIndex;
+    };
+#else
+    auto denseIndexOf = [](const ConcatOutputSection *osec) {
+      return osec->denseIndex;
+    };
+#endif
+    const size_t numOsecs = denseOsecs.size();
+    const size_t sectionCount = inputSections.size();
+    constexpr size_t sectionsPerChunk = 4096;
+    const size_t numChunks =
+        (sectionCount + sectionsPerChunk - 1) / sectionsPerChunk;
+    struct OutputSectionFold {
+      uint32_t count = 0;
+      uint32_t align = 0;
+      uint32_t firstFlags = 0;
+      uint32_t flagsOr = 0;
+      int inputOrder = UnspecifiedInputOrder;
+    };
+    std::vector<std::vector<OutputSectionFold>> chunkFolds(numChunks);
+    parallelFor(0, numChunks, [&](size_t chunkIndex) {
+      std::vector<OutputSectionFold> &folds = chunkFolds[chunkIndex];
+      folds.resize(numOsecs);
+      const size_t begin = chunkIndex * sectionsPerChunk;
+      const size_t end = std::min(begin + sectionsPerChunk, sectionCount);
+      for (size_t i = begin; i != end; ++i) {
+        ConcatInputSection *isec = inputSections[i];
+        if (isec->shouldOmitFromOutput())
+          continue;
+        OutputSectionFold &fold =
+            folds[denseIndexOf(cast<ConcatOutputSection>(isec->parent))];
+        if (fold.count == 0)
+          fold.firstFlags = isec->getFlags();
+        ++fold.count;
+        fold.align = std::max(fold.align, isec->align);
+        fold.flagsOr |= ConcatOutputSection::flagsContribution(isec);
+        fold.inputOrder =
+            std::min(fold.inputOrder, static_cast<int>(isec->outSecOff));
+      }
+    });
+    std::vector<std::vector<uint32_t>> chunkOffsets(numChunks);
+    SmallVector<uint32_t, 32> totals(numOsecs, 0);
+    for (size_t c = 0; c != numChunks; ++c) {
+      chunkOffsets[c].resize(numOsecs);
+      for (size_t o = 0; o != numOsecs; ++o) {
+        chunkOffsets[c][o] = totals[o];
+        totals[o] += chunkFolds[c][o].count;
+      }
+    }
+    for (size_t o = 0; o != numOsecs; ++o)
+      if (totals[o] != 0)
+        denseOsecs[o]->inputs.resize(totals[o]);
+    parallelFor(0, numChunks, [&](size_t chunkIndex) {
+      SmallVector<uint32_t, 32> cursors(chunkOffsets[chunkIndex].begin(),
+                                        chunkOffsets[chunkIndex].end());
+      const size_t begin = chunkIndex * sectionsPerChunk;
+      const size_t end = std::min(begin + sectionsPerChunk, sectionCount);
+      for (size_t i = begin; i != end; ++i) {
+        ConcatInputSection *isec = inputSections[i];
+        if (isec->shouldOmitFromOutput())
+          continue;
+        auto *osec = cast<ConcatOutputSection>(isec->parent);
+        osec->inputs[cursors[denseIndexOf(osec)]++] = isec;
+      }
+    });
+#ifndef NDEBUG
+    // The removed addInput() asserted input->parent == this; check the same
+    // invariant over the scattered slots, which also catches a slot that no
+    // chunk wrote.
+    for (size_t o = 0; o != numOsecs; ++o)
+      for (ConcatInputSection *isec : denseOsecs[o]->inputs)
+        assert(isec && isec->parent == denseOsecs[o] &&
+               "output section input's parent is not that output section");
+#endif
+    SmallVector<bool, 32> seen(numOsecs, false);
+    for (size_t c = 0; c != numChunks; ++c) {
+      for (size_t o = 0; o != numOsecs; ++o) {
+        const OutputSectionFold &fold = chunkFolds[c][o];
+        if (fold.count == 0)
+          continue;
+        ConcatOutputSection *osec = denseOsecs[o];
+        if (!seen[o]) {
+          seen[o] = true;
+          osec->align = fold.align;
+          // The first input's flags are assigned wholesale; its own
+          // contribution is a subset of them, so |ing the chunk's accumulated
+          // contributions here is exactly the serial result.
+          osec->flags = fold.firstFlags;
+        } else {
+          osec->align = std::max(osec->align, fold.align);
+        }
+        osec->flags |= fold.flagsOr;
+        osec->inputOrder = std::min(osec->inputOrder, fold.inputOrder);
+      }
+    }
   }
 
   // Once all the inputs are added, we can finalize the output section

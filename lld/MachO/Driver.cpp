@@ -2204,12 +2204,23 @@ static SmallVector<StringRef, 0> getAllowableClients(opt::InputArgList &args) {
 
 static void computeColdness() {
   TimeTraceScope timeScope("Compute coldness");
-  for (InputSection *isec : inputSections) {
-    if (!isCodeSection(isec))
-      continue;
-    isec->isCold =
-        llvm::any_of(isec->symbols, [](Defined *sym) { return sym->isCold(); });
-  }
+  // Each section's isCold bit is derived only from its own symbols, so chunks
+  // of the section table are independent.
+  constexpr size_t sectionsPerChunk = 4096;
+  const size_t sectionCount = inputSections.size();
+  const size_t numChunks =
+      (sectionCount + sectionsPerChunk - 1) / sectionsPerChunk;
+  parallelFor(0, numChunks, [&](size_t chunkIndex) {
+    const size_t begin = chunkIndex * sectionsPerChunk;
+    const size_t end = std::min(begin + sectionsPerChunk, sectionCount);
+    for (size_t i = begin; i != end; ++i) {
+      InputSection *isec = inputSections[i];
+      if (!isCodeSection(isec))
+        continue;
+      isec->isCold = llvm::any_of(isec->symbols,
+                                  [](Defined *sym) { return sym->isCold(); });
+    }
+  });
 }
 
 namespace lld {

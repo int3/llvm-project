@@ -180,8 +180,10 @@ UnwindInfoSection::UnwindInfoSection()
 // closest function with unwind info right before in the image. Thus, we add
 // function symbols for each unique address regardless of whether they have
 // associated unwind info.
-void UnwindInfoSection::addSymbol(const Defined *d) {
-  if (d->unwindEntry())
+void UnwindInfoSection::addSymbol(const Defined *d,
+                                  ConcatInputSection *fastIsec,
+                                  bool hasUnwindEntry) {
+  if (hasUnwindEntry)
     allEntriesAreOmitted = false;
   // Most function symbols start at offset zero of a ConcatInputSection. Keep
   // their one-based index in that section; alternate entries and non-concat
@@ -193,18 +195,11 @@ void UnwindInfoSection::addSymbol(const Defined *d) {
     return static_cast<uint32_t>(symbols.size());
   };
   uint32_t index;
-  bool useFallback = d->value != 0;
-  if (!useFallback) {
-    if (auto *isec = dyn_cast_or_null<ConcatInputSection>(d->isec())) {
-      index = isec->unwindSymbolIndex;
-      if (index == 0) {
-        index = isec->unwindSymbolIndex = appendSymbol();
-      }
-    } else {
-      useFallback = true;
-    }
-  }
-  if (useFallback) {
+  if (fastIsec) {
+    index = fastIsec->unwindSymbolIndex;
+    if (index == 0)
+      index = fastIsec->unwindSymbolIndex = appendSymbol();
+  } else {
     auto [it, inserted] = nonZeroSymbols.try_emplace({d->isec(), d->value}, 0);
     if (inserted)
       it->second = appendSymbol();
@@ -213,7 +208,7 @@ void UnwindInfoSection::addSymbol(const Defined *d) {
   // If we have multiple symbols at the same address, only one of them can have
   // an associated unwind entry.
   const Defined *&previous = symbols[index - 1];
-  if (previous != d && d->unwindEntry()) {
+  if (previous != d && hasUnwindEntry) {
     assert(!previous->unwindEntry());
     previous = d;
   }

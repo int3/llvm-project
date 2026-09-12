@@ -43,7 +43,15 @@ public:
   // of `OutputSection::finalize()`.
   virtual void finalizeContents();
 
-  void addInput(ConcatInputSection *input);
+  // Dense index into the createOutputSections() scatter tables. Valid only for
+  // the duration of that function.
+  uint32_t denseIndex = 0;
+
+  // The section flag bits that \p input contributes to a non-first input of an
+  // output section. Folding these with | is associative and commutative, so it
+  // can be accumulated per chunk and merged later.
+  static uint32_t flagsContribution(const InputSection *input);
+
   void writeTo(uint8_t *buf) const override;
 
   static bool classof(const OutputSection *sec) {
@@ -58,9 +66,6 @@ protected:
   size_t size = 0;
   uint64_t fileSize = 0;
   void finalizeOne(ConcatInputSection *);
-
-private:
-  void finalizeFlags(InputSection *input);
 };
 
 // We maintain one ThunkInfo per real function.
