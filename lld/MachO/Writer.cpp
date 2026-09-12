@@ -707,9 +707,22 @@ static void prepareSymbolRelocation(Symbol *sym, const InputSection *isec,
   }
 }
 
+// The ordered-replay events produced by the parallel classification pass.
+// `entryKind` records which synthetic-section entry the event creates, so that
+// repeat references within one chunk can be dropped; `validated` records that a
+// worker already confirmed the relocation's TLV attribute agrees with the
+// symbol, so the serial replay can skip validateSymbolRelocation().
+enum RelocationEntryKind : uint8_t {
+  notAnEntry = 0,
+  stubEntry,
+  gotEntry,
+  tlvEntry,
+};
+
 struct RelocationEvent {
   ConcatInputSection *isec;
   uint32_t index;
+  bool validated;
 };
 
 enum SymbolScanAction : uint8_t {
@@ -750,12 +763,14 @@ static void canonicalizeReferent(Relocation &r) {
     r.setReferent(referentIsec->canonical());
 }
 
-static void replayRelocation(ConcatInputSection *isec, Relocation &r) {
+static void replayRelocation(ConcatInputSection *isec, Relocation &r,
+                             bool validated = false) {
   if (auto *sym = dyn_cast_if_present<Symbol *>(r.getReferent())) {
     if (auto *undefined = dyn_cast<Undefined>(sym))
       treatUndefinedSymbol(*undefined, isec, r.getOffset());
     // treatUndefinedSymbol() can replace sym with a DylibSymbol; re-check.
-    if (!isa<Undefined>(sym) && validateSymbolRelocation(sym, isec, r))
+    if (!isa<Undefined>(sym) &&
+        (validated || validateSymbolRelocation(sym, isec, r)))
       prepareSymbolRelocation(sym, isec, r);
   } else if (!r.isPCRel()) {
     if (config->emitChainedFixups)
@@ -808,6 +823,45 @@ static bool isCompletedRelocation(const ConcatInputSection *isec,
   return r.isPCRel();
 }
 
+// Classifies an event that isCompletedRelocation() rejected. Returns the
+// synthetic-section entry the ordered replay would create for it, or
+// notAnEntry when replay does more than create that entry. Sets *validated
+// when the relocation's TLV attribute already agrees with the symbol, so that
+// the replay need not repeat validateSymbolRelocation().
+//
+// Creating a stub/GOT/TLV entry is idempotent: each addEntry() is
+// `if (entries.insert(sym))`, so every reference after the first to the same
+// (symbol, kind) pair performs only the set lookup and has no other effect.
+// Such repeats can therefore be dropped on the worker, provided the first
+// reference in each chunk survives and chunks replay in order.
+static RelocationEntryKind classifyRelocationEvent(const Relocation &r,
+                                                   bool *validated) {
+  *validated = false;
+  auto *sym = dyn_cast_if_present<Symbol *>(r.getReferent());
+  if (!sym || isa<Undefined>(sym))
+    return notAnEntry;
+
+  const RelocAttrs &relocAttrs = target->getRelocAttrs(r.getType());
+  if (relocAttrs.hasAttr(RelocAttrBits::TLV) != sym->isTlv())
+    return notAnEntry; // validateSymbolRelocation() must diagnose this.
+  *validated = true;
+
+  // prepareSymbolRelocation() diagnoses dead referents; keep those events.
+  if (!sym->isLive())
+    return notAnEntry;
+
+  // isCompletedRelocation() has already accepted the BRANCH/GOT/TLV cases that
+  // need no entry, so any surviving event of these kinds calls addEntry().
+  if (relocAttrs.hasAttr(RelocAttrBits::BRANCH))
+    return stubEntry;
+  if (relocAttrs.hasAttr(RelocAttrBits::GOT))
+    return gotEntry;
+  if (relocAttrs.hasAttr(RelocAttrBits::TLV))
+    return tlvEntry;
+  // UNSIGNED events append rebases or bindings, which are not idempotent.
+  return notAnEntry;
+}
+
 void Writer::scanRelocations() {
   TimeTraceScope timeScope("Scan relocations");
 
@@ -823,6 +877,8 @@ void Writer::scanRelocations() {
     const size_t begin = chunkIndex * sectionsPerChunk;
     const size_t end = std::min(begin + sectionsPerChunk, initialSectionCount);
     std::vector<RelocationEvent> &chunkEvents = events[chunkIndex];
+    // First occurrence per (symbol, entry kind) within this chunk.
+    llvm::DenseSet<std::pair<Symbol *, unsigned>> seenEntries;
     for (size_t i = begin; i != end; ++i) {
       ConcatInputSection *isec = inputSections[i];
       if (isec->shouldOmitFromOutput())
@@ -834,8 +890,17 @@ void Writer::scanRelocations() {
           canonicalizeReferent(isec->relocs[++index]);
           continue;
         }
-        if (!isCompletedRelocation(isec, r))
-          chunkEvents.push_back({isec, static_cast<uint32_t>(index)});
+        if (isCompletedRelocation(isec, r))
+          continue;
+        bool validated;
+        RelocationEntryKind kind = classifyRelocationEvent(r, &validated);
+        if (kind != notAnEntry &&
+            !seenEntries
+                 .insert({cast<Symbol *>(r.getReferent()), unsigned(kind)})
+                 .second)
+          continue;
+        chunkEvents.push_back(
+            {isec, static_cast<uint32_t>(index), validated});
       }
     }
   });
@@ -845,7 +910,8 @@ void Writer::scanRelocations() {
   // replacements.
   for (const std::vector<RelocationEvent> &chunkEvents : events)
     for (const RelocationEvent &event : chunkEvents)
-      replayRelocation(event.isec, event.isec->relocs[event.index]);
+      replayRelocation(event.isec, event.isec->relocs[event.index],
+                       event.validated);
 
   // This cannot use a range-for loop: ordered replay can append sections.
   for (size_t i = initialSectionCount; i < inputSections.size(); ++i)
