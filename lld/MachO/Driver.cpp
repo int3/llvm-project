@@ -832,11 +832,9 @@ static bool walkArchives() {
     if (!ok)
       return false;
 
-  // Two passes over every index entry, both on workers, both read-only on the
-  // symbol table: the earliest provider of each name, and the entries whose name
-  // is in undefined state now, which are the only ones the serial walk has to
-  // look at. Names a direct object or a preceding dylib already defines can never
-  // be extracted for, so they need no provider.
+  // One pass over every index entry, on workers, read-only on the symbol table,
+  // yielding both the earliest provider of each name and the entries the serial
+  // walk has to look at; see below.
   ts.reset();
   providerShards = std::make_unique<ProviderShard[]>(numProviderShards);
   // Every member's undefined names, enumerated on workers. This is the walk's
@@ -884,18 +882,58 @@ static bool walkArchives() {
     if (maxEntries + events > ordinalWalkMax)
       return false;
   }
-  ts.reset(new TimeTraceScope("Filter archive indexes"));
-  parallelFor(0, archives.size(),
-              [&](size_t archiveIndex) { archives[archiveIndex]->filterIndex(); });
-  ts.reset(new TimeTraceScope("Fold archive providers"));
-  parallelForEach(chunks, [&](const EntryChunk &chunk) {
+  // One pass over every index entry, on workers, read-only on the symbol table,
+  // producing both of the things the serial walk needs from it: the earliest
+  // provider of each name, and the entries whose name is in a state the walk can
+  // extract for, which are the only ones it has to look at. These were two
+  // passes, and the second repeated the first one's lookup per entry; but the
+  // provider rule's "skip a name already defined" is exactly the candidate rule's
+  // first test, so one lookup answers both. Chromium's 2.68 M entries pay half
+  // the lookups and one pass over the index arrays instead of two.
+  //
+  // Deriving the providers from the archive bytes alone would take this pass off
+  // the walk's critical path altogether, but then a member undefined naming a
+  // direct object's definition -- the common case -- would reach the table in the
+  // serial select loop instead of failing a provider lookup, which on Chromium is
+  // half a million lookups moved from here into the serial part.
+  ts.reset(new TimeTraceScope("Filter and fold archive indexes"));
+  std::vector<llvm::SmallVector<uint32_t, 0>> chunkCandidates(chunks.size());
+  parallelFor(0, chunks.size(), [&](size_t chunkIndex) {
+    const EntryChunk &chunk = chunks[chunkIndex];
     ArchiveFile *archive = archives[chunk.archiveIndex];
+    llvm::SmallVector<uint32_t, 0> &candidates = chunkCandidates[chunkIndex];
     for (uint32_t entryIndex = chunk.begin; entryIndex != chunk.end;
          ++entryIndex) {
       const ArchiveFile::IndexEntry &entry = archive->indexEntries[entryIndex];
-      if (Symbol *sym = symtab->find(entry.name))
+      // The direct objects are resolved and nothing mutates the table until the
+      // walk begins, so this lookup needs no lock.
+      Symbol *sym = symtab->find(entry.name);
+      if (sym) {
+        // A name a direct object or a preceding dylib already defines can never
+        // be extracted for, so it is neither a candidate nor in need of a
+        // provider.
         if (isa<Defined>(sym) || isa<CommonSymbol>(sym))
           continue;
+        // The candidate test is the negation of the walk's own suppression rule,
+        // not simply "undefined now": this runs after the inputs that follow the
+        // archive have been registered, so a dylib listed after it may be sitting
+        // in a slot whose lazy symbol the serial linker had already put there,
+        // and such an entry is still a candidate.
+        if (isa<Undefined>(sym)) {
+          candidates.push_back(entryIndex);
+        } else if (auto *dysym = dyn_cast<DylibSymbol>(sym)) {
+          // A weak dylib definition never suppresses an extraction; a strong one
+          // does exactly when it was registered before this archive.
+          if (dysym->isReferenced() &&
+              (dysym->isWeakDef() ||
+               (!dysym->isDynamicLookup() &&
+                dysym->getFile()->id > archive->id)))
+            candidates.push_back(entryIndex);
+        }
+      }
+      // A name nothing has mentioned yet is not a candidate, but it still needs a
+      // provider: a member the walk extracts later can be the first to reference
+      // it.
       ArchiveProvider provider{chunk.archiveIndex, entryIndex,
                                entry.childOffset};
       ProviderShard &shard = providerShards[providerShardOf(entry.name)];
@@ -905,7 +943,21 @@ static bool walkArchives() {
         it->second = provider;
     }
   });
+  // The walk visits an archive's candidates in index order. The chunks are built
+  // archive by archive with ascending begins, so concatenating their candidate
+  // lists in chunk order is that order.
+  {
+    std::vector<size_t> counts(archives.size(), 0);
+    for (size_t i = 0, e = chunks.size(); i != e; ++i)
+      counts[chunks[i].archiveIndex] += chunkCandidates[i].size();
+    for (size_t i = 0, e = archives.size(); i != e; ++i)
+      archives[i]->candidateEntries.reserve(counts[i]);
+    for (size_t i = 0, e = chunks.size(); i != e; ++i)
+      archives[chunks[i].archiveIndex]->candidateEntries.append(
+          chunkCandidates[i].begin(), chunkCandidates[i].end());
+  }
 
+  ts.reset(new TimeTraceScope("Suppress weak dylib overrides"));
   // A weak dylib definition that nothing has referenced yet is not what the
   // serial linker had in the slot when an archive member's definition arrived:
   // the archive's index entry replaced it with a LazyArchive symbol first, and
@@ -914,8 +966,8 @@ static bool walkArchives() {
   // still there and both the fold and the post-phase path would set one. Mark
   // them here -- after the direct objects have taken their references, which is
   // the state at the archive's own position -- and suppress the override on both
-  // paths. filterIndex() drops such an entry from the candidates for the same
-  // reason, so the walk itself never extracts at it.
+  // paths. The candidate test above drops such an entry for the same reason, so
+  // the walk itself never extracts at it.
   for (unsigned i = 0; i != numProviderShards; ++i)
     for (const auto &entry : providerShards[i].map) {
       Symbol *sym = symtab->find(entry.first);
@@ -1173,8 +1225,8 @@ static bool walkArchives() {
       // Same two pure tests as the undefined walk: an entry whose name a
       // member extracted earlier already provides created nothing in the serial
       // linker, and every candidate entry has a provider by construction (the
-      // provider pass skips only names already defined, which filterIndex also
-      // skips).
+      // merged pass gives an entry a provider unless its name is already
+      // defined, which is also the first thing that disqualifies a candidate).
       ArchiveProvider *entryProvider = lookupArchiveProvider(entry.name);
       if (entryProvider && entryProvider->extracted)
         continue;

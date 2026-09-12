@@ -3294,36 +3294,6 @@ bool ArchiveFile::fillMemberUndefineds(uint64_t childOffset) {
   return true;
 }
 
-void ArchiveFile::filterIndex() {
-  // The direct objects are resolved and nothing mutates the table until the walk
-  // begins, so these lookups need no lock. The test is the negation of the walk's
-  // own suppression rule, not simply "undefined now": this runs after the inputs
-  // that follow the archive have been registered, so a dylib listed after it may
-  // be sitting in a slot whose lazy symbol the serial linker had already put
-  // there, and such an entry is still a candidate.
-  for (uint32_t i = 0, e = indexEntries.size(); i != e; ++i) {
-    Symbol *sym = symtab->find(indexEntries[i].name);
-    // Never mentioned, so nothing ever asks this archive for it.
-    if (!sym)
-      continue;
-    if (isa<Defined>(sym) || isa<CommonSymbol>(sym))
-      continue;
-    if (isa<Undefined>(sym)) {
-      candidateEntries.push_back(i);
-      continue;
-    }
-    if (auto *dysym = dyn_cast<DylibSymbol>(sym)) {
-      if (!dysym->isReferenced())
-        continue;
-      // A weak dylib definition never suppresses an extraction; a strong one
-      // does exactly when it was registered before this archive.
-      if (dysym->isWeakDef() ||
-          (!dysym->isDynamicLookup() && dysym->getFile()->id > id))
-        candidateEntries.push_back(i);
-    }
-  }
-}
-
 bool ArchiveFile::buildIndex() {
   if (file->isEmpty() ||
       (file->hasSymbolTable() && file->getNumberOfSymbols() == 0))

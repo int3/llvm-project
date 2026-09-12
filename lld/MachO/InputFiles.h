@@ -498,9 +498,10 @@ public:
   // belongs at the position of the earliest index entry that names it, because
   // that is where the serial linker created its slot.
   llvm::SmallVector<IndexEntry, 0> indexEntries;
-  // Index entries whose name is in undefined state once the direct objects are
-  // resolved, in index order. Computed on a worker; the serial walk visits only
-  // these, plus entries a member's undefined symbol schedules.
+  // Index entries whose name is in a state the walk can extract for once every
+  // input has been registered, in index order. Computed on workers, in the same
+  // pass that folds the providers (see walkArchives()); the serial walk visits
+  // only these, plus entries a member's undefined symbol schedules.
   llvm::SmallVector<uint32_t, 0> candidateEntries;
   // Index entries whose name is an ObjC class symbol, in index order: the first
   // pass of a MandatoryLoad::ObjC prelude. Filled by buildIndex(), and only for
@@ -547,8 +548,6 @@ public:
     assert(it != memberObjC.end());
     return it->second;
   }
-  // Fill candidateEntries. Read-only on the symbol table; safe on a worker.
-  void filterIndex();
   // buildIndex() reads the archive's symbol table in order, which is all the
   // Archive API allows, and records a name and the symbol's coordinates per
   // entry. resolveIndexOffsets() then fills in each entry's member offset --
