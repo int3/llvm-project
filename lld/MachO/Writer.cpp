@@ -712,22 +712,52 @@ static void prepareSymbolRelocation(Symbol *sym, const InputSection *isec,
 }
 
 // The ordered-replay events produced by the parallel classification pass.
-// `entryKind` records which synthetic-section entry the event creates, so that
-// repeat references within one chunk can be dropped; `validated` records that a
-// worker already confirmed the relocation's TLV attribute agrees with the
-// symbol, so the serial replay can skip validateSymbolRelocation().
-enum RelocationEntryKind : uint8_t {
-  notAnEntry = 0,
+//
+// `kind` records what the serial replay must do. Every kind other than
+// `needsRelocation` is self-contained: the worker has already read the
+// relocation, resolved the referent, and decided which synthetic-section call
+// the replay makes, so the replay never touches `isec->relocs` again. That
+// matters because the relocation vectors are large and cold by the time the
+// replay runs (170 MB on Chromium debug), and the replay is serial.
+//
+// `needsRelocation` events are the ones a worker cannot finish: an Undefined
+// referent (`treatUndefinedSymbol()` mutates global state and its diagnostic
+// lists every referencing section), a TLV attribute that disagrees with the
+// symbol (`validateSymbolRelocation()` must diagnose it), a dead referent (the
+// `-init_offsets` fatal), and any referent that is neither Defined nor a
+// DylibSymbol. Those keep the relocation index in `offset` and run the original
+// `replayRelocation()` path, so diagnostics are unchanged.
+//
+// Creating a stub/GOT/TLV entry is idempotent: each addEntry() is
+// `if (entries.insert(sym))`, so every reference after the first to the same
+// (symbol, kind) pair performs only the set lookup and has no other effect.
+// Such repeats can therefore be dropped on the worker, provided the first
+// reference in each chunk survives and chunks replay in order.
+enum RelocationEventKind : uint8_t {
+  // Not an event: the worker proved the replay would do nothing.
+  noEvent = 0,
+  needsRelocation,
   stubEntry,
   gotEntry,
   tlvEntry,
+  // addNonLazyBindingEntries(sym, isec, offset, addend).
+  bindingEntry,
+  // A section referent that is not PC-relative: push one rebase.
+  rebaseEntry,
 };
 
 struct RelocationEvent {
+  // Null for rebaseEntry.
+  Symbol *sym;
   ConcatInputSection *isec;
-  uint32_t index;
-  bool validated;
+  // bindingEntry only.
+  int64_t addend;
+  // The relocation's offset, or its index in isec->relocs when
+  // kind == needsRelocation.
+  uint32_t offset;
+  RelocationEventKind kind;
 };
+static_assert(sizeof(RelocationEvent) == 32, "keep the replay event compact");
 
 enum SymbolScanAction : uint8_t {
   nonWeakDefinition = 1 << 0,
@@ -767,14 +797,12 @@ static void canonicalizeReferent(Relocation &r) {
     r.setReferent(referentIsec->canonical());
 }
 
-static void replayRelocation(ConcatInputSection *isec, Relocation &r,
-                             bool validated = false) {
+static void replayRelocation(ConcatInputSection *isec, Relocation &r) {
   if (auto *sym = dyn_cast_if_present<Symbol *>(r.getReferent())) {
     if (auto *undefined = dyn_cast<Undefined>(sym))
       treatUndefinedSymbol(*undefined, isec, r.getOffset());
     // treatUndefinedSymbol() can replace sym with a DylibSymbol; re-check.
-    if (!isa<Undefined>(sym) &&
-        (validated || validateSymbolRelocation(sym, isec, r)))
+    if (!isa<Undefined>(sym) && validateSymbolRelocation(sym, isec, r))
       prepareSymbolRelocation(sym, isec, r);
   } else if (!r.isPCRel()) {
     if (config->emitChainedFixups)
@@ -801,69 +829,82 @@ static void scanSectionRelocations(ConcatInputSection *isec) {
   }
 }
 
-static bool isCompletedRelocation(const ConcatInputSection *isec,
-                                  const Relocation &r) {
-  if (auto *sym = dyn_cast_if_present<Symbol *>(r.getReferent())) {
-    // Keep all cases that can diagnose or mutate global linker state in the
-    // ordered replay below.
-    if ((!isa<Defined>(sym) && !isa<DylibSymbol>(sym)) || !sym->isLive())
-      return false;
-
-    const RelocAttrs &relocAttrs = target->getRelocAttrs(r.getType());
-    if (relocAttrs.hasAttr(RelocAttrBits::TLV) != sym->isTlv())
-      return false;
-    if (relocAttrs.hasAttr(RelocAttrBits::BRANCH))
-      return !needsBinding(sym);
-    if (relocAttrs.hasAttr(RelocAttrBits::GOT))
-      return !relocAttrs.hasAttr(RelocAttrBits::POINTER) &&
-             !needsBinding(sym);
-    if (relocAttrs.hasAttr(RelocAttrBits::TLV))
-      return !needsBinding(sym);
-    if (relocAttrs.hasAttr(RelocAttrBits::UNSIGNED))
-      return isThreadLocalVariables(isec->getFlags()) && isa<Defined>(sym);
-    return true;
-  }
-
-  return r.isPCRel();
-}
-
-// Classifies an event that isCompletedRelocation() rejected. Returns the
-// synthetic-section entry the ordered replay would create for it, or
-// notAnEntry when replay does more than create that entry. Sets *validated
-// when the relocation's TLV attribute already agrees with the symbol, so that
-// the replay need not repeat validateSymbolRelocation().
-//
-// Creating a stub/GOT/TLV entry is idempotent: each addEntry() is
-// `if (entries.insert(sym))`, so every reference after the first to the same
-// (symbol, kind) pair performs only the set lookup and has no other effect.
-// Such repeats can therefore be dropped on the worker, provided the first
-// reference in each chunk survives and chunks replay in order.
-static RelocationEntryKind classifyRelocationEvent(const Relocation &r,
-                                                   bool *validated) {
-  *validated = false;
+// Classifies a relocation into the one call the serial replay must make for it,
+// or noEvent when the replay would do nothing. This runs on a worker, which
+// already has the relocation and the referent in cache, so the decision that
+// prepareSymbolRelocation() would make -- including needsBinding(sym) and
+// isThreadLocalVariables(isec->getFlags()) -- is made here, once per
+// relocation, rather than in the replay. Kinds other than needsRelocation
+// therefore leave the replay with nothing to read but the event itself.
+static RelocationEventKind
+classifyRelocation(const ConcatInputSection *isec, const Relocation &r) {
   auto *sym = dyn_cast_if_present<Symbol *>(r.getReferent());
-  if (!sym || isa<Undefined>(sym))
-    return notAnEntry;
+  if (!sym) {
+    // A PC-relative section referent needs nothing; any other one becomes a
+    // single rebase push.
+    return r.isPCRel() ? noEvent : rebaseEntry;
+  }
+  // treatUndefinedSymbol() can replace the symbol and its diagnostic must list
+  // every referencing section in order.
+  if (isa<Undefined>(sym))
+    return needsRelocation;
 
   const RelocAttrs &relocAttrs = target->getRelocAttrs(r.getType());
   if (relocAttrs.hasAttr(RelocAttrBits::TLV) != sym->isTlv())
-    return notAnEntry; // validateSymbolRelocation() must diagnose this.
-  *validated = true;
+    return needsRelocation; // validateSymbolRelocation() decides this one.
 
   // prepareSymbolRelocation() diagnoses dead referents; keep those events.
   if (!sym->isLive())
-    return notAnEntry;
+    return needsRelocation;
+  if (!isa<Defined>(sym) && !isa<DylibSymbol>(sym))
+    return needsRelocation;
 
-  // isCompletedRelocation() has already accepted the BRANCH/GOT/TLV cases that
-  // need no entry, so any surviving event of these kinds calls addEntry().
+  // These mirror prepareSymbolRelocation() exactly: noEvent is returned for
+  // precisely the cases in which it creates no entry and pushes no opcode.
   if (relocAttrs.hasAttr(RelocAttrBits::BRANCH))
-    return stubEntry;
+    return needsBinding(sym) ? stubEntry : noEvent;
   if (relocAttrs.hasAttr(RelocAttrBits::GOT))
-    return gotEntry;
+    return relocAttrs.hasAttr(RelocAttrBits::POINTER) || needsBinding(sym)
+               ? gotEntry
+               : noEvent;
   if (relocAttrs.hasAttr(RelocAttrBits::TLV))
-    return tlvEntry;
-  // UNSIGNED events append rebases or bindings, which are not idempotent.
-  return notAnEntry;
+    return needsBinding(sym) ? tlvEntry : noEvent;
+  if (relocAttrs.hasAttr(RelocAttrBits::UNSIGNED))
+    return isThreadLocalVariables(isec->getFlags()) && isa<Defined>(sym)
+               ? noEvent
+               : bindingEntry;
+  return noEvent;
+}
+
+// Performs the one call the worker selected, in replay order. The arguments are
+// the same ones prepareSymbolRelocation() and replayRelocation() would pass.
+static void replayRelocationEvent(const RelocationEvent &event) {
+  switch (event.kind) {
+  case needsRelocation:
+    replayRelocation(event.isec, event.isec->relocs[event.offset]);
+    return;
+  case stubEntry:
+    in.stubs->addEntry(event.sym);
+    return;
+  case gotEntry:
+  case tlvEntry:
+    // A GOT and a TLV reference share the symbol's single __got slot, exactly
+    // as in prepareSymbolRelocation().
+    addNonLazyPointerEntry(event.sym);
+    return;
+  case bindingEntry:
+    addNonLazyBindingEntries(event.sym, event.isec, event.offset, event.addend);
+    return;
+  case rebaseEntry:
+    if (config->emitChainedFixups)
+      in.chainedFixups->addRebase(event.isec, event.offset);
+    else
+      in.rebase->addEntry(event.isec, event.offset);
+    return;
+  case noEvent:
+    break;
+  }
+  llvm_unreachable("unclassified relocation replay event");
 }
 
 void Writer::scanRelocations() {
@@ -894,17 +935,31 @@ void Writer::scanRelocations() {
           canonicalizeReferent(isec->relocs[++index]);
           continue;
         }
-        if (isCompletedRelocation(isec, r))
+        RelocationEventKind kind = classifyRelocation(isec, r);
+        switch (kind) {
+        case noEvent:
           continue;
-        bool validated;
-        RelocationEntryKind kind = classifyRelocationEvent(r, &validated);
-        if (kind != notAnEntry &&
-            !seenEntries
-                 .insert({cast<Symbol *>(r.getReferent()), unsigned(kind)})
-                 .second)
+        case needsRelocation:
+          chunkEvents.push_back(
+              {nullptr, isec, 0, static_cast<uint32_t>(index), kind});
           continue;
-        chunkEvents.push_back(
-            {isec, static_cast<uint32_t>(index), validated});
+        case stubEntry:
+        case gotEntry:
+        case tlvEntry: {
+          Symbol *sym = cast<Symbol *>(r.getReferent());
+          if (!seenEntries.insert({sym, unsigned(kind)}).second)
+            continue;
+          chunkEvents.push_back({sym, isec, 0, r.getOffset(), kind});
+          continue;
+        }
+        case bindingEntry:
+          chunkEvents.push_back({cast<Symbol *>(r.getReferent()), isec,
+                                 r.getAddend(), r.getOffset(), kind});
+          continue;
+        case rebaseEntry:
+          chunkEvents.push_back({nullptr, isec, 0, r.getOffset(), kind});
+          continue;
+        }
       }
     }
   });
@@ -914,8 +969,7 @@ void Writer::scanRelocations() {
   // replacements.
   for (const std::vector<RelocationEvent> &chunkEvents : events)
     for (const RelocationEvent &event : chunkEvents)
-      replayRelocation(event.isec, event.isec->relocs[event.index],
-                       event.validated);
+      replayRelocationEvent(event);
 
   // This cannot use a range-for loop: ordered replay can append sections.
   for (size_t i = initialSectionCount; i < inputSections.size(); ++i)
@@ -975,6 +1029,10 @@ void Writer::scanSymbols() {
 
   // Replay in symVector order. The unwind insertion index is used by layout,
   // and a definition's weak-binding effect precedes its unwind effect.
+  size_t candidateCount = 0;
+  for (const auto &candidates : globalCandidates)
+    candidateCount += candidates.size();
+  in.unwindInfo->reserveSymbols(candidateCount);
   for (const auto &candidates : globalCandidates) {
     for (const SymbolScanCandidate &candidate : candidates) {
       if (candidate.actions & nonWeakDefinition)
@@ -1010,6 +1068,10 @@ void Writer::scanSymbols() {
                               defined->unwindEntry() != nullptr});
     }
   });
+  candidateCount = 0;
+  for (const auto &candidates : localCandidates)
+    candidateCount += candidates.size();
+  in.unwindInfo->reserveSymbols(candidateCount);
   for (const auto &candidates : localCandidates)
     for (const UnwindScanCandidate &candidate : candidates)
       in.unwindInfo->addSymbol(candidate.sym, candidate.isec,

@@ -192,6 +192,7 @@ void UnwindInfoSection::addSymbol(const Defined *d,
     if (symbols.size() == std::numeric_limits<uint32_t>::max())
       fatal("too many unwind symbols");
     symbols.push_back(d);
+    symbolHasEntry.push_back(false);
     return static_cast<uint32_t>(symbols.size());
   };
   uint32_t index;
@@ -212,28 +213,36 @@ void UnwindInfoSection::addSymbol(const Defined *d,
     assert(!previous->unwindEntry());
     previous = d;
   }
+  // Only one symbol per slot can carry an unwind entry, so the slot's final
+  // occupant has one exactly when any call for this slot did. Recording that
+  // here lets prepare() dereference only the slots that matter.
+  if (hasUnwindEntry)
+    symbolHasEntry.set(index - 1);
 }
 
 void UnwindInfoSectionImpl::prepare() {
   // This iteration needs to be deterministic, since prepareRelocations may add
-  // entries to the GOT. symbols preserves Writer::scanSymbols() order.
-  for (const Defined *d : symbols)
-    if (d->unwindEntry()) {
-      if (d->unwindEntry()->getName() == section_names::compactUnwind) {
-        prepareRelocations(d->unwindEntry());
-      } else {
-        // We don't have to add entries to the GOT here because FDEs have
-        // explicit GOT relocations, so Writer::scanRelocations() will add those
-        // GOT entries. However, we still need to canonicalize the personality
-        // pointers (like prepareRelocations() does for CU entries) in order
-        // to avoid overflowing the 3-personality limit.
-        FDE &fde = cast<ObjFile>(d->getFile())->fdes[d->unwindEntry()];
-        fde.personality = canonicalizePersonality(fde.personality);
-        // If ICF folded the LSDA, point at the surviving copy.
-        if (fde.lsda)
-          fde.lsda = fde.lsda->canonical();
-      }
+  // entries to the GOT. symbols preserves Writer::scanSymbols() order, and
+  // set_bits() walks the flagged slots in that same order; the unflagged
+  // slots, which are the majority, are never dereferenced.
+  for (unsigned i : symbolHasEntry.set_bits()) {
+    const Defined *d = symbols[i];
+    assert(d->unwindEntry());
+    if (d->unwindEntry()->getName() == section_names::compactUnwind) {
+      prepareRelocations(d->unwindEntry());
+    } else {
+      // We don't have to add entries to the GOT here because FDEs have
+      // explicit GOT relocations, so Writer::scanRelocations() will add those
+      // GOT entries. However, we still need to canonicalize the personality
+      // pointers (like prepareRelocations() does for CU entries) in order
+      // to avoid overflowing the 3-personality limit.
+      FDE &fde = cast<ObjFile>(d->getFile())->fdes[d->unwindEntry()];
+      fde.personality = canonicalizePersonality(fde.personality);
+      // If ICF folded the LSDA, point at the surviving copy.
+      if (fde.lsda)
+        fde.lsda = fde.lsda->canonical();
     }
+  }
 }
 
 // Compact unwind relocations have different semantics, so we handle them in a

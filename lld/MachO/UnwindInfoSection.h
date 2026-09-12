@@ -11,6 +11,7 @@
 
 #include "ConcatOutputSection.h"
 #include "SyntheticSections.h"
+#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
 
 namespace lld::macho {
@@ -27,12 +28,21 @@ public:
   // replay does not have to dereference the Defined.
   void addSymbol(const Defined *d, ConcatInputSection *fastIsec,
                  bool hasUnwindEntry);
+  // Grow the symbol slots and their entry bits for up to \p n more
+  // addSymbol() calls, so neither reallocates once per slot.
+  void reserveSymbols(size_t n) {
+    symbols.reserve(symbols.size() + n);
+    symbolHasEntry.reserve(symbols.size() + n);
+  }
   virtual void prepare() = 0;
 
 protected:
   UnwindInfoSection();
 
   std::vector<const Defined *> symbols;
+  // symbolHasEntry[i] is set when symbols[i]->unwindEntry() is non-null, so
+  // prepare() need not dereference every recorded symbol.
+  llvm::BitVector symbolHasEntry;
   llvm::DenseMap<
       std::pair<const InputSection *, uint64_t /*Defined::value*/>, uint32_t>
       nonZeroSymbols;
