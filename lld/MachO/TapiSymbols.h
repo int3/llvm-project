@@ -19,21 +19,84 @@
 #ifndef LLD_MACHO_TAPI_SYMBOLS_H
 #define LLD_MACHO_TAPI_SYMBOLS_H
 
+#include "llvm/ADT/CachedHashString.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Allocator.h"
 #include "llvm/TextAPI/InterfaceFile.h"
+#include <memory>
 #include <vector>
 
 namespace lld::macho {
+
+// A publishable symbol under its final linker name -- the ObjC class,
+// metaclass, EH-type and ivar prefixes are already applied -- with the name
+// hash computed once, off the ordered walk.
+struct PreparedTapiName {
+  explicit PreparedTapiName(llvm::CachedHashStringRef name, bool isWeakDef,
+                            bool isTlv)
+      : name(name), isWeakDef(isWeakDef), isTlv(isTlv) {}
+
+  llvm::CachedHashStringRef name;
+  bool isWeakDef;
+  bool isTlv;
+};
+
+// Which of the three "$ld$" actions a record carries. Records for any other
+// action are not created: handleLDSymbol() consumes them without an effect.
+enum class PreparedLDAction : uint8_t { Previous, InstallName, Hide };
+
+// A "$ld$" string that does not parse still warns, at its original position and
+// with its original text, so the parse failure travels as a record rather than
+// being applied.
+enum class PreparedLDWarning : uint8_t {
+  None,
+  StartVersion,
+  EndVersion,
+  CompatVersion,
+  OSVersion,
+  HiddenVersion,
+};
+
+// A pre-parsed "$ld$" symbol. Everything the ordered thread still has to do is
+// mutate the dylib or the symbol table; all of the splitting, the version
+// parsing and the platform and deployment-window tests happened on a worker.
+// Records whose action cannot apply to this target -- a platform, a version
+// window or an "os<version>" condition that excludes it -- are dropped during
+// preparation, because handleLDSymbol() would have returned without an effect.
+// Every record that survives preparation therefore applies.
+struct PreparedLDSymbol {
+  PreparedLDAction action = PreparedLDAction::Previous;
+  PreparedLDWarning warning = PreparedLDWarning::None;
+  // Previous: a compatibility version was given and parsed, so it replaces both
+  // the dylib's compatibility version and a synthetic dylib's current version.
+  bool hasCompatVersion = false;
+  uint32_t compatVersion = 0;
+  // The whole "$ld$..." name, for the diagnostics. Points into the interface.
+  llvm::StringRef originalName;
+  // Previous and InstallName.
+  llvm::StringRef installName;
+  // Previous: the symbol to add to the synthetic dylib; empty when the record
+  // renames the dylib it is in.
+  llvm::StringRef symbolName;
+  // Hide: the name to hide, in the prepared allocator so that it outlives the
+  // interface, with its hash computed once.
+  llvm::CachedHashStringRef hiddenName{llvm::StringRef()};
+};
 
 // Which symbols need the ordered handleLDSymbol() call, and the deterministic
 // order of the remaining publishable symbols. Nothing here touches the symbol
 // table, the string saver or any other ordered state.
 struct PreparedTapiSymbols {
-  // Arch-compatible "$ld$" symbols, in interface order. handleLDSymbol() still
-  // runs on these, in this order, on the ordered thread.
-  std::vector<const llvm::MachO::Symbol *> ldSymbols;
-  // The remaining arch-compatible symbols of a publishable kind, sorted by
-  // name because interface symbol order is non-deterministic.
-  std::vector<const llvm::MachO::Symbol *> normalSymbols;
+  // Names materialized off the ordered walk. Ownership moves to the DylibFile,
+  // so the names outlive the InterfaceFile they were read from.
+  std::unique_ptr<llvm::BumpPtrAllocator> names;
+  // Arch-compatible "$ld$" symbols that can still have an effect, in interface
+  // order. The ordered thread applies them in this order.
+  std::vector<PreparedLDSymbol> ldSymbols;
+  // The remaining arch-compatible symbols of a publishable kind under their
+  // final names, ordered by interface symbol name (interface symbol order is
+  // non-deterministic) and then by the order the names are derived in.
+  std::vector<PreparedTapiName> normalNames;
 };
 
 } // namespace lld::macho

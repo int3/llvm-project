@@ -2405,17 +2405,167 @@ static bool isTargetPlatformArchCompatible(
   return isArchABICompatible(archSet, target.Arch);
 }
 
+// Copies prefix + suffix, NUL-terminated, into the prepared allocator. The
+// result outlives the InterfaceFile, because the allocator moves to the
+// DylibFile.
+static StringRef saveTapiName(llvm::BumpPtrAllocator &alloc, StringRef prefix,
+                              StringRef suffix) {
+  size_t size = prefix.size() + suffix.size();
+  char *p = alloc.Allocate<char>(size + 1);
+  if (!prefix.empty())
+    memcpy(p, prefix.data(), prefix.size());
+  if (!suffix.empty())
+    memcpy(p + prefix.size(), suffix.data(), suffix.size());
+  p[size] = '\0';
+  return StringRef(p, size);
+}
+
+// Pre-parses one "$ld$" name into a record, dropping it when the action it
+// names cannot have an effect on this target. Everything read here is either
+// the name itself or immutable config, so this runs off the ordered walk; the
+// record carries the parse failures so that the warnings still come from the
+// ordered thread, in the original order and with the original text.
+static void prepareLDSymbol(llvm::BumpPtrAllocator &alloc,
+                            StringRef originalName,
+                            std::vector<PreparedLDSymbol> &out) {
+  StringRef action;
+  StringRef name;
+  std::tie(action, name) = originalName.drop_front(strlen("$ld$")).split('$');
+
+  if (action == "previous") {
+    // originalName: $ld$ previous $ <installname> $ <compatversion> $
+    // <platformstr> $ <startversion> $ <endversion> $ <symbol-name> $
+    StringRef installName;
+    StringRef compatVersion;
+    StringRef platformStr;
+    StringRef startVersion;
+    StringRef endVersion;
+    StringRef symbolName;
+    StringRef rest;
+    std::tie(installName, name) = name.split('$');
+    std::tie(compatVersion, name) = name.split('$');
+    std::tie(platformStr, name) = name.split('$');
+    std::tie(startVersion, name) = name.split('$');
+    std::tie(endVersion, name) = name.split('$');
+    std::tie(symbolName, rest) = name.rsplit('$');
+
+    // FIXME: Does this do the right thing for zippered files?
+    unsigned platform;
+    if (platformStr.getAsInteger(10, platform) ||
+        platform != static_cast<unsigned>(config->platform()))
+      return;
+
+    PreparedLDSymbol record;
+    record.action = PreparedLDAction::Previous;
+    record.originalName = originalName;
+
+    VersionTuple start;
+    if (start.tryParse(startVersion)) {
+      record.warning = PreparedLDWarning::StartVersion;
+      out.push_back(record);
+      return;
+    }
+    VersionTuple end;
+    if (end.tryParse(endVersion)) {
+      record.warning = PreparedLDWarning::EndVersion;
+      out.push_back(record);
+      return;
+    }
+    if (config->platformInfo.target.MinDeployment < start ||
+        config->platformInfo.target.MinDeployment >= end)
+      return;
+
+    if (!compatVersion.empty()) {
+      VersionTuple cVersion;
+      if (cVersion.tryParse(compatVersion)) {
+        record.warning = PreparedLDWarning::CompatVersion;
+        out.push_back(record);
+        return;
+      }
+      record.hasCompatVersion = true;
+      record.compatVersion = encodeVersion(cVersion);
+    }
+    record.installName = installName;
+    record.symbolName = symbolName;
+    out.push_back(record);
+    return;
+  }
+
+  if (action == "install_name") {
+    // originalName: $ld$ install_name $ os<version> $ install_name
+    StringRef condition, installName;
+    std::tie(condition, installName) = name.split('$');
+    PreparedLDSymbol record;
+    record.action = PreparedLDAction::InstallName;
+    record.originalName = originalName;
+    VersionTuple version;
+    if (!condition.consume_front("os") || version.tryParse(condition)) {
+      record.warning = PreparedLDWarning::OSVersion;
+      out.push_back(record);
+      return;
+    }
+    // A condition that does not match the deployment target leaves
+    // handleLDInstallNameSymbol() without an effect, so it needs no record.
+    if (version != config->platformInfo.target.MinDeployment)
+      return;
+    record.installName = installName;
+    out.push_back(record);
+    return;
+  }
+
+  if (action == "hide") {
+    StringRef symbolName;
+    bool shouldHide = true;
+    if (name.starts_with("os")) {
+      // If it's hidden based on versions.
+      name = name.drop_front(2);
+      StringRef minVersion;
+      std::tie(minVersion, symbolName) = name.split('$');
+      VersionTuple versionTup;
+      if (versionTup.tryParse(minVersion)) {
+        PreparedLDSymbol record;
+        record.action = PreparedLDAction::Hide;
+        record.originalName = originalName;
+        record.warning = PreparedLDWarning::HiddenVersion;
+        out.push_back(record);
+        return;
+      }
+      shouldHide = versionTup == config->platformInfo.target.MinDeployment;
+    } else {
+      symbolName = name;
+    }
+    if (!shouldHide)
+      return;
+    PreparedLDSymbol record;
+    record.action = PreparedLDAction::Hide;
+    record.originalName = originalName;
+    // The hidden name is read again while later re-exports of this umbrella
+    // publish their symbols, so it goes into the prepared allocator.
+    record.hiddenName =
+        CachedHashStringRef(saveTapiName(alloc, StringRef(), symbolName));
+    out.push_back(record);
+    return;
+  }
+
+  // Any other action is a no-op in handleLDSymbol(); it needs no record.
+}
+
 void macho::prepareTapiSymbols(const InterfaceFile &interface,
                                PreparedTapiSymbols &prepared) {
-  prepared.normalSymbols.reserve(interface.symbolsCount());
+  prepared.names = std::make_unique<llvm::BumpPtrAllocator>();
+  llvm::BumpPtrAllocator &alloc = *prepared.names;
+
+  std::vector<const llvm::MachO::Symbol *> normalSymbols;
+  normalSymbols.reserve(interface.symbolsCount());
   for (const auto *symbol : interface.symbols()) {
     if (!isArchABICompatible(symbol->getArchitectures(), config->arch()))
       continue;
-    // handleLDSymbol() mutates the dylib and the symbol table, so it stays on
-    // the ordered thread; record which symbols it consumes. It consumes
-    // exactly the "$ld$"-prefixed names.
+    // handleLDSymbol() mutates the dylib and the symbol table, so those
+    // mutations stay on the ordered thread; everything else about a "$ld$"
+    // symbol -- and it consumes exactly the "$ld$"-prefixed names -- is parsed
+    // here.
     if (symbol->getName().starts_with("$ld$")) {
-      prepared.ldSymbols.push_back(symbol);
+      prepareLDSymbol(alloc, symbol->getName(), prepared.ldSymbols);
       continue;
     }
 
@@ -2424,17 +2574,45 @@ void macho::prepareTapiSymbols(const InterfaceFile &interface,
     case EncodeKind::ObjectiveCClass:
     case EncodeKind::ObjectiveCClassEHType:
     case EncodeKind::ObjectiveCInstanceVariable:
-      prepared.normalSymbols.push_back(symbol);
+      normalSymbols.push_back(symbol);
     }
   }
   // interface.symbols() order is non-deterministic.
-  llvm::sort(prepared.normalSymbols,
+  llvm::sort(normalSymbols,
              [](auto *l, auto *r) { return l->getName() < r->getName(); });
+
+  // Materialize the final names -- the ObjC prefixes included -- and hash each
+  // one once, in exactly the order the ordered thread will publish them.
+  prepared.normalNames.reserve(normalSymbols.size());
+  auto add = [&](const llvm::MachO::Symbol &symbol, StringRef prefix) {
+    prepared.normalNames.emplace_back(
+        CachedHashStringRef(saveTapiName(alloc, prefix, symbol.getName())),
+        symbol.isWeakDefined(), symbol.isThreadLocalValue());
+  };
+  for (const auto *symbol : normalSymbols) {
+    switch (symbol->getKind()) {
+    case EncodeKind::GlobalSymbol:
+      add(*symbol, StringRef());
+      break;
+    case EncodeKind::ObjectiveCClass:
+      // XXX ld64 only creates these symbols when -ObjC is passed in. We may
+      // want to emulate that.
+      add(*symbol, objc::symbol_names::klass);
+      add(*symbol, objc::symbol_names::metaclass);
+      break;
+    case EncodeKind::ObjectiveCClassEHType:
+      add(*symbol, objc::symbol_names::ehtype);
+      break;
+    case EncodeKind::ObjectiveCInstanceVariable:
+      add(*symbol, objc::symbol_names::ivar);
+      break;
+    }
+  }
 }
 
 DylibFile::DylibFile(const InterfaceFile &interface, DylibFile *umbrella,
                      bool isBundleLoader, bool explicitlyLinked,
-                     const PreparedTapiSymbols *preparedSymbols)
+                     PreparedTapiSymbols *preparedSymbols)
     : InputFile(DylibKind, interface), refState(RefState::Unreferenced),
       explicitlyLinked(explicitlyLinked), isBundleLoader(isBundleLoader) {
   // FIXME: Add test for the missing TBD code path.
@@ -2486,39 +2664,50 @@ DylibFile::DylibFile(const InterfaceFile &interface, DylibFile *umbrella,
                                        symbol.isThreadLocalValue()));
   };
 
-  std::vector<const llvm::MachO::Symbol *> ownedNormalSymbols;
-  const std::vector<const llvm::MachO::Symbol *> *normalSymbols;
   if (preparedSymbols) {
-    // The arch filter, the kind classification and the name sort were done off
-    // the ordered walk; the ordered side effects still happen here, in the same
-    // order as the single-pass loop below.
-    for (const llvm::MachO::Symbol *symbol : preparedSymbols->ldSymbols)
-      handleLDSymbol(symbol->getName());
-    normalSymbols = &preparedSymbols->normalSymbols;
-  } else {
-    ownedNormalSymbols.reserve(interface.symbolsCount());
-    for (const auto *symbol : interface.symbols()) {
-      if (!isArchABICompatible(symbol->getArchitectures(), config->arch()))
-        continue;
-      if (handleLDSymbol(symbol->getName()))
-        continue;
+    // The arch filter, the kind classification, the name sort, the final names
+    // and their hashes, and the "$ld$" parsing were all done off the ordered
+    // walk; the ordered side effects still happen here, in the same order as
+    // the single-pass loop below.
+    tapiNameAlloc = std::move(preparedSymbols->names);
+    for (const PreparedLDSymbol &record : preparedSymbols->ldSymbols)
+      applyPreparedLDSymbol(record);
 
-      switch (symbol->getKind()) {
-      case EncodeKind::GlobalSymbol:
-      case EncodeKind::ObjectiveCClass:
-      case EncodeKind::ObjectiveCClassEHType:
-      case EncodeKind::ObjectiveCInstanceVariable:
-        ownedNormalSymbols.push_back(symbol);
-      }
+    // $ld$hide is the only thing that fills hiddenSymbols, and it has run by
+    // now, so an empty set stays empty for the rest of this loop.
+    const bool anyHidden = !exportingFile->hiddenSymbols.empty();
+    symbols.reserve(preparedSymbols->normalNames.size());
+    for (const PreparedTapiName &prepared : preparedSymbols->normalNames) {
+      if (anyHidden && exportingFile->hiddenSymbols.contains(prepared.name))
+        continue;
+      symbols.push_back(symtab->addDylib(prepared.name, exportingFile,
+                                         prepared.isWeakDef, prepared.isTlv));
     }
-    // interface.symbols() order is non-deterministic.
-    llvm::sort(ownedNormalSymbols,
-               [](auto *l, auto *r) { return l->getName() < r->getName(); });
-    normalSymbols = &ownedNormalSymbols;
+    return;
   }
 
+  std::vector<const llvm::MachO::Symbol *> ownedNormalSymbols;
+  ownedNormalSymbols.reserve(interface.symbolsCount());
+  for (const auto *symbol : interface.symbols()) {
+    if (!isArchABICompatible(symbol->getArchitectures(), config->arch()))
+      continue;
+    if (handleLDSymbol(symbol->getName()))
+      continue;
+
+    switch (symbol->getKind()) {
+    case EncodeKind::GlobalSymbol:
+    case EncodeKind::ObjectiveCClass:
+    case EncodeKind::ObjectiveCClassEHType:
+    case EncodeKind::ObjectiveCInstanceVariable:
+      ownedNormalSymbols.push_back(symbol);
+    }
+  }
+  // interface.symbols() order is non-deterministic.
+  llvm::sort(ownedNormalSymbols,
+             [](auto *l, auto *r) { return l->getName() < r->getName(); });
+
   // TODO(compnerd) filter out symbols based on the target platform
-  for (const auto *symbol : *normalSymbols) {
+  for (const auto *symbol : ownedNormalSymbols) {
     switch (symbol->getKind()) {
     case EncodeKind::GlobalSymbol:
       addSymbol(*symbol, symbol->getName());
@@ -2589,6 +2778,73 @@ DylibFile *DylibFile::getSyntheticDylib(StringRef installName,
   dylib->compatibilityVersion = compatVersion;
   extraDylibs.push_back(dylib);
   return dylib;
+}
+
+// Applies one pre-parsed $ld$ record: the mutations handleLDSymbol() and its
+// helpers would have performed, and the warnings they would have emitted, with
+// no splitting or version parsing left to do.
+void DylibFile::applyPreparedLDSymbol(const PreparedLDSymbol &record) {
+  switch (record.warning) {
+  case PreparedLDWarning::None:
+    break;
+  case PreparedLDWarning::StartVersion:
+    warn(toString(this) + ": failed to parse start version, symbol '" +
+         record.originalName + "' ignored");
+    return;
+  case PreparedLDWarning::EndVersion:
+    warn(toString(this) + ": failed to parse end version, symbol '" +
+         record.originalName + "' ignored");
+    return;
+  case PreparedLDWarning::CompatVersion:
+    warn(toString(this) + ": failed to parse compatibility version, symbol '" +
+         record.originalName + "' ignored");
+    return;
+  case PreparedLDWarning::OSVersion:
+    warn(toString(this) + ": failed to parse os version, symbol '" +
+         record.originalName + "' ignored");
+    return;
+  case PreparedLDWarning::HiddenVersion:
+    warn(toString(this) + ": failed to parse hidden version, symbol `" +
+         record.originalName + "` ignored.");
+    return;
+  }
+
+  switch (record.action) {
+  case PreparedLDAction::Previous: {
+    // Initialized to compatibilityVersion for the symbolName branch below. A
+    // preceding record without a symbol name may have changed it, so the
+    // fallback is read here rather than during preparation.
+    uint32_t newCompatibilityVersion = compatibilityVersion;
+    uint32_t newCurrentVersionForSymbol = currentVersion;
+    if (record.hasCompatVersion) {
+      newCompatibilityVersion = record.compatVersion;
+      newCurrentVersionForSymbol = record.compatVersion;
+    }
+
+    if (!record.symbolName.empty()) {
+      // A $ld$previous$ symbol with symbol name adds a symbol with that name to
+      // a dylib with given name and version.
+      auto *dylib = getSyntheticDylib(
+          record.installName, newCurrentVersionForSymbol,
+          newCompatibilityVersion);
+      dylib->symbols.push_back(
+          symtab->addDylib(saver().save(record.symbolName), dylib,
+                           /*isWeakDef=*/false, /*isTlv=*/false));
+      return;
+    }
+
+    // A $ld$previous$ symbol without symbol name modifies the dylib it's in.
+    this->installName = saver().save(record.installName);
+    this->compatibilityVersion = newCompatibilityVersion;
+    return;
+  }
+  case PreparedLDAction::InstallName:
+    this->installName = saver().save(record.installName);
+    return;
+  case PreparedLDAction::Hide:
+    exportingFile->hiddenSymbols.insert(record.hiddenName);
+    return;
+  }
 }
 
 // $ld$ symbols modify the properties/behavior of the library (e.g. its install

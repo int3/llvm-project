@@ -22,10 +22,12 @@
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/DebugInfo/DWARF/DWARFUnit.h"
 #include "llvm/Object/Archive.h"
+#include "llvm/Support/Allocator.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Threading.h"
 #include "llvm/TextAPI/TextAPIReader.h"
 
+#include <memory>
 #include <vector>
 
 namespace llvm {
@@ -298,6 +300,7 @@ public:
 // .dylib or .tbd file
 // Defined in TapiSymbols.h.
 struct PreparedTapiSymbols;
+struct PreparedLDSymbol;
 
 // Computes the order-independent half of the TAPI DylibFile constructor. Safe
 // to call off the ordered input walk.
@@ -318,7 +321,7 @@ public:
   explicit DylibFile(const llvm::MachO::InterfaceFile &interface,
                      DylibFile *umbrella, bool isBundleLoader,
                      bool explicitlyLinked,
-                     const PreparedTapiSymbols *preparedSymbols = nullptr);
+                     PreparedTapiSymbols *preparedSymbols = nullptr);
   explicit DylibFile(DylibFile *umbrella);
 
   void parseLoadCommands(MemoryBufferRef mb);
@@ -364,6 +367,7 @@ private:
                                uint32_t compatVersion);
 
   bool handleLDSymbol(StringRef originalName);
+  void applyPreparedLDSymbol(const PreparedLDSymbol &record);
   void handleLDPreviousSymbol(StringRef name, StringRef originalName);
   void handleLDInstallNameSymbol(StringRef name, StringRef originalName);
   void handleLDHideSymbol(StringRef name, StringRef originalName);
@@ -373,6 +377,10 @@ private:
                     const llvm::MachO::InterfaceFile *currentTopLevelTapi);
 
   llvm::DenseSet<llvm::CachedHashStringRef> hiddenSymbols;
+
+  // Holds the symbol names a worker materialized for this file, when it was
+  // built from a prepared interface. The names outlive the InterfaceFile.
+  std::unique_ptr<llvm::BumpPtrAllocator> tapiNameAlloc;
 };
 
 // .a file

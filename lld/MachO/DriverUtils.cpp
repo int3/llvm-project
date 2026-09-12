@@ -635,7 +635,7 @@ DylibFile *macho::loadDylib(MemoryBufferRef mbref, DylibFile *umbrella,
   file_magic magic = identify_magic(mbref.getBuffer());
   if (magic == file_magic::tapi_file) {
     std::unique_ptr<InterfaceFile> interfaceFile;
-    const PreparedTapiSymbols *preparedSymbols = nullptr;
+    PreparedTapiSymbols *preparedSymbols = nullptr;
     // Keeps a pipelined entry, and so the symbol vectors pointing into its
     // InterfaceFile, alive for as long as preparedSymbols is used below.
     std::unique_ptr<PreparedTapiFile> preparedOwner;

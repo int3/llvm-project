@@ -56,6 +56,9 @@ public:
                     bool isPrivateExtern);
 
   Symbol *addDylib(StringRef name, DylibFile *file, bool isWeakDef, bool isTlv);
+  // For callers that already computed the name hash, e.g. off the ordered walk.
+  Symbol *addDylib(llvm::CachedHashStringRef name, DylibFile *file,
+                   bool isWeakDef, bool isTlv);
   Symbol *addDynamicLookup(StringRef name);
 
   Symbol *addLazyArchive(StringRef name, ArchiveFile *file,
@@ -160,6 +163,8 @@ private:
                      bool isPrivateExtern);
 
   std::pair<Symbol *, bool> insert(StringRef name, const InputFile *);
+  std::pair<Symbol *, bool> insert(llvm::CachedHashStringRef name,
+                                   const InputFile *);
   llvm::DenseMap<llvm::CachedHashStringRef, Symbol *> symMap;
   std::vector<Symbol *> symVector;
   std::unique_ptr<Shard[]> shards;

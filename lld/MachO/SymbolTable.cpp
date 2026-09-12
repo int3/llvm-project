@@ -117,7 +117,11 @@ void SymbolTable::endParallelInput() {
 
 std::pair<Symbol *, bool> SymbolTable::insert(StringRef name,
                                               const InputFile *file) {
-  CachedHashStringRef cachedName(name);
+  return insert(CachedHashStringRef(name), file);
+}
+
+std::pair<Symbol *, bool> SymbolTable::insert(CachedHashStringRef cachedName,
+                                              const InputFile *file) {
   if (sharded) {
     Shard &shard = shards[shardOf(cachedName)];
     auto [it, wasInserted] = shard.map.try_emplace(cachedName, nullptr);
@@ -765,7 +769,13 @@ Symbol *SymbolTable::addCommon(StringRef name, InputFile *file, uint64_t size,
 
 Symbol *SymbolTable::addDylib(StringRef name, DylibFile *file, bool isWeakDef,
                               bool isTlv) {
-  auto [s, wasInserted] = insert(name, file);
+  return addDylib(CachedHashStringRef(name), file, isWeakDef, isTlv);
+}
+
+Symbol *SymbolTable::addDylib(CachedHashStringRef cachedName, DylibFile *file,
+                              bool isWeakDef, bool isTlv) {
+  StringRef name = cachedName.val();
+  auto [s, wasInserted] = insert(cachedName, file);
 
   RefState refState = RefState::Unreferenced;
   if (!wasInserted) {
