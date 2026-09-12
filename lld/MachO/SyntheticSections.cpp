@@ -23,6 +23,7 @@
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/LEB128.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/xxhash.h"
 
@@ -1403,19 +1404,58 @@ static void stableSortByFileId(std::vector<StabsSymbol> &syms) {
   syms = std::move(sorted);
 }
 
-void SymtabSection::gatherStabsSymbols() {
+// `parallel` is set when prepareStabs() runs this on the prepare worker during
+// address assignment; the serial finalizeContents() path keeps the plain walk.
+void SymtabSection::gatherStabsSymbols(bool parallel) {
   stabsSymbols.clear();
-  for (const SymtabEntry &entry :
-       concat<SymtabEntry>(localSymbols, externalSymbols)) {
+  const size_t numLocals = localSymbols.size();
+  const size_t numEntries = numLocals + externalSymbols.size();
+  // We use the symbol's original InputSection to get the file id,
+  // even for ICF folded symbols, to ensure STABS entries point to the
+  // correct object file where the symbol was originally defined
+  auto candidateAt = [&](size_t i, StabsSymbol &out) -> bool {
+    const SymtabEntry &entry =
+        i < numLocals ? localSymbols[i] : externalSymbols[i - numLocals];
     assert(entry.sym->isLive() &&
            "dead symbols should not be in localSymbols, externalSymbols");
-    // We use the symbol's original InputSection to get the file id,
-    // even for ICF folded symbols, to ensure STABS entries point to the
-    // correct object file where the symbol was originally defined
-    if (Defined *defined = getStabsCandidate(entry.sym))
-      stabsSymbols.push_back(
-          {entry.sym, static_cast<uint32_t>(entry.strx),
-           static_cast<uint32_t>(defined->originalIsec->getFile()->id)});
+    Defined *defined = getStabsCandidate(entry.sym);
+    if (!defined)
+      return false;
+    out = {entry.sym, static_cast<uint32_t>(entry.strx),
+           static_cast<uint32_t>(defined->originalIsec->getFile()->id)};
+    return true;
+  };
+
+  if (!parallel) {
+    StabsSymbol candidate;
+    for (size_t i = 0; i != numEntries; ++i)
+      if (candidateAt(i, candidate))
+        stabsSymbols.push_back(candidate);
+  } else {
+    // Each chunk keeps its candidates in entry order and the chunks are
+    // concatenated in chunk order, so the gathered sequence is exactly the
+    // one the serial walk produces -- and getStabsCandidate() only reads
+    // symbol flags, the original input section and its object file.
+    constexpr size_t chunkSize = 8192;
+    const size_t numChunks = divideCeil(numEntries, chunkSize);
+    std::vector<std::vector<StabsSymbol>> chunks(numChunks);
+    parallelFor(0, numChunks, [&](size_t c) {
+      const size_t begin = c * chunkSize;
+      const size_t end = std::min(numEntries, begin + chunkSize);
+      std::vector<StabsSymbol> &out = chunks[c];
+      out.reserve(end - begin);
+      StabsSymbol candidate;
+      for (size_t i = begin; i != end; ++i)
+        if (candidateAt(i, candidate))
+          out.push_back(candidate);
+    });
+    std::vector<size_t> starts(numChunks + 1, 0);
+    for (size_t c = 0; c != numChunks; ++c)
+      starts[c + 1] = starts[c] + chunks[c].size();
+    stabsSymbols.resize(starts[numChunks]);
+    parallelFor(0, numChunks, [&](size_t c) {
+      llvm::copy(chunks[c], stabsSymbols.begin() + starts[c]);
+    });
   }
 
   stableSortByFileId(stabsSymbols);
@@ -1444,7 +1484,7 @@ void SymtabSection::gatherStabsSymbols() {
 void SymtabSection::prepareStabs() {
   if (config->omitDebugInfo)
     return;
-  gatherStabsSymbols();
+  gatherStabsSymbols(/*parallel=*/true);
   preparedLocalSymbols = localSymbols.size();
   preparedExternalSymbols = externalSymbols.size();
   stabsPrepared = true;
@@ -1471,9 +1511,9 @@ void SymtabSection::emitStabs() {
             ArrayRef<SymtabEntry>(localSymbols).drop_front(preparedLocalSymbols)) ||
         suffixNeedsStabs(ArrayRef<SymtabEntry>(externalSymbols)
                              .drop_front(preparedExternalSymbols)))
-      gatherStabsSymbols();
+      gatherStabsSymbols(/*parallel=*/false);
   } else {
-    gatherStabsSymbols();
+    gatherStabsSymbols(/*parallel=*/false);
   }
 
   // One working-directory lookup for the whole link instead of one per object
@@ -1681,6 +1721,64 @@ void SymtabSection::emitStabs() {
   stabsSymbols.shrink_to_fit();
 }
 
+// The filter the prefix pass applies to every object-file symbol when
+// gathering local symbol-table entries. Reads only symbol flags and the name,
+// all final before address assignment.
+static bool isLocalSymtabEntry(Defined *defined) {
+  if (defined->isExternal() || !defined->isLive() || !defined->includeInSymtab)
+    return false;
+  switch (config->localSymbolsPresence) {
+  case SymtabPresence::All:
+    return true;
+  case SymtabPresence::None:
+    return false;
+  case SymtabPresence::SelectivelyIncluded:
+    return config->localSymbolPatterns.match(defined->getName());
+  case SymtabPresence::SelectivelyExcluded:
+    return !config->localSymbolPatterns.match(defined->getName());
+  }
+  llvm_unreachable("invalid SymtabPresence");
+}
+
+// The prefix pass's local-symbol walk, spread over the workers: each chunk of
+// input files collects its own candidates in file-and-symbol order, the chunk
+// sizes are prefix-summed, and each chunk copies its list to its own offset.
+// So `localSymbols` is exactly what the serial walk builds, and every object
+// symbol is examined once -- a counting pass followed by a scatter pass reads
+// them all twice, which costs more CPU than the serial walk it replaces on a
+// link whose prepare task is not the critical path. `strx` is the deferred
+// ordinal, which is positional (locals are numbered first, from zero).
+void SymtabSection::collectLocalSymbolsParallel() {
+  assert(localSymbols.empty() && "the prefix pass gathers locals first");
+  ArrayRef<InputFile *> files = inputFiles.getArrayRef();
+  const size_t numFiles = files.size();
+  constexpr size_t filesPerChunk = 64;
+  const size_t numChunks = divideCeil(numFiles, filesPerChunk);
+  std::vector<std::vector<Symbol *>> chunks(numChunks);
+  parallelFor(0, numChunks, [&](size_t c) {
+    std::vector<Symbol *> &out = chunks[c];
+    const size_t end = std::min(numFiles, (c + 1) * filesPerChunk);
+    for (size_t i = c * filesPerChunk; i != end; ++i)
+      if (auto *objFile = dyn_cast<ObjFile>(files[i]))
+        for (Symbol *sym : objFile->symbols)
+          if (auto *defined = dyn_cast_or_null<Defined>(sym))
+            if (isLocalSymtabEntry(defined))
+              out.push_back(sym);
+  });
+  std::vector<size_t> starts(numChunks + 1, 0);
+  for (size_t c = 0; c != numChunks; ++c)
+    starts[c + 1] = starts[c] + chunks[c].size();
+  localSymbols.resize(starts[numChunks]);
+  parallelFor(0, numChunks, [&](size_t c) {
+    size_t pos = starts[c];
+    for (Symbol *sym : chunks[c]) {
+      localSymbols[pos] = {sym, pos};
+      ++pos;
+    }
+    assert(pos == starts[c + 1] && "chunk sizes must not change");
+  });
+}
+
 // Collects the symbol-table entries for `syms`: the whole symbol table on the
 // prefix pass, or only the symbols appended after snapshotSymbols() on the tail
 // pass. The prefix pass also walks the object files for local symbols and
@@ -1726,14 +1824,21 @@ void SymtabSection::collectSymbols(ArrayRef<Symbol *> syms, bool isPrefix) {
     // the right thing regardless, but this check is a perf optimization because
     // iterating through all the input files and their symbols is expensive.
     if (config->localSymbolsPresence != SymtabPresence::None) {
-      for (const InputFile *file : inputFiles) {
-        if (auto *objFile = dyn_cast<ObjFile>(file)) {
-          for (Symbol *sym : objFile->symbols) {
-            if (auto *defined = dyn_cast_or_null<Defined>(sym)) {
-              if (defined->isExternal() || !defined->isLive() ||
-                  !defined->includeInSymtab)
-                continue;
-              localSymbolsHandler(sym);
+      // On the prepare worker the walk runs on the workers and numbers its
+      // entries positionally; without deferred strings addString() has to run
+      // in entry order, so that path stays serial.
+      if (prepared && deferStrings) {
+        collectLocalSymbolsParallel();
+        normalSymbolOrdinal = localSymbols.size();
+      } else {
+        for (const InputFile *file : inputFiles) {
+          if (auto *objFile = dyn_cast<ObjFile>(file)) {
+            for (Symbol *sym : objFile->symbols) {
+              if (auto *defined = dyn_cast_or_null<Defined>(sym)) {
+                if (!isLocalSymtabEntry(defined))
+                  continue;
+                addSymbol(localSymbols, sym);
+              }
             }
           }
         }

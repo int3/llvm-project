@@ -564,7 +564,7 @@ private:
   void emitObjectFileStab(const StabsSourceGroup &);
   void emitEndFunStab(Defined *);
   Defined *getFuncBodySym(Defined *);
-  void gatherStabsSymbols();
+  void gatherStabsSymbols(bool parallel);
   void emitStabs();
 
 protected:
@@ -591,6 +591,7 @@ protected:
 
 private:
   void collectSymbols(llvm::ArrayRef<Symbol *> syms, bool isPrefix);
+  void collectLocalSymbolsParallel();
 
   std::vector<Symbol *> preparedSymbols;
   bool prepared = false;
