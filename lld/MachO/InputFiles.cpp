@@ -3225,13 +3225,6 @@ void macho::forEachUndefinedName(MemoryBufferRef mb,
 }
 
 bool ArchiveFile::canWalk() {
-  // A thin archive's members are separate files on disk, and Child::getBuffer()
-  // opens one lazily by appending to the Archive's ThinBuffers vector with no
-  // lock, so two workers reading two members race on it. Both the prepass and
-  // the walk read members on workers, so the walker cannot own a thin archive's
-  // index; addLazySymbols() reads them on the main thread, as it always did.
-  if (file->isThin())
-    return false;
   if (file->isEmpty() ||
       (file->hasSymbolTable() && file->getNumberOfSymbols() == 0))
     return true;
@@ -3262,18 +3255,57 @@ void ArchiveFile::reserveMemberUndefineds(
   bool wantObjC = mandatoryLoad == MandatoryLoad::ObjC;
   if (wantObjC)
     memberObjC.reserve(indexChildren.size());
+  // A thin archive needs a buffer slot per member as well; see
+  // mapWalkedMember().
+  bool thin = file->isThin();
+  if (thin)
+    memberBuffers.reserve(indexChildren.size());
   for (const auto &kv : indexChildren) {
     undefinedNames.try_emplace(kv.first);
     if (wantObjC)
       memberObjC.try_emplace(kv.first, false);
+    if (thin)
+      memberBuffers.try_emplace(kv.first);
     work.emplace_back(this, kv.first);
   }
+}
+
+// Archive::Child::getMemoryBufferRef() is thread-safe only for a regular
+// archive, whose member is a range of the archive's own mapped buffer. A thin
+// archive's member is a separate file, which Child::getBuffer() maps and then
+// hands to the Archive to own in its ThinBuffers vector -- an unsynchronised
+// std::vector::push_back. Two workers filling two members of one thin archive
+// therefore corrupted the heap (PROTO-heap-corruption-001: "realloc(): invalid
+// next size" and "double free or corruption" on the Chromium thin-archive
+// link, which has 770 thin archives). The walker maps thin members itself
+// instead, into a slot per child that reserveMemberUndefineds() created before
+// any worker ran, under the same rule as the maps above. The buffer has to
+// outlive the call, because the StringRefs in undefinedNames point into it.
+Expected<MemoryBufferRef>
+ArchiveFile::mapWalkedMember(uint64_t childOffset,
+                            const object::Archive::Child &c) {
+  if (!file->isThin())
+    return c.getMemoryBufferRef();
+  Expected<StringRef> name = c.getName();
+  if (!name)
+    return name.takeError();
+  Expected<std::string> path = c.getFullName();
+  if (!path)
+    return path.takeError();
+  ErrorOr<std::unique_ptr<MemoryBuffer>> buf = MemoryBuffer::getFile(
+      *path, /*IsText=*/false, /*RequiresNullTerminator=*/false);
+  if (std::error_code ec = buf.getError())
+    return errorCodeToError(ec);
+  auto slot = memberBuffers.find(childOffset);
+  assert(slot != memberBuffers.end());
+  slot->second = std::move(*buf);
+  return MemoryBufferRef(slot->second->getBuffer(), *name);
 }
 
 bool ArchiveFile::fillMemberUndefineds(uint64_t childOffset) {
   auto child = indexChildren.find(childOffset);
   assert(child != indexChildren.end());
-  Expected<MemoryBufferRef> mb = child->second.getMemoryBufferRef();
+  Expected<MemoryBufferRef> mb = mapWalkedMember(childOffset, child->second);
   if (!mb) {
     llvm::consumeError(mb.takeError());
     return false;

@@ -583,6 +583,15 @@ private:
   llvm::DenseMap<uint64_t, llvm::SmallVector<StringRef, 0>> undefinedNames;
   // Same shape and the same rule: every key exists before any worker runs.
   llvm::DenseMap<uint64_t, bool> memberObjC;
+  // Same shape and the same rule, and only for a thin archive: the buffer a
+  // worker mapped for its own member, owned here rather than in the Archive's
+  // unsynchronised ThinBuffers vector. See mapWalkedMember().
+  llvm::DenseMap<uint64_t, std::unique_ptr<llvm::MemoryBuffer>> memberBuffers;
+  // getMemoryBufferRef() for a member the walker is about to read on a worker:
+  // safe for distinct members of one archive, thin or not.
+  Expected<MemoryBufferRef>
+  mapWalkedMember(uint64_t childOffset,
+                  const llvm::object::Archive::Child &c);
   Expected<InputFile *> childToObjectFile(const llvm::object::Archive::Child &c,
                                           bool lazy);
   std::unique_ptr<llvm::object::Archive> file;
