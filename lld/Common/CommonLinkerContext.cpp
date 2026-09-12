@@ -22,7 +22,13 @@ using namespace lld;
 // state.
 static CommonLinkerContext *lctx;
 
+// Starts at one so that a cache initialized to zero is never mistaken for a
+// valid entry. See getSpecificAllocSingleton().
+uint64_t lld::commonContextGeneration = 1;
+
 CommonLinkerContext::CommonLinkerContext() {
+  ++commonContextGeneration;
+
   // A nested context, e.g. the dynamic debugging link, does not install itself.
   if (lctx)
     return;
@@ -34,6 +40,8 @@ CommonLinkerContext::CommonLinkerContext() {
 
 CommonLinkerContext::~CommonLinkerContext() {
   assert(lctx);
+  ++commonContextGeneration;
+
   // Explicitly call the destructors since we created the objects with placement
   // new in SpecificAlloc::create().
   for (auto &it : instances)

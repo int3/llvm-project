@@ -22,8 +22,20 @@
 #define LLD_COMMON_MEMORY_H
 
 #include "llvm/Support/Allocator.h"
+#include "llvm/Support/Compiler.h"
+
+#include <cstdint>
 
 namespace lld {
+// Both declared in CommonLinkerContext.h, which includes this header.
+class CommonLinkerContext;
+CommonLinkerContext &commonContext();
+// Bumped by every CommonLinkerContext constructor and destructor, so that a
+// cached arena pointer is invalidated whenever the set of live contexts
+// changes -- including a make<T>() after the context that owns the arena has
+// been destroyed.
+extern uint64_t commonContextGeneration;
+
 // A base class only used by the CommonLinkerContext to keep track of the
 // SpecificAlloc<> instances.
 struct SpecificAllocBase {
@@ -47,12 +59,31 @@ template <class T> int SpecificAlloc<T>::tag = 0;
 
 // Creates the arena on-demand on the first call; or returns it, if it was
 // already created.
+//
+// getOrCreate() is a DenseMap lookup in the linker context, and make<T>() calls
+// it once per allocation, which on a link that creates millions of symbols and
+// input sections is measurable: about 2% of a one-thread rust-analyzer link.
+// The arena belongs to the context and is never replaced while that context
+// lives, so the result is cached per thread and revalidated against the
+// context generation alone. Comparing &commonContext() would not be a valid
+// check by itself -- a second link in the same process can allocate its
+// context where the previous one was -- and it is not needed either, since
+// every context construction and destruction bumps the generation. Dropping
+// it also keeps the fast path off commonContext(). The cache is thread-local
+// rather than static because getOrCreate() is not thread-safe and two
+// contexts can in principle be live on different threads; caching per thread
+// does not make it any less safe, it only calls it far less often.
 template <typename T>
 inline llvm::SpecificBumpPtrAllocator<T> &getSpecificAllocSingleton() {
-  SpecificAllocBase *instance = SpecificAllocBase::getOrCreate(
-      &SpecificAlloc<T>::tag, sizeof(SpecificAlloc<T>),
-      alignof(SpecificAlloc<T>), SpecificAlloc<T>::create);
-  return ((SpecificAlloc<T> *)instance)->alloc;
+  static thread_local uint64_t cachedGeneration = 0;
+  static thread_local SpecificAlloc<T> *cachedInstance = nullptr;
+  if (LLVM_UNLIKELY(cachedGeneration != commonContextGeneration)) {
+    cachedInstance = (SpecificAlloc<T> *)SpecificAllocBase::getOrCreate(
+        &SpecificAlloc<T>::tag, sizeof(SpecificAlloc<T>),
+        alignof(SpecificAlloc<T>), SpecificAlloc<T>::create);
+    cachedGeneration = commonContextGeneration;
+  }
+  return cachedInstance->alloc;
 }
 
 // Creates new instances of T off a (almost) contiguous arena/object pool. The
