@@ -469,6 +469,21 @@ public:
   void addLazySymbols(bool heldIndex = false);
   void fetch(const llvm::object::Archive::Symbol &);
 
+  // Which of this archive's members the command line makes mandatory. -all_load
+  // and -force_load load every member, -ObjC the ones an ObjC class symbol or an
+  // ObjC/Swift section names, all at the archive's own registration point and
+  // regardless of any reference. The walker replays those loads as a per-archive
+  // prelude (see walkArchives()); the paths where the walker does not run replay
+  // them in loadMandatoryArchiveMembers() instead.
+  enum class MandatoryLoad : uint8_t {
+    None,
+    ObjC,
+    AllLoad,
+    ForceLoad,
+    LcOption,
+  };
+  MandatoryLoad mandatoryLoad = MandatoryLoad::None;
+
   // --- parallel input phase ---
   //
   // The walker (see Driver.cpp) decides which members to extract from the
@@ -487,6 +502,16 @@ public:
   // resolved, in index order. Computed on a worker; the serial walk visits only
   // these, plus entries a member's undefined symbol schedules.
   llvm::SmallVector<uint32_t, 0> candidateEntries;
+  // Index entries whose name is an ObjC class symbol, in index order: the first
+  // pass of a MandatoryLoad::ObjC prelude. Filled by buildIndex(), and only for
+  // that kind.
+  llvm::SmallVector<uint32_t, 0> classEntries;
+  // Every member's child offset, in member order, which is the order the
+  // mandatory passes walk the members in. Filled by buildMemberMaps(), and only
+  // when a mandatory load needs it: a member that no index entry names -- a
+  // category-only object has nothing but local __OBJC_$_CATEGORY_* symbols -- is
+  // reachable no other way.
+  llvm::SmallVector<uint64_t, 0> childOrder;
   // Set if any member carries an LC_LINKER_OPTION; see fillMemberUndefineds().
   std::atomic<bool> memberLinkerOptions{false};
   // One per index entry while the index is being read, so that the member
@@ -512,6 +537,14 @@ public:
   ArrayRef<StringRef> memberUndefineds(uint64_t childOffset) const {
     auto it = undefinedNames.find(childOffset);
     assert(it != undefinedNames.end());
+    return it->second;
+  }
+  // Does this member carry an __objc_catlist or __swift* section? Read from the
+  // member's header and section table on a worker, in fillMemberUndefineds(),
+  // for a MandatoryLoad::ObjC archive only.
+  bool memberHasObjCSection(uint64_t childOffset) const {
+    auto it = memberObjC.find(childOffset);
+    assert(it != memberObjC.end());
     return it->second;
   }
   // Fill candidateEntries. Read-only on the symbol table; safe on a worker.
@@ -547,6 +580,8 @@ private:
   // Keyed by child offset. Every value is created before any worker runs, so the
   // workers only write into their own value and never rehash the map.
   llvm::DenseMap<uint64_t, llvm::SmallVector<StringRef, 0>> undefinedNames;
+  // Same shape and the same rule: every key exists before any worker runs.
+  llvm::DenseMap<uint64_t, bool> memberObjC;
   Expected<InputFile *> childToObjectFile(const llvm::object::Archive::Child &c,
                                           bool lazy);
   std::unique_ptr<llvm::object::Archive> file;

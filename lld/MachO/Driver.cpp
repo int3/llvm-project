@@ -409,6 +409,96 @@ static void multiThreadedPageIn(const DeferredFiles &deferred) {
 }
 #endif
 
+// The member loads -all_load, -force_load, -ObjC and the forceLoadSwift
+// LC_LINKER_OPTION rule perform at an archive's own registration point, before
+// its index is published and regardless of any reference.
+//
+// \p contentsOnly performs none of them and only pushes the member buffers the
+// read workers page in: the parallel input phase has held this archive's index
+// back, so the loads run later instead -- in the walker's per-archive prelude,
+// or, on the paths where the walker does not run, in this same function from the
+// point that publishes the index the ordinary way.
+static void loadMandatoryArchiveMembers(ArchiveFile *file, StringRef path,
+                                        DeferredFiles *archiveContents,
+                                        bool isLazy, bool contentsOnly) {
+  using MandatoryLoad = ArchiveFile::MandatoryLoad;
+  switch (file->mandatoryLoad) {
+  case MandatoryLoad::None:
+    return;
+  case MandatoryLoad::AllLoad:
+  case MandatoryLoad::ForceLoad:
+  case MandatoryLoad::LcOption: {
+    if (contentsOnly || !readFile(path))
+      return;
+    StringRef reason = file->mandatoryLoad == MandatoryLoad::LcOption
+                           ? "LC_LINKER_OPTION"
+                           : (file->mandatoryLoad == MandatoryLoad::ForceLoad
+                                  ? "-force_load"
+                                  : "-all_load");
+    Error e = Error::success();
+    for (const object::Archive::Child &c : file->getArchive().children(e)) {
+      if (Error e = file->fetch(c, reason)) {
+        if (config->warnThinArchiveMissingMembers)
+          warn(toString(file) + ": " + reason +
+               " failed to load archive member: " + toString(std::move(e)));
+        else
+          llvm::consumeError(std::move(e));
+      }
+    }
+    if (e)
+      error(toString(file) +
+            ": Archive::children failed: " + toString(std::move(e)));
+    return;
+  }
+  case MandatoryLoad::ObjC: {
+    if (!contentsOnly && file->getArchive().hasSymbolTable()) {
+      for (const object::Archive::Symbol &sym : file->getArchive().symbols())
+        if (sym.getName().starts_with(objc::symbol_names::klass))
+          file->fetch(sym);
+    }
+    bool wantContents = config->readWorkers && archiveContents != nullptr;
+    if ((contentsOnly && !wantContents) || !readFile(path))
+      return;
+
+    // TODO: no need to look for ObjC sections for a given archive member if
+    // we already found that it contains an ObjC symbol.
+    Error e = Error::success();
+    for (const object::Archive::Child &c : file->getArchive().children(e)) {
+      Expected<MemoryBufferRef> mb = c.getMemoryBufferRef();
+      if (!mb) {
+        // A member whose buffer cannot be read makes the walker decline the
+        // whole archive set, and this function then runs for real, so the
+        // diagnostic is still emitted exactly once.
+        if (contentsOnly) {
+          llvm::consumeError(mb.takeError());
+          continue;
+        }
+        // We used to create broken repro tarballs that only included those
+        // object files from thin archives that ended up being used.
+        if (config->warnThinArchiveMissingMembers)
+          warn(toString(file) + ": -ObjC failed to open archive member: " +
+               toString(mb.takeError()));
+        else
+          llvm::consumeError(mb.takeError());
+        continue;
+      }
+
+      if (wantContents)
+        archiveContents->push_back({path, isLazy, *mb});
+      if (contentsOnly || !hasObjCSection(*mb))
+        continue;
+      if (Error e = file->fetch(c, "-ObjC"))
+        error(toString(file) + ": -ObjC failed to load archive member: " +
+              toString(std::move(e)));
+    }
+    if (e)
+      error(toString(file) +
+            ": Archive::children failed: " + toString(std::move(e)));
+    return;
+  }
+  }
+}
+
 static InputFile *processFile(std::optional<MemoryBufferRef> buffer,
                               DeferredFiles *archiveContents, StringRef path,
                               LoadType loadType, bool isLazy = false,
@@ -451,75 +541,19 @@ static InputFile *processFile(std::optional<MemoryBufferRef> buffer,
         return file;
     }
 
-    bool isLCLinkerForceLoad = loadType == LoadType::LCLinkerOption &&
-                               config->forceLoadSwift &&
-                               path::filename(path).starts_with("libswift");
-    if ((isCommandLineLoad && config->allLoad) ||
-        loadType == LoadType::CommandLineForce || isLCLinkerForceLoad) {
-      if (readFile(path)) {
-        Error e = Error::success();
-        for (const object::Archive::Child &c : file->getArchive().children(e)) {
-          StringRef reason;
-          switch (loadType) {
-          case LoadType::LCLinkerOption:
-            reason = "LC_LINKER_OPTION";
-            break;
-          case LoadType::CommandLineForce:
-            reason = "-force_load";
-            break;
-          case LoadType::CommandLine:
-            reason = "-all_load";
-            break;
-          }
-          if (Error e = file->fetch(c, reason)) {
-            if (config->warnThinArchiveMissingMembers)
-              warn(toString(file) + ": " + reason +
-                   " failed to load archive member: " + toString(std::move(e)));
-            else
-              llvm::consumeError(std::move(e));
-          }
-        }
-        if (e)
-          error(toString(file) +
-                ": Archive::children failed: " + toString(std::move(e)));
-      }
-    } else if (isCommandLineLoad && config->forceLoadObjC) {
-      if (file->getArchive().hasSymbolTable()) {
-        for (const object::Archive::Symbol &sym : file->getArchive().symbols())
-          if (sym.getName().starts_with(objc::symbol_names::klass))
-            file->fetch(sym);
-      }
-
-      // TODO: no need to look for ObjC sections for a given archive member if
-      // we already found that it contains an ObjC symbol.
-      if (readFile(path)) {
-        Error e = Error::success();
-        for (const object::Archive::Child &c : file->getArchive().children(e)) {
-          Expected<MemoryBufferRef> mb = c.getMemoryBufferRef();
-          if (!mb) {
-            // We used to create broken repro tarballs that only included those
-            // object files from thin archives that ended up being used.
-            if (config->warnThinArchiveMissingMembers)
-              warn(toString(file) + ": -ObjC failed to open archive member: " +
-                   toString(mb.takeError()));
-            else
-              llvm::consumeError(mb.takeError());
-            continue;
-          }
-
-          if (config->readWorkers && archiveContents)
-            archiveContents->push_back({path, isLazy, *mb});
-          if (!hasObjCSection(*mb))
-            continue;
-          if (Error e = file->fetch(c, "-ObjC"))
-            error(toString(file) + ": -ObjC failed to load archive member: " +
-                  toString(std::move(e)));
-        }
-        if (e)
-          error(toString(file) +
-                ": Archive::children failed: " + toString(std::move(e)));
-      }
-    }
+    file->mandatoryLoad = ArchiveFile::MandatoryLoad::None;
+    if (loadType == LoadType::LCLinkerOption) {
+      if (config->forceLoadSwift &&
+          path::filename(path).starts_with("libswift"))
+        file->mandatoryLoad = ArchiveFile::MandatoryLoad::LcOption;
+    } else if (loadType == LoadType::CommandLineForce)
+      file->mandatoryLoad = ArchiveFile::MandatoryLoad::ForceLoad;
+    else if (config->allLoad)
+      file->mandatoryLoad = ArchiveFile::MandatoryLoad::AllLoad;
+    else if (config->forceLoadObjC)
+      file->mandatoryLoad = ArchiveFile::MandatoryLoad::ObjC;
+    loadMandatoryArchiveMembers(file, path, archiveContents, isLazy,
+                                /*contentsOnly=*/deferArchiveIndex);
     if ((!archiveContents || archiveContents->empty()) && !deferArchiveIndex)
       file->addLazySymbols();
     loadedArchives[path] = ArchiveFileInfo{file, isCommandLineLoad};
@@ -946,6 +980,13 @@ static bool walkArchives() {
   uint32_t registrationTop = 0;
   uint32_t walkCounter = 0;
   uint32_t lastVisitedEntry = UINT32_MAX; // "before entry 0"
+  // Where an archive's index entries start in its walk counter. Zero unless a
+  // mandatory-member prelude ran first and consumed values ahead of them.
+  std::vector<uint32_t> walkBases(archives.size(), 0);
+  // Set while a prelude is running: its members load at the archive's own
+  // registration point, before its index is registered, so no entry of the
+  // current archive has been passed yet -- not even entry 0.
+  bool prelude = false;
   auto walkOfEntry = [&](uint32_t archiveIndex, uint32_t entryIndex) -> uint32_t {
     const std::vector<EntryWalk> &blocks = visited[archiveIndex];
     // The last visited entry at or before entryIndex.
@@ -954,7 +995,8 @@ static bool walkArchives() {
                                  return k < b.entryIndex;
                                });
     if (it == blocks.begin())
-      return entryIndex; // no visited entry before it: the gaps start at zero
+      // No visited entry before it: the gaps start where the entries do.
+      return walkBases[archiveIndex] + entryIndex;
     --it;
     if (it->entryIndex == entryIndex)
       return it->walkStart;
@@ -997,10 +1039,13 @@ static bool walkArchives() {
           if (first->extracted)
             continue;
           first->extracted = true;
-          // Only an entry the walk has already passed created a slot there.
-          if (first->archiveIndex > frontierArchive ||
-              (first->archiveIndex == frontierArchive &&
-               first->entryIndex > frontierEntry))
+          // Only an entry the walk has already passed created a slot there. A
+          // prelude has passed nothing in its own archive: the index is not
+          // registered until the prelude is over.
+          bool passed = first->archiveIndex < frontierArchive ||
+                        (first->archiveIndex == frontierArchive && !prelude &&
+                         first->entryIndex <= frontierEntry);
+          if (!passed)
             continue;
           symtab->reserveArchiveSlot(
               entry.name.val(), archive,
@@ -1064,6 +1109,47 @@ static bool walkArchives() {
     registrationTop = parallelInput.archiveOrdinals[archiveIndex];
     walkCounter = 0;
     lastVisitedEntry = UINT32_MAX;
+
+    // -ObjC, -force_load and -all_load load members at the archive's own
+    // registration point, before its index is registered, so those members and
+    // their undefined symbols take the first walk values of this archive and its
+    // index entries start after them. Nothing in this archive can satisfy an
+    // undefined yet, so a provider here is scheduled for the entry loop below,
+    // which is where the serial linker's own registration of that entry would
+    // have extracted it; a provider in an earlier archive extracts at once.
+    prelude = true;
+    frontierEntry = 0;
+    switch (archive->mandatoryLoad) {
+    case ArchiveFile::MandatoryLoad::None:
+      break;
+    case ArchiveFile::MandatoryLoad::LcOption:
+      // beginHeldInput() only ever holds a CommandLine or CommandLineForce
+      // archive, and this kind is set only for an LC_LINKER_OPTION load, which
+      // arrives after the phase has ended.
+      llvm_unreachable("the walker cannot own an LC_LINKER_OPTION archive");
+    case ArchiveFile::MandatoryLoad::ObjC:
+      for (uint32_t entryIndex : archive->classEntries) {
+        const ArchiveFile::IndexEntry &entry = archive->indexEntries[entryIndex];
+        extract(archiveIndex, entry.childOffset, entry.name.val());
+      }
+      for (uint64_t childOffset : archive->childOrder)
+        if (archive->memberHasObjCSection(childOffset))
+          extract(archiveIndex, childOffset, "-ObjC");
+      break;
+    case ArchiveFile::MandatoryLoad::AllLoad:
+    case ArchiveFile::MandatoryLoad::ForceLoad: {
+      StringRef reason =
+          archive->mandatoryLoad == ArchiveFile::MandatoryLoad::ForceLoad
+              ? "-force_load"
+              : "-all_load";
+      for (uint64_t childOffset : archive->childOrder)
+        extract(archiveIndex, childOffset, reason);
+      break;
+    }
+    }
+    prelude = false;
+    walkBases[archiveIndex] = walkCounter;
+
     size_t next = 0;
     auto &pending = scheduled[archiveIndex];
     while (next != archive->candidateEntries.size() || !pending.empty()) {
@@ -1213,6 +1299,12 @@ static void finishParallelInput(bool moreInputsFollow = false) {
         archiveCtx.walk = 0;
         archiveCtx.seq = 0;
         symtab->serialCtx = &archiveCtx;
+        // The mandatory members load at this archive's own position, before its
+        // index, exactly as they do on the serial path.
+        loadMandatoryArchiveMembers(parallelInput.archives[i],
+                                    parallelInput.archives[i]->getName(),
+                                    /*archiveContents=*/nullptr,
+                                    /*isLazy=*/false, /*contentsOnly=*/false);
         parallelInput.archives[i]->publishHeldIndex();
       }
       symtab->serialCtx = nullptr;
@@ -1321,8 +1413,12 @@ static void finishParallelInput(bool moreInputsFollow = false) {
     // ordinary way. Every direct object is already resolved, and every archive
     // follows every object, so this is the serial order.
     providerShards.reset();
-    for (ArchiveFile *archive : parallelInput.archives)
+    for (ArchiveFile *archive : parallelInput.archives) {
+      loadMandatoryArchiveMembers(archive, archive->getName(),
+                                  /*archiveContents=*/nullptr,
+                                  /*isLazy=*/false, /*contentsOnly=*/false);
       archive->addLazySymbols();
+    }
     parallelInput.archives.clear();
   }
   // parallelInput.contexts is deliberately not cleared: deferFile() holds a
@@ -1357,14 +1453,17 @@ static bool beginHeldInput(MemoryBufferRef mbref, bool isLazy,
       }
       break;
     case file_magic::archive:
-      // An archive that loads every member does so at its own position, so it
-      // needs the objects before it resolved and the table in its serial state.
-      // An input that follows the phase -- an autolinked library named by a
-      // held or an already-parsed object -- means the walk would decline later
-      // anyway, and declining now is strictly better: the archive publishes its
-      // index at its own command-line position on the ordinary serial path.
-      holdArchiveIndex = loadType == LoadType::CommandLine &&
-                         !config->allLoad && !config->forceLoadObjC &&
+      // An archive's mandatory members (-ObjC, -force_load, -all_load) load at
+      // its own position, before its index; the walker replays those loads as a
+      // per-archive prelude, so the index can still be held back. An archive
+      // loaded from an LC_LINKER_OPTION arrives after the phase.
+      //
+      // An input that follows the phase -- an autolinked library named by a held
+      // or an already-parsed object -- means the walk would decline later anyway,
+      // and declining now is strictly better: the archive publishes its index at
+      // its own command-line position on the ordinary serial path.
+      holdArchiveIndex = (loadType == LoadType::CommandLine ||
+                          loadType == LoadType::CommandLineForce) &&
                          !parallelInput.heldLinkerOptions &&
                          unprocessedLCLinkerOptions.empty();
       if (!holdArchiveIndex)
@@ -1409,8 +1508,12 @@ static void endHeldInput(InputFile *file, bool holdParse, bool holdArchiveIndex,
     return;
   }
   // This archive has to publish its index right here, which means every object
-  // before it must already be resolved.
+  // before it must already be resolved. Its mandatory members load just before
+  // the index, which is what processFile() left to this point.
   finishParallelInput(/*moreInputsFollow=*/true);
+  loadMandatoryArchiveMembers(archive, archive->getName(),
+                              /*archiveContents=*/nullptr, /*isLazy=*/false,
+                              /*contentsOnly=*/false);
   archive->addLazySymbols();
 }
 

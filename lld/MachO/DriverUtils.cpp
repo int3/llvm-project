@@ -410,6 +410,11 @@ static void pipelineReexports(TapiPipelineState *state,
     SmallString<261> resolved;
     if (!probeReexportPath(ref.getInstallName(), resolved))
       continue;
+    // addPipelinedTapiFile() drops a path that is already pipelined, so reading
+    // the file first only opens and maps the same re-exported TBD again -- and a
+    // core library is re-exported by many parents.
+    if (isPipelinedTapiPath(CachedHashStringRef(StringRef(resolved))))
+      continue;
     ErrorOr<std::unique_ptr<MemoryBuffer>> mbOrErr =
         MemoryBuffer::getFile(resolved, /*IsText=*/false,
                               /*RequiresNullTerminator=*/false);
@@ -532,6 +537,10 @@ void macho::pipelineAutolinkName(StringRef name, bool isFramework) {
   SmallString<261> resolved;
   if (isFramework ? !probeFrameworkName(name, resolved)
                   : !probeLibraryName(name, resolved))
+    return;
+
+  // Same as in pipelineReexports(): an already pipelined path needs no read.
+  if (isPipelinedTapiPath(CachedHashStringRef(StringRef(resolved))))
     return;
 
   // Not readFile(): that diagnoses a failure and records a --reproduce member

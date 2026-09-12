@@ -3252,8 +3252,13 @@ bool ArchiveFile::canWalk() {
 void ArchiveFile::reserveMemberUndefineds(
     std::vector<std::pair<ArchiveFile *, uint64_t>> &work) {
   undefinedNames.reserve(indexChildren.size());
+  bool wantObjC = mandatoryLoad == MandatoryLoad::ObjC;
+  if (wantObjC)
+    memberObjC.reserve(indexChildren.size());
   for (const auto &kv : indexChildren) {
     undefinedNames.try_emplace(kv.first);
+    if (wantObjC)
+      memberObjC.try_emplace(kv.first, false);
     work.emplace_back(this, kv.first);
   }
 }
@@ -3281,6 +3286,11 @@ bool ArchiveFile::fillMemberUndefineds(uint64_t childOffset) {
                        &sawLinkerOption);
   if (sawLinkerOption)
     memberLinkerOptions.store(true, std::memory_order_relaxed);
+  // The -ObjC prelude's second pass. This reads the header, the load commands
+  // and the section table, all of which the pass above has just touched, so it
+  // costs the worker nothing beyond the section walk itself.
+  if (mandatoryLoad == MandatoryLoad::ObjC)
+    memberObjC.find(childOffset)->second = hasObjCSection(*mb);
   return true;
 }
 
@@ -3354,9 +3364,14 @@ bool ArchiveFile::buildIndex() {
   // Rust staticlib, not once per member -- was 25 of the 33 ms this pass cost.
   // resolveIndexOffsets() does it in parallel chunks instead.
   indexSymbols.reserve(file->getNumberOfSymbols());
+  bool wantClassEntries = mandatoryLoad == MandatoryLoad::ObjC;
   for (const object::Archive::Symbol &sym : file->symbols()) {
+    StringRef name = sym.getName();
     indexSymbols.push_back(sym);
-    indexEntries.push_back({CachedHashStringRef(sym.getName()), 0});
+    indexEntries.push_back({CachedHashStringRef(name), 0});
+    // The -ObjC prelude's first pass, in the index order it walks.
+    if (wantClassEntries && name.starts_with(objc::symbol_names::klass))
+      classEntries.push_back(indexEntries.size() - 1);
   }
   return true;
 }
@@ -3374,12 +3389,27 @@ bool ArchiveFile::resolveIndexOffsets(uint32_t begin, uint32_t end) {
 }
 
 bool ArchiveFile::buildMemberMaps() {
+  // A mandatory load walks the members, not the index, so every member has to be
+  // in the maps -- including one no index entry names, which a plain index walk
+  // would never reach. The headers are warm from resolveIndexOffsets().
+  if (mandatoryLoad != MandatoryLoad::None) {
+    Error err = Error::success();
+    for (const object::Archive::Child &c : file->children(err)) {
+      uint64_t childOffset = c.getChildOffset();
+      childOrder.push_back(childOffset);
+      indexChildren.try_emplace(childOffset, c);
+    }
+    if (err) {
+      llvm::consumeError(std::move(err));
+      return false;
+    }
+  }
   // Map work only: every offset is resolved and the headers are warm. A Child is
   // constructed once per member rather than once per entry.
   for (uint32_t i = 0, e = indexEntries.size(); i != e; ++i) {
     uint64_t childOffset = indexEntries[i].childOffset;
     llvm::SmallVector<uint32_t, 2> &entries = memberEntries[childOffset];
-    if (entries.empty()) {
+    if (entries.empty() && !indexChildren.contains(childOffset)) {
       // Whether every member is a native object file is checked on a worker, in
       // fillMemberUndefineds(), which has to map each member's buffer anyway;
       // the walk is abandoned before it mutates anything if one is not. A Child
