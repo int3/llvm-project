@@ -554,8 +554,10 @@ public:
   // Symbol::getMember() parses a member header, so this is chunked across
   // workers -- and buildMemberMaps() builds the per-member maps from the
   // resolved offsets. Any of them returning false means this archive cannot be
-  // walked, and the link falls back to addLazySymbols(). All three are safe on
-  // a worker; only the first two may run concurrently for one archive.
+  // walked, and the link falls back to addLazySymbols(). All three read only the
+  // archive's bytes, so they run on workers from the archive's hold point while
+  // the main thread is still walking the argument list; only
+  // resolveIndexOffsets() may run concurrently with itself for one archive.
   bool buildIndex();
   bool resolveIndexOffsets(uint32_t begin, uint32_t end);
   bool buildMemberMaps();

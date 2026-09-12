@@ -636,6 +636,33 @@ static void checkAndCacheFramework(InputFile *file, StringRef path) {
 }
 
 namespace {
+// One held archive's prepass: everything the walk needs from the archive that
+// depends only on the archive's bytes -- its index, each entry's member offset,
+// the per-member maps, and each member's undefined names. None of it reads the
+// symbol table or allocates from anything the main thread shares, so it runs as
+// worker tasks from the moment the archive is held (see startArchivePrepass())
+// instead of at the top of the walk, which puts it behind the rest of the
+// argument walk -- the dylib registrations and the wait on the TAPI pipeline --
+// rather than in front of the first thing the walk actually has to do serially.
+//
+// The stages depend on each other but the tasks never block on each other: each
+// stage's last task starts the next one. Nesting a parallelFor inside a task
+// instead would let one worker's nested wait pull in another archive's whole
+// prepass, so the depth would grow with the number of archives, and a Rust link
+// holds two hundred of them.
+struct ArchivePrepassState {
+  ArchiveFile *archive = nullptr;
+  DeferredDiagnostics diags;
+  // Cleared if this archive cannot be walked, which sends the whole archive set
+  // back to addLazySymbols().
+  std::atomic<bool> ok{true};
+  // Set once every stage has finished. Not set when the prepass was abandoned.
+  std::atomic<bool> done{false};
+  // Outstanding tasks of the stage now running.
+  std::atomic<uint32_t> pending{0};
+  std::vector<std::pair<ArchiveFile *, uint64_t>> members;
+};
+
 // E006 design 7, stage 1: direct object files are parsed on workers.
 //
 // The command line is still walked in order, so that every diagnostic, every
@@ -663,6 +690,17 @@ struct ParallelInputPhase {
   // archive is held instead of only at finishParallelInput(). Monotone: an
   // object that follows a held archive is not held at all.
   bool heldLinkerOptions = false;
+  // One prepass state per held archive, in the same order as `archives`. A deque
+  // because the running tasks hold references into it while the argument walk
+  // appends more.
+  std::deque<ArchivePrepassState> prepassStates;
+  // Holds every prepass task of every held archive. Created with the first held
+  // archive and joined once, at the end of the phase. The tasks spawn their
+  // successors through the raw pointer, not the owner: unique_ptr::reset() clears
+  // the owner before the destructor waits for the tasks, so the owner is null for
+  // exactly the window in which they are still running.
+  std::unique_ptr<llvm::parallel::TaskGroup> prepass;
+  llvm::parallel::TaskGroup *prepassGroup = nullptr;
 };
 
 // Where the first member defining a name lives. The walker needs the earliest
@@ -730,6 +768,133 @@ static void startParallelInput() {
 #endif
 }
 
+// Set when the phase learns it will not walk after all. The prepass is pure, so
+// a task that has not started yet can simply return; what has already been spent
+// is spent.
+static std::atomic<bool> prepassCancelled{false};
+
+// Index entries per offset-resolution task. One archive can hold most of the
+// entries on the command line -- one Rust staticlib has 157,000 -- so the chunk
+// is the unit of work, not the archive.
+static constexpr uint32_t prepassChunkEntries = 8192;
+
+static void prepassResolveOffsets(ArchivePrepassState &state);
+static void prepassBuildMaps(ArchivePrepassState &state);
+static void prepassFillUndefineds(ArchivePrepassState &state);
+
+static bool prepassStopped(const ArchivePrepassState &state) {
+  return prepassCancelled.load(std::memory_order_relaxed) ||
+         !state.ok.load(std::memory_order_relaxed);
+}
+
+// Stage 1: the archive's symbol table, which the Archive API can only walk in
+// order, so this is one task per archive.
+static void prepassReadIndex(ArchivePrepassState &state) {
+  if (prepassStopped(state))
+    return;
+  deferredDiagnostics = &state.diags;
+  bool ok = state.archive->buildIndex();
+  deferredDiagnostics = nullptr;
+  if (!ok) {
+    state.ok.store(false, std::memory_order_relaxed);
+    return;
+  }
+  prepassResolveOffsets(state);
+}
+
+// Stage 2: each entry's member offset. Resolving one parses that member's header,
+// so this is chunked; doing it once per entry rather than once per member was
+// most of what reading an index cost.
+static void prepassResolveOffsets(ArchivePrepassState &state) {
+  if (prepassStopped(state))
+    return;
+  ArchiveFile *archive = state.archive;
+  uint32_t entries = archive->indexEntries.size();
+  uint32_t numChunks = llvm::divideCeil(entries, prepassChunkEntries);
+  if (numChunks == 0) {
+    prepassBuildMaps(state);
+    return;
+  }
+  state.pending.store(numChunks, std::memory_order_relaxed);
+  for (uint32_t chunk = 0; chunk != numChunks; ++chunk)
+    parallelInput.prepassGroup->spawn([&state, chunk, entries] {
+      if (!prepassStopped(state)) {
+        uint32_t begin = chunk * prepassChunkEntries;
+        if (!state.archive->resolveIndexOffsets(
+                begin, std::min(begin + prepassChunkEntries, entries)))
+          state.ok.store(false, std::memory_order_relaxed);
+      }
+      if (state.pending.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        prepassBuildMaps(state);
+    });
+}
+
+// Stage 3: the per-member maps, map work only now that every offset is resolved
+// and every member header is warm. One task per archive.
+static void prepassBuildMaps(ArchivePrepassState &state) {
+  if (prepassStopped(state))
+    return;
+  if (!state.archive->buildMemberMaps()) {
+    state.ok.store(false, std::memory_order_relaxed);
+    return;
+  }
+  prepassFillUndefineds(state);
+}
+
+// Stage 4: every member's undefined names. This is the walk's largest cost by a
+// wide margin -- not the symbol lookups but the walk over each member's own
+// symbol table, which first-touches tens of thousands of pages of a
+// multi-gigabyte archive mapping. A member that is never extracted costs a
+// worker one wasted scan.
+static void prepassFillUndefineds(ArchivePrepassState &state) {
+  if (prepassStopped(state))
+    return;
+  state.archive->reserveMemberUndefineds(state.members);
+  size_t members = state.members.size();
+  if (members == 0) {
+    state.done.store(true, std::memory_order_release);
+    return;
+  }
+  size_t chunk =
+      std::max<size_t>(1, members / (llvm::parallel::getThreadCount() * 4));
+  size_t numChunks = llvm::divideCeil(members, chunk);
+  state.pending.store(numChunks, std::memory_order_relaxed);
+  for (size_t c = 0; c != numChunks; ++c)
+    parallelInput.prepassGroup->spawn([&state, c, chunk, members] {
+      if (!prepassStopped(state))
+        for (size_t i = c * chunk, e = std::min(i + chunk, members); i != e; ++i)
+          if (!state.members[i].first->fillMemberUndefineds(
+                  state.members[i].second))
+            state.ok.store(false, std::memory_order_relaxed);
+      if (state.pending.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        state.done.store(true, std::memory_order_release);
+    });
+}
+
+static void startArchivePrepass(ArchiveFile *archive) {
+  if (!parallelInput.prepass) {
+    parallelInput.prepass = std::make_unique<llvm::parallel::TaskGroup>();
+    parallelInput.prepassGroup = parallelInput.prepass.get();
+  }
+  ArchivePrepassState &state = parallelInput.prepassStates.emplace_back();
+  state.archive = archive;
+  parallelInput.prepassGroup->spawn([&state] { prepassReadIndex(state); });
+}
+
+// Nothing after this point may read an archive the prepass is still writing, and
+// the publishing paths write the archive's symbols themselves. `willWalk` is the
+// caller's knowledge at the join, which is before the held objects' own
+// LC_LINKER_OPTIONs have been seen: it only decides whether the remaining tasks
+// are worth finishing, never whether the result is used.
+static void joinArchivePrepass(bool willWalk) {
+  if (!parallelInput.prepass)
+    return;
+  if (!willWalk)
+    prepassCancelled.store(true, std::memory_order_relaxed);
+  parallelInput.prepass.reset(); // The destructor waits for the tasks.
+  parallelInput.prepassGroup = nullptr;
+}
+
 // Test hook. Reversing the order in which the workers take the held files apart
 // exercises the fold's out-of-order paths deterministically, at any thread
 // count; the output must not change.
@@ -778,21 +943,17 @@ static void parseHeldFiles(size_t begin) {
 static bool walkArchives() {
   std::vector<ArchiveFile *> &archives = parallelInput.archives;
 
-  // Reading each archive's symbol table is independent per archive, and has to
-  // be in order within one, because that is all the Archive API offers.
-  std::vector<char> usable(archives.size(), 0);
-  std::vector<DeferredDiagnostics> indexDiags(archives.size());
-  std::unique_ptr<TimeTraceScope> ts(new TimeTraceScope("Read archive indexes"));
-  parallelFor(0, archives.size(), [&](size_t i) {
-    deferredDiagnostics = &indexDiags[i];
-    usable[i] = archives[i]->buildIndex();
-    deferredDiagnostics = nullptr;
-  });
-  for (DeferredDiagnostics &diags : indexDiags)
-    if (!diags.empty())
-      replayDiagnostics(diags);
-  for (char ok : usable)
-    if (!ok)
+  // The prepass -- each archive's index, its entries' member offsets, its member
+  // maps and its members' undefined names -- ran on workers from the point each
+  // archive was held, and finishParallelInput() joined it before it parsed the
+  // held objects, so everything it produced is finished and visible here. Its
+  // diagnostics replay in archive order, which is where the serial linker
+  // reported them.
+  assert(parallelInput.prepassStates.size() == archives.size());
+  std::unique_ptr<TimeTraceScope> ts;
+  for (ArchivePrepassState &state : parallelInput.prepassStates)
+    if (!state.ok.load(std::memory_order_acquire) ||
+        !state.done.load(std::memory_order_acquire))
       return false;
 
   // Chunks of index entries. Everything that is per entry rather than per archive
@@ -804,58 +965,14 @@ static bool walkArchives() {
     uint32_t begin;
     uint32_t end;
   };
-  constexpr uint32_t chunkEntries = 8192;
   std::vector<EntryChunk> chunks;
   for (uint32_t i = 0; i != archives.size(); ++i) {
     uint32_t n = archives[i]->indexEntries.size();
-    for (uint32_t b = 0; b < n; b += chunkEntries)
-      chunks.push_back({i, b, std::min(b + chunkEntries, n)});
+    for (uint32_t b = 0; b < n; b += prepassChunkEntries)
+      chunks.push_back({i, b, std::min(b + prepassChunkEntries, n)});
   }
 
-  // Resolving an entry's member offset parses that member's header, so doing it
-  // once per entry -- 157,000 times for libgkrust.a, not once per member -- was
-  // most of what reading the indexes cost.
-  ts.reset(new TimeTraceScope("Resolve archive member offsets"));
-  std::atomic<bool> offsetsOk{true};
-  parallelForEach(chunks, [&](const EntryChunk &chunk) {
-    if (!archives[chunk.archiveIndex]->resolveIndexOffsets(chunk.begin,
-                                                           chunk.end))
-      offsetsOk.store(false, std::memory_order_relaxed);
-  });
-  if (!offsetsOk.load(std::memory_order_relaxed))
-    return false;
-  ts.reset(new TimeTraceScope("Build archive member maps"));
-  parallelFor(0, archives.size(), [&](size_t i) {
-    usable[i] = archives[i]->buildMemberMaps();
-  });
-  for (char ok : usable)
-    if (!ok)
-      return false;
-
-  // One pass over every index entry, on workers, read-only on the symbol table,
-  // yielding both the earliest provider of each name and the entries the serial
-  // walk has to look at; see below.
-  ts.reset();
-  providerShards = std::make_unique<ProviderShard[]>(numProviderShards);
-  // Every member's undefined names, enumerated on workers. This is the walk's
-  // largest serial cost by a wide margin -- not the symbol lookups but the walk
-  // over each member's own symbol table, which first-touches tens of thousands
-  // of pages of a multi-gigabyte archive mapping -- and it depends only on the
-  // archive bytes, so it is pure. A member that is never extracted costs a
-  // worker one wasted scan. Parallelism is per member, not per archive: one
-  // Rust staticlib can hold every member on the command line.
   {
-    TimeTraceScope timeScope("Prepare archive member undefineds");
-    std::vector<std::pair<ArchiveFile *, uint64_t>> members;
-    for (ArchiveFile *archive : archives)
-      archive->reserveMemberUndefineds(members);
-    std::atomic<bool> allNative{true};
-    parallelForEach(members, [&](std::pair<ArchiveFile *, uint64_t> &m) {
-      if (!m.first->fillMemberUndefineds(m.second))
-        allNative.store(false, std::memory_order_relaxed);
-    });
-    if (!allNative.load(std::memory_order_relaxed))
-      return false;
     // An extracted member that brings in its own libraries would have those
     // inputs reference names after the phase has ended. The walk creates no slot
     // for an index entry it does not extract, so such a name would be created
@@ -882,6 +999,16 @@ static bool walkArchives() {
     if (maxEntries + events > ordinalWalkMax)
       return false;
   }
+
+  // Every decline is behind us, so the prepass's diagnostics can be replayed:
+  // buildIndex() makes the same first-member architecture check as
+  // addLazySymbols(), and on a command line that declines after the prepass has
+  // run it is addLazySymbols() that reports it. Replaying before the decline
+  // decisions emitted that warning twice.
+  for (ArchivePrepassState &state : parallelInput.prepassStates)
+    if (!state.diags.empty())
+      replayDiagnostics(state.diags);
+
   // One pass over every index entry, on workers, read-only on the symbol table,
   // producing both of the things the serial walk needs from it: the earliest
   // provider of each name, and the entries whose name is in a state the walk can
@@ -897,6 +1024,7 @@ static bool walkArchives() {
   // serial select loop instead of failing a provider lookup, which on Chromium is
   // half a million lookups moved from here into the serial part.
   ts.reset(new TimeTraceScope("Filter and fold archive indexes"));
+  providerShards = std::make_unique<ProviderShard[]>(numProviderShards);
   std::vector<llvm::SmallVector<uint32_t, 0>> chunkCandidates(chunks.size());
   parallelFor(0, chunks.size(), [&](size_t chunkIndex) {
     const EntryChunk &chunk = chunks[chunkIndex];
@@ -1275,6 +1403,12 @@ static void resetParallelInputPhase() {
   parallelInput.archiveOrdinals.clear();
   parallelInput.nextOrdinal = 0;
   parallelInput.heldLinkerOptions = false;
+  // Already joined at the end of the phase; the reset() is for the link that
+  // never reached one, and its destructor still waits.
+  parallelInput.prepass.reset();
+  parallelInput.prepassGroup = nullptr;
+  parallelInput.prepassStates.clear();
+  prepassCancelled.store(false, std::memory_order_relaxed);
 }
 
 // After the phase, a name referenced for the first time still has to be able to
@@ -1316,6 +1450,23 @@ static void finishParallelInput(bool moreInputsFollow = false) {
   symtab->serialCtx = nullptr;
 
   auto &objects = parallelInput.objects;
+
+  // Join the prepass before the held objects are parsed, not just before the
+  // archives are walked or published. Both are fault-heavy parallel phases --
+  // the prepass first-touches the index and every member's symbol table, the
+  // held parse the objects' own pages -- and overlapping them costs more in the
+  // kernel than the overlap saves: with the join after the parse, Chromium debug
+  // spent about 150 ms more system time and lost 2.1% of wall while its user
+  // cycles fell (`PROTO-stage2-s4-prepass-001`, and `-002` isolating the merged
+  // pass). Joining here keeps the two apart structurally rather than by reading
+  // a scheduling signal. Where the argument walk after the first archive is long
+  // enough to absorb the prepass -- Firefox, both Rust links, the dylib and TAPI
+  // wait -- this join returns at once and the overlap is still free; where it is
+  // not, the phases run in the order they ran before the prepass existed.
+  {
+    TimeTraceScope timeScope("Join archive index prepass");
+    joinArchivePrepass(/*willWalk=*/!moreInputsFollow);
+  }
   {
     TimeTraceScope timeScope("Parse held object files");
     parseHeldFiles(0);
@@ -1557,6 +1708,10 @@ static void endHeldInput(InputFile *file, bool holdParse, bool holdArchiveIndex,
   if (archive->canWalk()) {
     parallelInput.archives.push_back(archive);
     parallelInput.archiveOrdinals.push_back(ctx->top);
+    // Everything the walk needs from the archive's bytes starts now, on workers,
+    // so that it overlaps the rest of the argument walk instead of running in
+    // front of the walk's first serial decision.
+    startArchivePrepass(archive);
     return;
   }
   // This archive has to publish its index right here, which means every object
@@ -3088,6 +3243,12 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
 
   ctx->e.initialize(stdoutOS, stderrOS, exitEarly, disableOutput);
   ctx->e.cleanupCallback = []() {
+    // A fatal() raised inside the input phase leaves the prepass tasks running,
+    // and they are reading archive buffers that this callback and the arena
+    // teardown behind it are about to release. Wait for them before anything
+    // else here frees what they read; the prepass is pure, so abandoning what
+    // has not started costs only the work already spent.
+    joinArchivePrepass(/*willWalk=*/false);
     resolvedFrameworks.clear();
     resolvedLibraries.clear();
     cachedReads.clear();

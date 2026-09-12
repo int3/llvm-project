@@ -3225,6 +3225,13 @@ void macho::forEachUndefinedName(MemoryBufferRef mb,
 }
 
 bool ArchiveFile::canWalk() {
+  // A thin archive's members are separate files on disk, and Child::getBuffer()
+  // opens one lazily by appending to the Archive's ThinBuffers vector with no
+  // lock, so two workers reading two members race on it. Both the prepass and
+  // the walk read members on workers, so the walker cannot own a thin archive's
+  // index; addLazySymbols() reads them on the main thread, as it always did.
+  if (file->isThin())
+    return false;
   if (file->isEmpty() ||
       (file->hasSymbolTable() && file->getNumberOfSymbols() == 0))
     return true;

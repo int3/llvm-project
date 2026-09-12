@@ -1,16 +1,21 @@
 # REQUIRES: x86
-## The walker derives the earliest provider of each index-entry name and the
+## Two things the walker does off the ordered argument walk: it reads each held
+## archive's index -- the index itself, its entries' member offsets, the member
+## maps and each member's undefined names -- as worker tasks started when the
+## archive is held, and it derives both the earliest provider of each name and the
 ## entries the serial walk has to visit from one chunked pass over the index, with
-## one symbol-table lookup per entry instead of the two passes and two lookups it
-## took before. Neither which member is extracted, nor the order, nor the output
-## bytes may change, at any thread count.
+## one symbol-table lookup per entry instead of two passes and two lookups.
+## Neither which member is extracted, nor the order, nor the output bytes may
+## change, at any thread count.
 ##
 ## What this covers that parallel-input-archive.s does not: three archives held at
-## once, so a member of the first schedules an entry of the second and the
-## per-archive candidate lists are built from several chunks each; an archive whose
-## index is wider than one 8192-entry chunk, so the candidate lists have to be
-## concatenated in index order across chunks; and an object after the archives,
-## which ends the phase where it stands and publishes the indexes the ordinary way.
+## once, so three prepass chains run concurrently and a member of the first
+## schedules an entry of the second, and the per-archive candidate lists are built
+## from several chunks each; an archive whose index is wider than one 8192-entry
+## chunk, so the offset resolution and the candidate lists both span chunks and
+## the lists have to be concatenated in index order; and an object after the
+## archives, which ends the phase where it stands, abandons whatever of the
+## prepass has not finished, and publishes the indexes the ordinary way.
 
 # RUN: rm -rf %t; split-file %s %t
 # RUN: mkdir -p %t/x1 %t/x2 %t/x8 %t/x16 %t/d1 %t/d2 %t/d8 %t/d16
