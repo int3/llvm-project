@@ -159,14 +159,15 @@
 ## The record ordinal's three fields share 63 bits of one integer, so a link big
 ## enough to overflow one of them has to be handled rather than truncated.
 ## LLD_ORDINAL_BITS narrows the widths so that both paths can be reached here.
-# RUN: mkdir -p %t/narrowwalk %t/narrowtop
+# RUN: mkdir -p %t/narrowwalk
 ## Too few bits for the archive's walk events: the walk cannot number them, so it
 ## declines and the archives publish their indexes the ordinary way. Same output.
 # RUN: env LLD_ORDINAL_BITS=17,1,23 %lld -lSystem -o %t/narrowwalk/out --threads=8 %t/dysmain.o %t/dys.a
 # RUN: cmp %t/dys1/out %t/narrowwalk/out
 ## Too few bits for the command line: a clear error, not a wrong ordinal.
-# RUN: env LLD_ORDINAL_BITS=1,23,23 not %lld -lSystem -o %t/narrowtop/out --threads=8 %t/dysmain.o %t/dys.a 2>&1 | FileCheck %s --check-prefix=ORDOVER
-# ORDOVER: error: input record ordinal out of range
+## The top-level-ordinal overflow diagnostic is in
+## parallel-input-ordinal-overflow.s: it comes from fatal(), which the
+## LLD_IN_TEST=2 harness cannot show.
 
 ## Design 7's "Stage 2 position rule" minimal test. a.o references _foo; the
 ## member defining it has undefineds _bar then _qux in nlist order; the TBD is

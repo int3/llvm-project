@@ -44,12 +44,9 @@
 # RUN: not %lld -lSystem --threads=1 %t/tlvbad.o -o /dev/null 2>&1 | FileCheck %s --check-prefix=TLVBAD
 # RUN: not %lld -lSystem --threads=8 %t/tlvbad.o -o /dev/null 2>&1 | FileCheck %s --check-prefix=TLVBAD
 
-## ...and a dead referent under -init_offsets.
-# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-macos11.0 %t/deadref.s -o %t/deadref.o
-# RUN: not %lld -lSystem -init_offsets --threads=1 %t/deadref.o -o /dev/null 2>&1 | \
-# RUN:   FileCheck %s --check-prefix=DEADREF
-# RUN: not %lld -lSystem -init_offsets --threads=8 %t/deadref.o -o /dev/null 2>&1 | \
-# RUN:   FileCheck %s --check-prefix=DEADREF
+## ...and a dead referent under -init_offsets, which is in
+## init-offsets-dead-referent.s: that one comes from fatal(), which the
+## LLD_IN_TEST=2 harness cannot show.
 
 ## Ordered, not -DAG: these pin the replay's order and its arguments. The three
 ## bindings of _gfoo differ only in the addend the event carries.
@@ -107,7 +104,6 @@
 
 # TLVBAD: error: {{.*}}tlvbad.o:(symbol _main+0x3): TLV relocation requires that symbol _notatlv be thread-local
 
-# DEADREF: error: {{.*}}deadref.o:(symbol _main+0x3): cannot reference _init_slot defined in __mod_init_func when -init_offsets is used
 
 #--- foo.s
 .globl _ffoo
@@ -217,14 +213,3 @@ _main:
 .data
 _notatlv:
   .quad 0
-
-#--- deadref.s
-.globl _main
-.text
-_main:
-  leaq _init_slot(%rip), %rax
-  retq
-
-.section __DATA,__mod_init_func,mod_init_funcs
-_init_slot:
-  .quad _main
