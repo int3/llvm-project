@@ -3190,6 +3190,31 @@ static void forEachUndefinedNameImpl(MemoryBufferRef mb,
   }
 }
 
+bool macho::hasLinkerOptions(MemoryBufferRef mb) {
+  using namespace llvm::MachO;
+  // ncmds sits at the same offset in mach_header and mach_header_64, so this
+  // pass does not need forEachUndefinedName's LP specialization. Only the
+  // header and the load commands are read; the symbol table is not touched.
+  const char *buf = mb.getBufferStart();
+  size_t size = mb.getBufferSize();
+  if (size < sizeof(mach_header) || size < size_t(target->headerSize))
+    return false;
+  auto *hdr = reinterpret_cast<const mach_header *>(buf);
+  const char *p = buf + target->headerSize;
+  const char *end = buf + size;
+  for (uint32_t i = 0, n = hdr->ncmds; i != n; ++i) {
+    if (size_t(end - p) < sizeof(load_command))
+      break;
+    auto *cmd = reinterpret_cast<const load_command *>(p);
+    if (cmd->cmd == LC_LINKER_OPTION)
+      return true;
+    if (cmd->cmdsize < sizeof(load_command) || size_t(end - p) < cmd->cmdsize)
+      break;
+    p += cmd->cmdsize;
+  }
+  return false;
+}
+
 void macho::forEachUndefinedName(MemoryBufferRef mb,
                                  llvm::function_ref<void(StringRef)> fn,
                                  bool *sawLinkerOption) {

@@ -589,6 +589,12 @@ extern bool parallelParseActive;
 // symbols; the walker reads the index instead.
 extern bool deferArchiveIndex;
 
+// True if the object carries an LC_LINKER_OPTION, read from the load commands
+// alone. The parallel input phase asks this before it holds an object, because
+// an autolinked library loads after the phase and the archive walker cannot run
+// when any input follows it.
+bool hasLinkerOptions(MemoryBufferRef mb);
+
 // Calls fn with the name of every external undefined symbol of a Mach-O object
 // file, in nlist order, without parsing it. This is what lets the walker decide
 // which archive member to extract next without waiting for the parse of the

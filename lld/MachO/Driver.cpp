@@ -623,6 +623,12 @@ struct ParallelInputPhase {
   std::vector<ArchiveFile *> archives;
   std::vector<uint32_t> archiveOrdinals;
   uint32_t nextOrdinal = 0;
+  // Set when a held object carries an LC_LINKER_OPTION, which means a library
+  // loads after the phase and the walk cannot run. Learned at hold time, from
+  // the object's load commands, so the decision is available before the first
+  // archive is held instead of only at finishParallelInput(). Monotone: an
+  // object that follows a held archive is not held at all.
+  bool heldLinkerOptions = false;
 };
 
 // Where the first member defining a name lives. The walker needs the earliest
@@ -1125,6 +1131,7 @@ static void resetParallelInputPhase() {
   parallelInput.archives.clear();
   parallelInput.archiveOrdinals.clear();
   parallelInput.nextOrdinal = 0;
+  parallelInput.heldLinkerOptions = false;
 }
 
 // After the phase, a name referenced for the first time still has to be able to
@@ -1331,16 +1338,30 @@ static bool beginHeldInput(MemoryBufferRef mbref, bool isLazy,
       // An object after an archive can define a name the archive would
       // otherwise have been extracted for, so the archives that precede it are
       // walked first and this object is resolved in the ordinary serial way.
-      if (isLazy || !parallelInput.archives.empty())
+      if (isLazy || !parallelInput.archives.empty()) {
         finishParallelInput(/*moreInputsFollow=*/true);
-      else
+      } else {
         holdParse = true;
+        // An autolinked library loads after the phase, so no archive held after
+        // this object can be walked. Reading it here instead of waiting for the
+        // held parse keeps the whole archive path on the serial position it had
+        // before the phase existed, including its overlap with the TAPI
+        // pipeline, rather than deferring it to the end of the phase.
+        if (!parallelInput.heldLinkerOptions && hasLinkerOptions(mbref))
+          parallelInput.heldLinkerOptions = true;
+      }
       break;
     case file_magic::archive:
       // An archive that loads every member does so at its own position, so it
       // needs the objects before it resolved and the table in its serial state.
+      // An input that follows the phase -- an autolinked library named by a
+      // held or an already-parsed object -- means the walk would decline later
+      // anyway, and declining now is strictly better: the archive publishes its
+      // index at its own command-line position on the ordinary serial path.
       holdArchiveIndex = loadType == LoadType::CommandLine &&
-                         !config->allLoad && !config->forceLoadObjC;
+                         !config->allLoad && !config->forceLoadObjC &&
+                         !parallelInput.heldLinkerOptions &&
+                         unprocessedLCLinkerOptions.empty();
       if (!holdArchiveIndex)
         finishParallelInput(/*moreInputsFollow=*/true);
       break;
