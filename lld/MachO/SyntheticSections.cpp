@@ -2223,7 +2223,7 @@ void CStringSection::addInput(CStringInputSection *isec) {
 void CStringSection::writeTo(uint8_t *buf) const {
   for (const CStringInputSection *isec : inputs) {
     for (const auto &[i, piece] : llvm::enumerate(isec->pieces)) {
-      if (!piece.live)
+      if (!piece.isLive())
         continue;
       StringRef string = isec->getStringRef(i);
       memcpy(buf + piece.outSecOff, string.data(), string.size());

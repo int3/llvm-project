@@ -93,7 +93,7 @@ static MapInfo gatherMapInfo() {
           if (auto isec = dyn_cast<CStringInputSection>(subsec.isec)) {
             auto &liveCStrings = info.liveCStringsForSection[isec->parent];
             for (const auto &[i, piece] : llvm::enumerate(isec->pieces)) {
-              if (piece.live)
+              if (piece.isLive())
                 liveCStrings.push_back({isec->parent->addr + piece.outSecOff,
                                         {fileIndex, isec->getStringRef(i)}});
               else

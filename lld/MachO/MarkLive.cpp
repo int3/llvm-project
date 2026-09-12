@@ -17,6 +17,9 @@
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/TimeProfiler.h"
 
+#include <algorithm>
+#include <vector>
+
 namespace lld::macho {
 
 using namespace llvm;
@@ -180,13 +183,13 @@ void MarkLiveImpl<RecordWhyLive>::markTransitively() {
     } while (!worklist.empty());
   } else {
 
-    // Literal-section liveness is backed by packed bitfields. Workers only
-    // collect their writes; the serial merge below applies them after a frontier
-    // has drained. Concat sections and symbols use their addressable atomic bits.
-    using LiteralEntry = std::pair<InputSection *, uint64_t>;
+    // Every liveness bit a worker touches is now set atomically: concat sections
+    // and symbols through their own atomic flags, literal pieces through
+    // InputSection::markLive(), whose CStringInputSection and
+    // WordLiteralInputSection implementations OR into an atomic word. There is
+    // no serial literal merge left.
     auto enqueueParallel = [](InputSection *isec, uint64_t off,
-                              SmallVectorImpl<WorklistEntry *> &next,
-                              SmallVectorImpl<LiteralEntry> &literals) {
+                              SmallVectorImpl<WorklistEntry *> &next) {
       if (auto *concat = dyn_cast<ConcatInputSection>(isec)) {
         if (!concat->live.load(std::memory_order_relaxed) &&
             !concat->live.exchange(true, std::memory_order_relaxed)) {
@@ -195,32 +198,31 @@ void MarkLiveImpl<RecordWhyLive>::markTransitively() {
         }
         return;
       }
-      literals.emplace_back(isec, off);
+      isec->markLive(off);
     };
-    auto addSymParallel = [&](Symbol *s, SmallVectorImpl<WorklistEntry *> &next,
-                               SmallVectorImpl<LiteralEntry> &literals) {
+    auto addSymParallel = [&](Symbol *s,
+                              SmallVectorImpl<WorklistEntry *> &next) {
       if (s->used.load(std::memory_order_relaxed) ||
           s->used.exchange(true, std::memory_order_relaxed))
         return;
       if (auto *d = dyn_cast<Defined>(s)) {
         if (d->isec())
-          enqueueParallel(d->isec(), d->value, next, literals);
+          enqueueParallel(d->isec(), d->value, next);
         if (d->unwindEntry())
-          enqueueParallel(d->unwindEntry(), 0, next, literals);
+          enqueueParallel(d->unwindEntry(), 0, next);
       }
     };
     auto visit = [&](ConcatInputSection *isec,
-                     SmallVectorImpl<WorklistEntry *> &next,
-                     SmallVectorImpl<LiteralEntry> &literals) {
+                     SmallVectorImpl<WorklistEntry *> &next) {
       for (const Relocation &r : isec->relocs) {
         if (auto *s = r.getReferent().dyn_cast<Symbol *>())
-          addSymParallel(s, next, literals);
+          addSymParallel(s, next);
         else
-          enqueueParallel(cast<InputSection *>(r.getReferent()), r.getAddend(), next,
-                          literals);
+          enqueueParallel(cast<InputSection *>(r.getReferent()), r.getAddend(),
+                          next);
       }
       for (Defined *d : isec->symbols)
-        addSymParallel(d, next, literals);
+        addSymParallel(d, next);
     };
 
     while (true) {
@@ -230,16 +232,12 @@ void MarkLiveImpl<RecordWhyLive>::markTransitively() {
         const size_t workers =
             std::min(frontier.size(), llvm::parallel::getThreadCount());
         if (workers == 1 || frontier.size() < 1024) {
-          SmallVector<LiteralEntry, 256> literals;
           for (WorklistEntry *entry : frontier)
-            visit(cast<ConcatInputSection>(entry), worklist, literals);
-          for (const LiteralEntry &entry : literals)
-            entry.first->markLive(entry.second);
+            visit(cast<ConcatInputSection>(entry), worklist);
           continue;
         }
 
         SmallVector<SmallVector<WorklistEntry *, 0>, 0> nextWorklists(workers);
-        SmallVector<SmallVector<LiteralEntry, 0>, 0> literalWorklists(workers);
         {
           llvm::parallel::TaskGroup tasks;
           for (size_t worker = 0; worker != workers; ++worker) {
@@ -247,16 +245,13 @@ void MarkLiveImpl<RecordWhyLive>::markTransitively() {
             const size_t end = frontier.size() * (worker + 1) / workers;
             tasks.spawn([&, worker, begin, end] {
               for (size_t i = begin; i != end; ++i)
-                visit(cast<ConcatInputSection>(frontier[i]), nextWorklists[worker],
-                      literalWorklists[worker]);
+                visit(cast<ConcatInputSection>(frontier[i]),
+                      nextWorklists[worker]);
             });
           }
         }
         for (SmallVectorImpl<WorklistEntry *> &next : nextWorklists)
           worklist.append(next.begin(), next.end());
-        for (SmallVectorImpl<LiteralEntry> &literals : literalWorklists)
-          for (const LiteralEntry &entry : literals)
-            entry.first->markLive(entry.second);
       }
 
       // Keep LIVE_SUPPORT and its fixed point serial. It depends on all literal
@@ -298,40 +293,62 @@ void markLive() {
   // Add GC roots.
   if (config->entry)
     marker->addSym(config->entry);
-  for (Symbol *sym : symtab->getSymbols()) {
-    if (auto *defined = dyn_cast<Defined>(sym)) {
-      // -exported_symbol(s_list)
-      if (!config->exportedSymbols.empty() &&
-          config->exportedSymbols.match(defined->getName())) {
-        // NOTE: Even though exporting private externs is an ill-defined
-        // operation, we are purposely not checking for privateExtern in
-        // order to follow ld64's behavior of treating all exported private
-        // extern symbols as live, irrespective of whether they are autohide.
-        marker->addSym(defined);
-        continue;
-      }
-
-      // public symbols explicitly marked .no_dead_strip
-      if (defined->referencedDynamically || defined->noDeadStrip) {
-        marker->addSym(defined);
-        continue;
-      }
-
-      // FIXME: When we implement these flags, make symbols from them GC
-      // roots:
-      // * -reexported_symbol(s_list)
-      // * -alias_list
-      // * -init
-
-      // In dylibs and bundles and in executables with -export_dynamic,
-      // all external functions are GC roots.
-      bool externsAreRoots =
-          config->outputType != MH_EXECUTE || config->exportDynamic;
-      if (externsAreRoots && !defined->privateExtern) {
-        marker->addSym(defined);
-        continue;
-      }
-    }
+  // Deciding whether a symbol is a root is a pure read of its name and flags,
+  // and on links with an -exported_symbols_list the name hashing dominates this
+  // scope. So select roots on workers into per-chunk lists and then addSym()
+  // them serially in symVector order, which is exactly the order the serial loop
+  // used. -why_live prints as it marks, so it keeps the serial path.
+  ArrayRef<Symbol *> symbols = symtab->getSymbols();
+  // In dylibs and bundles and in executables with -export_dynamic, all
+  // external functions are GC roots.
+  const bool externsAreRoots =
+      config->outputType != MH_EXECUTE || config->exportDynamic;
+  auto isRoot = [externsAreRoots](const Symbol *sym) {
+    auto *defined = dyn_cast<Defined>(sym);
+    if (!defined)
+      return false;
+    // -exported_symbol(s_list)
+    //
+    // NOTE: Even though exporting private externs is an ill-defined
+    // operation, we are purposely not checking for privateExtern in
+    // order to follow ld64's behavior of treating all exported private
+    // extern symbols as live, irrespective of whether they are autohide.
+    if (!config->exportedSymbols.empty() &&
+        config->exportedSymbols.match(defined->getName()))
+      return true;
+    // public symbols explicitly marked .no_dead_strip
+    if (defined->referencedDynamically || defined->noDeadStrip)
+      return true;
+    // FIXME: When we implement these flags, make symbols from them GC
+    // roots:
+    // * -reexported_symbol(s_list)
+    // * -alias_list
+    // * -init
+    return externsAreRoots && !defined->privateExtern;
+  };
+  const size_t rootChunks =
+      config->whyLive.empty() && symbols.size() >= 2048 &&
+              llvm::parallel::strategy.ThreadsRequested != 1
+          ? llvm::parallel::getThreadCount()
+          : 1;
+  if (rootChunks <= 1) {
+    for (Symbol *sym : symbols)
+      if (isRoot(sym))
+        marker->addSym(sym);
+  } else {
+    std::vector<std::vector<Symbol *>> chunkRoots(rootChunks);
+    llvm::parallelFor(0, rootChunks, [&](size_t chunk) {
+      const size_t begin = symbols.size() * chunk / rootChunks;
+      const size_t end = symbols.size() * (chunk + 1) / rootChunks;
+      std::vector<Symbol *> &roots = chunkRoots[chunk];
+      roots.reserve((end - begin) / 8 + 1);
+      for (size_t i = begin; i != end; ++i)
+        if (isRoot(symbols[i]))
+          roots.push_back(symbols[i]);
+    });
+    for (const std::vector<Symbol *> &roots : chunkRoots)
+      for (Symbol *sym : roots)
+        marker->addSym(sym);
   }
   // -u symbols
   for (Symbol *sym : config->explicitUndefineds)

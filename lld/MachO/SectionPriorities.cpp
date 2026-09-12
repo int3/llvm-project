@@ -494,7 +494,7 @@ void macho::PriorityBuilder::forEachStringPiece(
   std::vector<std::pair<CStringInputSection *, size_t>> unorderedPieces;
   for (CStringInputSection *isec : inputs) {
     for (const auto &[stringPieceIdx, piece] : llvm::enumerate(isec->pieces)) {
-      if (!piece.live)
+      if (!piece.isLive())
         continue;
       // Process pieces in input order if we have no cstrings in our orderfile
       if (forceInputOrder || cStringPriorities.empty()) {
@@ -504,7 +504,7 @@ void macho::PriorityBuilder::forEachStringPiece(
       uint32_t hash =
           computeHash
               ? (xxh3_64bits(isec->getStringRef(stringPieceIdx)) & 0x7fffffff)
-              : piece.hash;
+              : piece.getHash();
       if (auto priority = getCStringPriority(hash, isec->getFile()))
         orderedPieces.emplace_back(*priority, isec, stringPieceIdx);
       else

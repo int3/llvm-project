@@ -16,12 +16,12 @@
 #include "lld/Common/LLVM.h"
 #include "lld/Common/Memory.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/CachedHashString.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/BinaryFormat/MachO.h"
 
 #include <atomic>
+#include <memory>
 
 namespace lld {
 namespace macho {
@@ -198,14 +198,45 @@ inline bool isCoalescedWeak(InputSection *isec) {
 struct StringPiece {
   // Offset from the start of the containing input section.
   uint32_t inSecOff;
-  uint32_t live : 1;
-  // Only set if deduplicating literals
-  uint32_t hash : 31;
+  // Liveness and the dedup hash share one 32-bit word: bit 0 is the live flag,
+  // bits 1-31 are the hash (only set if deduplicating literals). Packing them
+  // explicitly lets dead-strip workers set the live bit with a single atomic OR
+  // rather than deferring literal writes to a serial merge. `hash` is never
+  // written after splitIntoPieces(), so the OR cannot lose it, and the other
+  // two fields live in words of their own.
+  std::atomic<uint32_t> liveAndHash;
   // Offset from the start of the containing output section.
   uint64_t outSecOff = 0;
 
   StringPiece(uint64_t off, uint32_t hash)
-      : inSecOff(off), live(!config->deadStrip), hash(hash) {}
+      : inSecOff(off), liveAndHash((hash << 1) | (config->deadStrip ? 0 : 1)) {}
+
+  // std::atomic is neither copyable nor movable, but StringPiece is stored in a
+  // std::vector and passed by value to predicates. Every such copy happens
+  // outside markLive(), so a relaxed load is enough.
+  StringPiece(const StringPiece &other)
+      : inSecOff(other.inSecOff),
+        liveAndHash(other.liveAndHash.load(std::memory_order_relaxed)),
+        outSecOff(other.outSecOff) {}
+  StringPiece &operator=(const StringPiece &other) {
+    inSecOff = other.inSecOff;
+    liveAndHash.store(other.liveAndHash.load(std::memory_order_relaxed),
+                      std::memory_order_relaxed);
+    outSecOff = other.outSecOff;
+    return *this;
+  }
+
+  bool isLive() const { return liveAndHash.load(std::memory_order_relaxed) & 1; }
+  void setLive(bool live) {
+    uint32_t word = liveAndHash.load(std::memory_order_relaxed);
+    liveAndHash.store(live ? (word | 1) : (word & ~uint32_t(1)),
+                      std::memory_order_relaxed);
+  }
+  // Unlike setLive(), safe to call concurrently on the same piece.
+  void markLiveAtomic() { liveAndHash.fetch_or(1, std::memory_order_relaxed); }
+  uint32_t getHash() const {
+    return liveAndHash.load(std::memory_order_relaxed) >> 1;
+  }
 };
 
 static_assert(sizeof(StringPiece) == 16, "StringPiece is too big!");
@@ -228,8 +259,14 @@ public:
         deduplicateLiterals(dedupLiterals) {}
 
   uint64_t getOffset(uint64_t off) const override;
-  bool isLive(uint64_t off) const override { return getStringPiece(off).live; }
-  void markLive(uint64_t off) override { getStringPiece(off).live = true; }
+  bool isLive(uint64_t off) const override {
+    return getStringPiece(off).isLive();
+  }
+  // Safe to call concurrently: getStringPiece() only reads, and the live bit is
+  // set with an atomic OR.
+  void markLive(uint64_t off) override {
+    getStringPiece(off).markLiveAtomic();
+  }
   // Find the StringPiece that contains this offset.
   StringPiece &getStringPiece(uint64_t off);
   const StringPiece &getStringPiece(uint64_t off) const;
@@ -255,7 +292,7 @@ public:
   LLVM_ATTRIBUTE_ALWAYS_INLINE
   llvm::CachedHashStringRef getCachedHashStringRef(size_t i) const {
     assert(deduplicateLiterals);
-    return {getStringRef(i), pieces[i].hash};
+    return {getStringRef(i), pieces[i].getHash()};
   }
 
   static bool classof(const InputSection *isec) {
@@ -275,10 +312,14 @@ public:
                           uint32_t align);
   uint64_t getOffset(uint64_t off) const override;
   bool isLive(uint64_t off) const override {
-    return live[off >> power2LiteralSize];
+    size_t i = off >> power2LiteralSize;
+    return (liveWords[i / 64].load(std::memory_order_relaxed) >> (i % 64)) & 1;
   }
+  // Safe to call concurrently on the same section.
   void markLive(uint64_t off) override {
-    live[off >> power2LiteralSize] = true;
+    size_t i = off >> power2LiteralSize;
+    liveWords[i / 64].fetch_or(uint64_t(1) << (i % 64),
+                               std::memory_order_relaxed);
   }
 
   static bool classof(const InputSection *isec) {
@@ -287,8 +328,10 @@ public:
 
 private:
   unsigned power2LiteralSize;
-  // The liveness of data[off] is tracked by live[off >> power2LiteralSize].
-  llvm::BitVector live;
+  // The liveness of data[off] is tracked by bit (off >> power2LiteralSize) of
+  // liveWords. Dead-strip workers set those bits atomically, so no serial merge
+  // of literal liveness is needed.
+  std::unique_ptr<std::atomic<uint64_t>[]> liveWords;
 };
 
 inline uint8_t sectionType(uint32_t flags) {

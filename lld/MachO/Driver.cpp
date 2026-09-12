@@ -2065,7 +2065,7 @@ static void addSynthenticMethnames() {
                                 /*align=*/1, /*dedupLiterals=*/true);
   isec->splitIntoPieces();
   for (auto &piece : isec->pieces)
-    piece.live = true;
+    piece.setLive(true);
   section.subsections.push_back({0, isec});
   in.objcMethnameSection->addInput(isec);
   in.objcMethnameSection->isec->markLive(0);

@@ -628,7 +628,7 @@ void ObjcCategoryMerger::tryEraseDefinedAtIsecOffset(
   else if (auto *csisec = dyn_cast_or_null<CStringInputSection>(sym->isec())) {
     uint32_t totalOffset = sym->value + reloc->getAddend();
     StringPiece &piece = csisec->getStringPiece(totalOffset);
-    piece.live = false;
+    piece.setLive(false);
   } else {
     llvm_unreachable("erased symbol has to be Defined or CStringInputSection");
   }
@@ -1071,7 +1071,7 @@ Defined *ObjcCategoryMerger::emitCategoryName(const std::string &name,
   parentSection->subsections.push_back({0, newStringSec});
 
   newStringSec->splitIntoPieces();
-  newStringSec->pieces[0].live = true;
+  newStringSec->pieces[0].setLive(true);
   newStringSec->parent = infoCategoryWriter.catNameInfo.outputSection;
   in.cStringSection->addInput(newStringSec);
   assert(newStringSec->pieces.size() == 1);
