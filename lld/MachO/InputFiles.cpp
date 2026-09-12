@@ -74,11 +74,13 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/StringSaver.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/TarWriter.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/TextAPI/Architecture.h"
 #include "llvm/TextAPI/InterfaceFile.h"
 
+#include <cstdio>
 #include <optional>
 #include <type_traits>
 
@@ -783,7 +785,7 @@ static macho::Symbol *createDefined(const NList &sym, StringRef name,
     else if (isWeakDefCanBeHidden)
       isPrivateExtern = true;
     return symtab->addDefinedRecord(
-        {/*ordinal=*/0, name, isec->getFile(), isec, value, size,
+        {/*ordinal=*/RecordOrdinal(), name, isec->getFile(), isec, value, size,
          (sym.n_desc & N_WEAK_DEF) != 0, isPrivateExtern,
          (sym.n_desc & REFERENCED_DYNAMICALLY) != 0,
          (sym.n_desc & N_NO_DEAD_STRIP) != 0, isWeakDefCanBeHidden, isCold});
@@ -808,7 +810,7 @@ static macho::Symbol *createAbsolute(const NList &sym, InputFile *file,
   if (sym.n_type & N_EXT) {
     bool isPrivateExtern = sym.n_type & N_PEXT || forceHidden;
     return symtab->addDefinedRecord(
-        {/*ordinal=*/0, name, file, nullptr, sym.n_value, /*size=*/0,
+        {/*ordinal=*/RecordOrdinal(), name, file, nullptr, sym.n_value, /*size=*/0,
          /*isWeakDef=*/false, isPrivateExtern,
          /*isReferencedDynamically=*/false,
          (sym.n_desc & N_NO_DEAD_STRIP) != 0,
@@ -1089,6 +1091,7 @@ void ObjFile::parseLinkerOptions(SmallVectorImpl<StringRef> &LCLinkerOptions) {
 SmallVector<StringRef> macho::unprocessedLCLinkerOptions;
 bool macho::deferDirectObjParse = false;
 bool macho::parallelParseActive = false;
+bool macho::deferArchiveIndex = false;
 
 ObjFile::ObjFile(MemoryBufferRef mb, uint32_t modTime, StringRef archiveName,
                  bool lazy, bool forceHidden, bool compatArch,
@@ -2990,7 +2993,7 @@ ArchiveFile::ArchiveFile(std::unique_ptr<object::Archive> &&f, bool forceHidden)
     : InputFile(ArchiveKind, f->getMemoryBufferRef()), file(std::move(f)),
       forceHidden(forceHidden) {}
 
-void ArchiveFile::addLazySymbols() {
+void ArchiveFile::addLazySymbols(bool heldIndex) {
   // Avoid calling getMemoryBufferRef() on zero-symbol archive
   // since that crashes.
   if (file->isEmpty() ||
@@ -3041,8 +3044,318 @@ void ArchiveFile::addLazySymbols() {
     }
   }
 
-  for (const object::Archive::Symbol &sym : file->symbols())
-    symtab->addLazyArchive(sym.getName(), this, sym);
+  for (const object::Archive::Symbol &sym : file->symbols()) {
+    if (heldIndex)
+      symtab->addResidualLazyArchive(sym.getName(), this, sym);
+    else
+      symtab->addLazyArchive(sym.getName(), this, sym);
+  }
+}
+
+void ArchiveFile::publishHeldIndex() { addLazySymbols(/*heldIndex=*/true); }
+
+void (*macho::archiveProviderHook)(StringRef, uint32_t) = nullptr;
+bool (*macho::weakOverrideSuppressedHook)(const Symbol *) = nullptr;
+
+unsigned macho::ordinalSeqBits = 23;
+unsigned macho::ordinalWalkBits = 23;
+unsigned macho::ordinalTopBits = 17;
+uint32_t macho::ordinalSeqMax = (1u << 23) - 1;
+uint32_t macho::ordinalWalkMax = (1u << 23) - 1;
+uint32_t macho::ordinalTopMax = (1u << 17) - 1;
+
+// LLD_ORDINAL_BITS=top,walk,seq narrows the fields so that a test can drive a
+// link into the overflow paths without needing a corpus that large. Nothing
+// outside the tests sets it, and nothing reads the widths before this runs.
+void macho::initRecordOrdinalWidths() {
+  const char *env = ::getenv("LLD_ORDINAL_BITS");
+  if (!env)
+    return;
+  unsigned t = 0, w = 0, q = 0;
+  if (sscanf(env, "%u,%u,%u", &t, &w, &q) != 3 || t < 1 || w < 1 || q < 1 ||
+      t + w + q > 63) {
+    error("LLD_ORDINAL_BITS must be three positive widths summing to at most 63");
+    return;
+  }
+  ordinalTopBits = t;
+  ordinalWalkBits = w;
+  ordinalSeqBits = q;
+  ordinalTopMax = (uint32_t(1) << t) - 1;
+  ordinalWalkMax = (uint32_t(1) << w) - 1;
+  ordinalSeqMax = (uint32_t(1) << q) - 1;
+}
+
+void macho::reportOrdinalOverflow(uint32_t top, uint32_t walk, uint32_t seq) {
+  fatal("input record ordinal out of range: (top " + Twine(top) + ", walk " +
+        Twine(walk) + ", seq " + Twine(seq) + ") does not fit in (" +
+        Twine(ordinalTopBits) + ", " + Twine(ordinalWalkBits) + ", " +
+        Twine(ordinalSeqBits) + ") bits. This is a limit of the parallel input "
+        "phase's record ordinals, not of the link; please report it.");
+}
+
+template <class LP>
+static void forEachUndefinedNameImpl(MemoryBufferRef mb,
+                                     llvm::function_ref<void(StringRef)> fn,
+                                     bool *sawLinkerOption) {
+  using Header = typename LP::mach_header;
+  using NList = typename LP::nlist;
+  using namespace llvm::MachO;
+
+  auto *buf = reinterpret_cast<const uint8_t *>(mb.getBufferStart());
+  auto *hdr = reinterpret_cast<const Header *>(buf);
+
+  // One allocation-free pass over the load commands for both tables. findCommand
+  // builds a std::vector per call, and the walker makes this call once per
+  // extracted member.
+  const symtab_command *st = nullptr;
+  const dysymtab_command *dst = nullptr;
+  const uint8_t *p = buf + target->headerSize;
+  for (uint32_t i = 0, n = hdr->ncmds; i != n; ++i) {
+    auto *cmd = reinterpret_cast<const load_command *>(p);
+    if (cmd->cmd == LC_SYMTAB)
+      st = reinterpret_cast<const symtab_command *>(cmd);
+    else if (cmd->cmd == LC_DYSYMTAB)
+      dst = reinterpret_cast<const dysymtab_command *>(cmd);
+    else if (cmd->cmd == LC_LINKER_OPTION && sawLinkerOption)
+      *sawLinkerOption = true;
+    p += cmd->cmdsize;
+  }
+  if (!st)
+    return;
+  ArrayRef<NList> nList(reinterpret_cast<const NList *>(buf + st->symoff),
+                        st->nsyms);
+  const char *strtab = reinterpret_cast<const char *>(buf) + st->stroff;
+
+  // The names must come out in the same order, and with the same one-for-one
+  // correspondence, as the undefined records ObjFile::parseSymbols() applies:
+  // the walker gives each of a member's undefined records its own position, so
+  // an undefined this loop did not report would shift every position after it.
+  // parseSymbols() scans the whole nlist with the isUndef() filter, so the
+  // LC_DYSYMTAB undefined range may only replace that scan when the range
+  // provably covers every such entry: the three ranges must tile [0, nsyms) in
+  // order, which makes the undefined range the suffix of the nlist and puts
+  // every symbol the producer classified as undefined inside it. Otherwise fall
+  // back to the full scan.
+  uint32_t begin = 0, end = st->nsyms;
+  if (dst && dst->ilocalsym == 0 && dst->iextdefsym == dst->nlocalsym &&
+      dst->iundefsym == dst->nlocalsym + dst->nextdefsym &&
+      dst->iundefsym + dst->nundefsym == st->nsyms)
+    begin = dst->iundefsym;
+  for (uint32_t i = begin; i != end; ++i) {
+    const NList &sym = nList[i];
+    if (sym.n_type & N_STAB)
+      continue;
+    // A common symbol is also N_UNDF, but with a non-zero size. Commons live in
+    // the LC_DYSYMTAB undefined range too, so the filter is still needed there.
+    if ((sym.n_type & N_TYPE) != N_UNDF || sym.n_value != 0)
+      continue;
+    fn(StringRef(strtab + sym.n_strx));
+  }
+}
+
+void macho::forEachUndefinedName(MemoryBufferRef mb,
+                                 llvm::function_ref<void(StringRef)> fn,
+                                 bool *sawLinkerOption) {
+  if (target->wordSize == 8)
+    forEachUndefinedNameImpl<LP64>(mb, fn, sawLinkerOption);
+  else
+    forEachUndefinedNameImpl<ILP32>(mb, fn, sawLinkerOption);
+}
+
+bool ArchiveFile::canWalk() {
+  if (file->isEmpty() ||
+      (file->hasSymbolTable() && file->getNumberOfSymbols() == 0))
+    return true;
+  // Without an index each child is published as a lazy object file.
+  if (!file->hasSymbolTable())
+    return false;
+  // Only the first member is looked at here: walking every member would put a
+  // pass over the whole archive back on the ordered argument walk. buildIndex()
+  // checks the rest on a worker, and a member it rejects makes walkArchives()
+  // fall back to publishing the indexes the ordinary way.
+  Error err = Error::success();
+  auto child = file->child_begin(err);
+  if (err) {
+    llvm::consumeError(std::move(err));
+    return false;
+  }
+  Expected<MemoryBufferRef> mb = child->getMemoryBufferRef();
+  if (!mb) {
+    llvm::consumeError(mb.takeError());
+    return false;
+  }
+  return identify_magic(mb->getBuffer()) == file_magic::macho_object;
+}
+
+void ArchiveFile::reserveMemberUndefineds(
+    std::vector<std::pair<ArchiveFile *, uint64_t>> &work) {
+  undefinedNames.reserve(indexChildren.size());
+  for (const auto &kv : indexChildren) {
+    undefinedNames.try_emplace(kv.first);
+    work.emplace_back(this, kv.first);
+  }
+}
+
+bool ArchiveFile::fillMemberUndefineds(uint64_t childOffset) {
+  auto child = indexChildren.find(childOffset);
+  assert(child != indexChildren.end());
+  Expected<MemoryBufferRef> mb = child->second.getMemoryBufferRef();
+  if (!mb) {
+    llvm::consumeError(mb.takeError());
+    return false;
+  }
+  // A bitcode member is resolved on the serial boundary, so the walk gives the
+  // whole link back to addLazySymbols() if it meets one.
+  if (identify_magic(mb->getBuffer()) != file_magic::macho_object)
+    return false;
+  llvm::SmallVector<StringRef, 0> &names =
+      undefinedNames.find(childOffset)->second;
+  // An LC_LINKER_OPTION in a member adds inputs after the phase, and a name only
+  // those inputs reference has no slot yet, because the walk creates none for an
+  // index entry it does not extract. The member's load commands are being walked
+  // here anyway, so the walk can find out before it commits to anything.
+  bool sawLinkerOption = false;
+  forEachUndefinedName(*mb, [&](StringRef name) { names.push_back(name); },
+                       &sawLinkerOption);
+  if (sawLinkerOption)
+    memberLinkerOptions.store(true, std::memory_order_relaxed);
+  return true;
+}
+
+void ArchiveFile::filterIndex() {
+  // The direct objects are resolved and nothing mutates the table until the walk
+  // begins, so these lookups need no lock. The test is the negation of the walk's
+  // own suppression rule, not simply "undefined now": this runs after the inputs
+  // that follow the archive have been registered, so a dylib listed after it may
+  // be sitting in a slot whose lazy symbol the serial linker had already put
+  // there, and such an entry is still a candidate.
+  for (uint32_t i = 0, e = indexEntries.size(); i != e; ++i) {
+    Symbol *sym = symtab->find(indexEntries[i].name);
+    // Never mentioned, so nothing ever asks this archive for it.
+    if (!sym)
+      continue;
+    if (isa<Defined>(sym) || isa<CommonSymbol>(sym))
+      continue;
+    if (isa<Undefined>(sym)) {
+      candidateEntries.push_back(i);
+      continue;
+    }
+    if (auto *dysym = dyn_cast<DylibSymbol>(sym)) {
+      if (!dysym->isReferenced())
+        continue;
+      // A weak dylib definition never suppresses an extraction; a strong one
+      // does exactly when it was registered before this archive.
+      if (dysym->isWeakDef() ||
+          (!dysym->isDynamicLookup() && dysym->getFile()->id > id))
+        candidateEntries.push_back(i);
+    }
+  }
+}
+
+bool ArchiveFile::buildIndex() {
+  if (file->isEmpty() ||
+      (file->hasSymbolTable() && file->getNumberOfSymbols() == 0))
+    return true;
+  // Without an index each child is published as a lazy object file, which the
+  // fold is not prepared for.
+  if (!file->hasSymbolTable())
+    return false;
+
+  // The same first-member architecture check addLazySymbols() makes.
+  Error err = Error::success();
+  auto child = file->child_begin(err);
+  if (!err) {
+    Expected<MemoryBufferRef> mbOrErr = child->getMemoryBufferRef();
+    if (!mbOrErr) {
+      llvm::consumeError(mbOrErr.takeError());
+    } else if (identify_magic(mbOrErr->getBuffer()) ==
+               file_magic::macho_object) {
+      if (target->wordSize == 8)
+        compatArch = compatWithTargetArch(
+            this, reinterpret_cast<const LP64::mach_header *>(
+                      mbOrErr->getBufferStart()));
+      else
+        compatArch = compatWithTargetArch(
+            this, reinterpret_cast<const ILP32::mach_header *>(
+                      mbOrErr->getBufferStart()));
+      if (!compatArch)
+        return true;
+    }
+  } else {
+    llvm::consumeError(std::move(err));
+  }
+
+  // Only the walk over the archive's symbol table itself, which the Archive API
+  // can only do in order: a name and the symbol's own coordinates per entry. The
+  // child offset is deliberately left out, because Symbol::getMember() parses the
+  // member's header, and doing that once per index entry -- 160,000 times for one
+  // Rust staticlib, not once per member -- was 25 of the 33 ms this pass cost.
+  // resolveIndexOffsets() does it in parallel chunks instead.
+  indexSymbols.reserve(file->getNumberOfSymbols());
+  for (const object::Archive::Symbol &sym : file->symbols()) {
+    indexSymbols.push_back(sym);
+    indexEntries.push_back({CachedHashStringRef(sym.getName()), 0});
+  }
+  return true;
+}
+
+bool ArchiveFile::resolveIndexOffsets(uint32_t begin, uint32_t end) {
+  for (uint32_t i = begin; i != end; ++i) {
+    Expected<object::Archive::Child> c = indexSymbols[i].getMember();
+    if (!c) {
+      llvm::consumeError(c.takeError());
+      return false;
+    }
+    indexEntries[i].childOffset = c->getChildOffset();
+  }
+  return true;
+}
+
+bool ArchiveFile::buildMemberMaps() {
+  // Map work only: every offset is resolved and the headers are warm. A Child is
+  // constructed once per member rather than once per entry.
+  for (uint32_t i = 0, e = indexEntries.size(); i != e; ++i) {
+    uint64_t childOffset = indexEntries[i].childOffset;
+    llvm::SmallVector<uint32_t, 2> &entries = memberEntries[childOffset];
+    if (entries.empty()) {
+      // Whether every member is a native object file is checked on a worker, in
+      // fillMemberUndefineds(), which has to map each member's buffer anyway;
+      // the walk is abandoned before it mutates anything if one is not. A Child
+      // is constructed once per member here rather than once per entry, and its
+      // header is already warm from resolveIndexOffsets().
+      Expected<object::Archive::Child> c = indexSymbols[i].getMember();
+      if (!c) {
+        llvm::consumeError(c.takeError());
+        return false;
+      }
+      indexChildren.try_emplace(childOffset, *c);
+    }
+    entries.push_back(i);
+  }
+  indexSymbols = decltype(indexSymbols)();
+  return true;
+}
+
+ObjFile *ArchiveFile::createIndexedMember(uint64_t childOffset,
+                                          StringRef reason) {
+  if (!seen.insert(childOffset).second)
+    return nullptr;
+  auto it = indexChildren.find(childOffset);
+  assert(it != indexChildren.end());
+  // The walker parses the extracted members together, on workers.
+  llvm::SaveAndRestore<bool> deferParse(deferDirectObjParse, true);
+  Expected<InputFile *> file = childToObjectFile(it->second, /*lazy=*/false);
+  if (!file) {
+    error(toString(this) + ": could not get the member defining symbol " +
+          reason + ": " + toString(file.takeError()));
+    return nullptr;
+  }
+  return cast<ObjFile>(*file);
+}
+
+void ArchiveFile::publishIndexedMember(ObjFile *member, StringRef reason) {
+  inputFiles.insert(member);
+  printArchiveMemberLoad(reason, member);
 }
 
 static Expected<InputFile *>

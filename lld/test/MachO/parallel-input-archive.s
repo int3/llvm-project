@@ -125,6 +125,152 @@
 # OBJC:      -ObjC forced load of {{.*}}objc.a(objc1.o)
 # OBJC-NEXT: -ObjC forced load of {{.*}}objc.a(objc2.o)
 
+## A member's undefined names are enumerated from its LC_DYSYMTAB undefined
+## range, and each one gets its own position, so the enumeration has to match the
+## undefined records ObjFile::parseSymbols() applies, one for one and in order.
+## dys.o exercises the two ways that can go wrong: a common symbol, which is also
+## N_UNDF and sits inside the undefined range but is not an undefined record, and
+## a nested extraction between two of its undefineds, whose positions are
+## allocated in between.
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/dysmain.s -o %t/dysmain.o
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/dyshead.s -o %t/dyshead.o
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/dysn1.s -o %t/dysn1.o
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/dysn2.s -o %t/dysn2.o
+# RUN: llvm-ar --format=darwin rcs %t/dys.a %t/dyshead.o %t/dysn1.o %t/dysn2.o
+# RUN: mkdir -p %t/dys1 %t/dys2 %t/dys8 %t/dys16
+# RUN: %lld -lSystem -o %t/dys1/out --threads=1 -why_load %t/dysmain.o %t/dys.a 2>&1 | FileCheck %s --check-prefix=DYSWHY
+# RUN: %lld -lSystem -o %t/dys2/out --threads=2 -why_load %t/dysmain.o %t/dys.a 2>&1 | FileCheck %s --check-prefix=DYSWHY
+# RUN: %lld -lSystem -o %t/dys8/out --threads=8 -why_load %t/dysmain.o %t/dys.a 2>&1 | FileCheck %s --check-prefix=DYSWHY
+# RUN: %lld -lSystem -o %t/dys16/out --threads=16 -why_load %t/dysmain.o %t/dys.a 2>&1 | FileCheck %s --check-prefix=DYSWHY
+# RUN: cmp %t/dys1/out %t/dys2/out
+# RUN: cmp %t/dys1/out %t/dys8/out
+# RUN: cmp %t/dys1/out %t/dys16/out
+# RUN: llvm-objdump --syms %t/dys1/out | FileCheck %s --check-prefix=DYSSYMS
+
+# DYSWHY:      _head forced load of {{.*}}dys.a(dyshead.o)
+# DYSWHY-NEXT: _n1 forced load of {{.*}}dys.a(dysn1.o)
+# DYSWHY-NEXT: _n2 forced load of {{.*}}dys.a(dysn2.o)
+
+# DYSSYMS-DAG: __TEXT,dh _head
+# DYSSYMS-DAG: __TEXT,d1 _n1
+# DYSSYMS-DAG: __TEXT,d2 _n2
+# DYSSYMS-DAG: _shared_common
+
+## The record ordinal's three fields share 63 bits of one integer, so a link big
+## enough to overflow one of them has to be handled rather than truncated.
+## LLD_ORDINAL_BITS narrows the widths so that both paths can be reached here.
+# RUN: mkdir -p %t/narrowwalk %t/narrowtop
+## Too few bits for the archive's walk events: the walk cannot number them, so it
+## declines and the archives publish their indexes the ordinary way. Same output.
+# RUN: env LLD_ORDINAL_BITS=17,1,23 %lld -lSystem -o %t/narrowwalk/out --threads=8 %t/dysmain.o %t/dys.a
+# RUN: cmp %t/dys1/out %t/narrowwalk/out
+## Too few bits for the command line: a clear error, not a wrong ordinal.
+# RUN: env LLD_ORDINAL_BITS=1,23,23 not %lld -lSystem -o %t/narrowtop/out --threads=8 %t/dysmain.o %t/dys.a 2>&1 | FileCheck %s --check-prefix=ORDOVER
+# ORDOVER: error: input record ordinal out of range
+
+## Design 7's "Stage 2 position rule" minimal test. a.o references _foo; the
+## member defining it has undefineds _bar then _qux in nlist order; the TBD is
+## listed *after* the archive and exports _qux before _bar. History creates _bar
+## then _qux, at the member's undefined events, because the archive's registration
+## precedes the dylib on the command line. If the walk numbered its events from
+## the command-line counter instead of the archive's own, the dylib's exports
+## would sort first and the two stubs would swap.
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/pos-main.s -o %t/pos-main.o
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/pos-foo.s -o %t/pos-foo.o
+# RUN: llvm-ar --format=darwin rcs %t/pos.a %t/pos-foo.o
+# RUN: mkdir -p %t/pos1 %t/pos2 %t/pos8
+# RUN: %lld -lSystem -dylib -install_name /usr/lib/libposout.dylib -o %t/pos1/out --threads=1 %t/pos-main.o %t/pos.a %t/pos.tbd
+# RUN: %lld -lSystem -dylib -install_name /usr/lib/libposout.dylib -o %t/pos2/out --threads=2 %t/pos-main.o %t/pos.a %t/pos.tbd
+# RUN: %lld -lSystem -dylib -install_name /usr/lib/libposout.dylib -o %t/pos8/out --threads=8 %t/pos-main.o %t/pos.a %t/pos.tbd
+# RUN: cmp %t/pos1/out %t/pos2/out
+# RUN: cmp %t/pos1/out %t/pos8/out
+## symVector order is what the symbol table emitter walks, so the undefined
+## entries come out in the order their slots were created: _bar before _qux.
+# RUN: llvm-objdump --macho --syms %t/pos1/out | FileCheck %s --check-prefix=POSORD
+
+# POSORD: *UND* _bar
+# POSORD: *UND* _qux
+
+## The symmetric case: a name the member *defines* is also exported by the TBD
+## listed after the archive, so its position is the index entry's, not the
+## export's.
+# RUN: mkdir -p %t/possym1 %t/possym8
+# RUN: %lld -lSystem -dylib -install_name /usr/lib/libposout.dylib -o %t/possym1/out --threads=1 %t/pos-main.o %t/pos.a %t/pos-foo.tbd
+# RUN: %lld -lSystem -dylib -install_name /usr/lib/libposout.dylib -o %t/possym8/out --threads=8 %t/pos-main.o %t/pos.a %t/pos-foo.tbd
+# RUN: cmp %t/possym1/out %t/possym8/out
+
+## overridesWeakDef: libweak exports _x weakly and nothing references it at the
+## point wo.a is registered, so the serial linker's index entry replaced the weak
+## dylib symbol with a lazy one and the member's later definition set no override.
+## The only reference to _x comes from a member of the second archive, so the walk
+## still has the weak dylib symbol in the slot when the definition folds.
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/wo-main.s -o %t/wo-main.o
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/wo-def.s -o %t/wo-def.o
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/wo-ref.s -o %t/wo-ref.o
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/wo-dylib.s -o %t/wo-dylib.o
+# RUN: %lld -dylib -o %t/libwo.dylib %t/wo-dylib.o
+# RUN: llvm-ar --format=darwin rcs %t/wo-def.a %t/wo-def.o
+# RUN: llvm-ar --format=darwin rcs %t/wo-ref.a %t/wo-ref.o
+# RUN: mkdir -p %t/wo1 %t/wo8
+# RUN: %lld -lSystem -o %t/wo1/out --threads=1 %t/wo-main.o %t/libwo.dylib %t/wo-def.a %t/wo-ref.a
+# RUN: %lld -lSystem -o %t/wo8/out --threads=8 %t/wo-main.o %t/libwo.dylib %t/wo-def.a %t/wo-ref.a
+# RUN: cmp %t/wo1/out %t/wo8/out
+# RUN: llvm-objdump --macho --weak-bind %t/wo1/out | FileCheck %s --check-prefix=NOWEAKBIND
+# RUN: llvm-objdump --macho --weak-bind %t/wo8/out | FileCheck %s --check-prefix=NOWEAKBIND
+
+# NOWEAKBIND-NOT: _x
+
+## A name provided both by a walked command-line archive and by an autolinked
+## archive published after the phase, first referenced by a member the autolink
+## pass itself brings in. libalearly.a's index entry for _shared created the slot
+## at its own command-line position, so the serial linker fetched from there and
+## liballate.a's later lazy symbol never owned it. The walk leaves no lazy symbol
+## behind, so addUndefined() has to ask the provider map before taking the lazy
+## symbol it does find.
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/al-main.s -o %t/al-main.o
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/al-early.s -o %t/al-early.o
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/al-sharedlate.s -o %t/al-sharedlate.o
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/al-late.s -o %t/al-late.o
+# RUN: llvm-ar --format=darwin rcs %t/libalearly.a %t/al-early.o
+# RUN: mkdir -p %t/allate
+# RUN: llvm-ar --format=darwin rcs %t/allate/liballate.a %t/al-sharedlate.o %t/al-late.o
+# RUN: mkdir -p %t/al1 %t/al2 %t/al8
+# RUN: %lld -lSystem -L%t/allate -o %t/al1/out --threads=1 -why_load %t/al-main.o %t/libalearly.a 2>&1 | FileCheck %s --check-prefix=ALWHY
+# RUN: %lld -lSystem -L%t/allate -o %t/al2/out --threads=2 -why_load %t/al-main.o %t/libalearly.a 2>&1 | FileCheck %s --check-prefix=ALWHY
+# RUN: %lld -lSystem -L%t/allate -o %t/al8/out --threads=8 -why_load %t/al-main.o %t/libalearly.a 2>&1 | FileCheck %s --check-prefix=ALWHY
+# RUN: cmp %t/al1/out %t/al2/out
+# RUN: cmp %t/al1/out %t/al8/out
+
+## The nested fetch is reported first, because the member that triggered it is
+## only announced once its own parse -- and so every extraction inside it -- has
+## finished.
+# ALWHY: _shared forced load of {{.*}}libalearly.a(al-early.o)
+# ALWHY-NEXT: _needs_late forced load of {{.*}}liballate.a(al-late.o)
+# ALWHY-NOT: al-sharedlate.o
+
+## Inline unwind replay order. The parent member owns a weak _wp and its nested
+## child owns a weak _wc, both with __eh_frame entries and no -dead_strip, and a
+## third member extracted by the parent's *second* undefined defines both
+## strongly. So both members are flagged for inline unwind registration (design 7
+## section 3), the displacing records sort between the child's completion and the
+## parent's, and the parent is adopted first while completing last. Replaying in
+## adoption order strips the child's frame; it has to be completion order. The
+## members are laid out so that the parent's index entry comes last, because an
+## undefined can only extract from an entry the walk has already passed.
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/gp-main.s -o %t/gp-main.o
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/gp-parent.s -o %t/gp-parent.o
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/gp-child.s -o %t/gp-child.o
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/gp-strong.s -o %t/gp-strong.o
+# RUN: llvm-ar --format=darwin rcs %t/gp.a %t/gp-child.o %t/gp-strong.o %t/gp-parent.o
+# RUN: mkdir -p %t/gp1 %t/gp2 %t/gp8 %t/gp16
+# RUN: %lld -lSystem -o %t/gp1/out --threads=1 %t/gp-main.o %t/gp.a
+# RUN: %lld -lSystem -o %t/gp2/out --threads=2 %t/gp-main.o %t/gp.a
+# RUN: %lld -lSystem -o %t/gp8/out --threads=8 %t/gp-main.o %t/gp.a
+# RUN: %lld -lSystem -o %t/gp16/out --threads=16 %t/gp-main.o %t/gp.a
+# RUN: cmp %t/gp1/out %t/gp2/out
+# RUN: cmp %t/gp1/out %t/gp8/out
+# RUN: cmp %t/gp1/out %t/gp16/out
+
 #--- main.s
 .globl _main
 _main:
@@ -209,3 +355,167 @@ _objc1:
 .section __TEXT,o2
 _objc2:
   retq
+
+#--- dysmain.s
+.globl _main
+_main:
+  callq _head
+  retq
+
+#--- dyshead.s
+## The undefined range holds _n1, _n2 and the common symbol _shared_common; only
+## _n1 and _n2 are undefined records, and each extracts a member.
+.globl _head
+.comm _shared_common,8,3
+.section __TEXT,dh
+_head:
+  callq _n1
+  callq _n2
+  retq
+
+#--- dysn1.s
+.globl _n1
+.comm _shared_common,8,3
+.section __TEXT,d1
+_n1:
+  retq
+
+#--- dysn2.s
+.globl _n2
+.section __TEXT,d2
+_n2:
+  retq
+
+#--- pos-main.s
+.globl _entry
+_entry:
+  callq _foo
+  retq
+
+#--- pos-foo.s
+.globl _foo
+.section __TEXT,pf
+_foo:
+  callq _bar
+  callq _qux
+  retq
+
+#--- pos.tbd
+--- !tapi-tbd
+tbd-version: 4
+targets: [ x86_64-macos ]
+install-name: '/usr/lib/libpos.dylib'
+exports:
+  - targets: [ x86_64-macos ]
+    symbols: [ _qux, _bar ]
+...
+
+#--- pos-foo.tbd
+--- !tapi-tbd
+tbd-version: 4
+targets: [ x86_64-macos ]
+install-name: '/usr/lib/libposfoo.dylib'
+exports:
+  - targets: [ x86_64-macos ]
+    symbols: [ _foo, _qux, _bar ]
+...
+
+#--- wo-main.s
+.globl _main
+_main:
+  callq _trigger
+  retq
+
+#--- wo-dylib.s
+.globl _x
+.weak_definition _x
+_x:
+  retq
+
+#--- wo-def.s
+.globl _x
+.section __TEXT,wd
+_x:
+  retq
+
+#--- wo-ref.s
+.globl _trigger
+.section __TEXT,wr
+_trigger:
+  callq _x
+  retq
+
+#--- al-main.s
+.linker_option "-lallate"
+.globl _main
+_main:
+  callq _needs_late
+  retq
+
+#--- al-early.s
+.globl _shared
+.section __TEXT,ae
+_shared:
+  retq
+
+#--- al-sharedlate.s
+.globl _shared
+.section __TEXT,asl
+_shared:
+  retq
+
+#--- al-late.s
+.globl _needs_late
+.section __TEXT,al
+_needs_late:
+  callq _shared
+  retq
+
+#--- gp-main.s
+.globl _main
+_main:
+  callq _parent
+  retq
+
+#--- gp-parent.s
+.globl _parent
+_parent:
+  callq _child
+  callq _strong
+  retq
+.globl _wp
+.weak_definition _wp
+_wp:
+  .cfi_startproc
+  .cfi_def_cfa_offset 16
+  retq
+  .cfi_endproc
+
+#--- gp-child.s
+.globl _child
+_child:
+  retq
+.globl _wc
+.weak_definition _wc
+_wc:
+  .cfi_startproc
+  .cfi_def_cfa_offset 16
+  retq
+  .cfi_endproc
+
+#--- gp-strong.s
+.globl _strong
+_strong:
+  retq
+.globl _wp
+_wp:
+  .cfi_startproc
+  .cfi_def_cfa_offset 16
+  retq
+  .cfi_endproc
+.globl _wc
+_wc:
+  .cfi_startproc
+  .cfi_def_cfa_offset 16
+  retq
+  .cfi_endproc

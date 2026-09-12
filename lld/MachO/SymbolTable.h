@@ -63,6 +63,12 @@ public:
 
   Symbol *addLazyArchive(StringRef name, ArchiveFile *file,
                          const llvm::object::Archive::Symbol &sym);
+  // addLazyArchive() for an index the parallel input phase held back. It differs
+  // from addLazyArchive() only in that a dylib definition registered after the
+  // archive does not keep the slot, because in the serial order this archive's
+  // lazy symbol was already there.
+  void addResidualLazyArchive(StringRef name, ArchiveFile *file,
+                              const llvm::object::Archive::Symbol &sym);
   Symbol *addLazyObject(StringRef name, InputFile &file);
 
   Defined *addSynthetic(StringRef name, InputSection *, uint64_t value,
@@ -104,6 +110,13 @@ public:
   // addDefined() with the arguments bundled, used by the fold and its replay.
   Symbol *addDefinedRecord(const DeferredDefinedRecord &rec);
 
+  // The serial linker created a slot for every archive index entry, so a symbol
+  // an extracted member defines sits in symVector where the archive's index was
+  // published, not where the member was parsed. The walker reserves those
+  // positions; the member's own records then fill them in.
+  void reserveArchiveSlot(StringRef name, InputFile *archive,
+                          RecordOrdinal ordinal);
+
 private:
   // Per-slot bookkeeping for the fold. Allocated immediately in front of the
   // SymbolUnion so that Symbol itself does not grow: mechanism 44 left only two
@@ -115,20 +128,25 @@ private:
     // slot's position in symVector.
     RecordOrdinal firstOrdinal;
     // The ordinal of the record that produced the symbol currently in the slot,
-    // plus, in the top bit, a flag saying that one record for this name has been
-    // deferred and so every later record for it must be deferred too, so that
-    // the replay sees a single ordered stream. A file ordinal never reaches 2^31,
-    // so the top bit of an ordinal is always free.
+    // with, in its top bit, a flag saying that one record for this name has been
+    // deferred and so every later one must be too, so that the replay sees a
+    // single ordered stream. The three ordinal fields share 63 bits, so that bit
+    // is free.
     RecordOrdinal winnerAndDeferred;
 
-    static constexpr RecordOrdinal deferredBit = RecordOrdinal(1) << 63;
-    RecordOrdinal winner() const { return winnerAndDeferred & ~deferredBit; }
-    void setWinner(RecordOrdinal ordinal) {
-      assert((ordinal & deferredBit) == 0);
-      winnerAndDeferred = ordinal | (winnerAndDeferred & deferredBit);
+    static constexpr uint64_t deferredBit = 1ull << 63;
+    RecordOrdinal winner() const {
+      RecordOrdinal o = winnerAndDeferred;
+      o.v &= ~deferredBit;
+      return o;
     }
-    bool isDeferred() const { return winnerAndDeferred & deferredBit; }
-    void setDeferred() { winnerAndDeferred |= deferredBit; }
+    void setWinner(RecordOrdinal ordinal) {
+      assert((ordinal.v & deferredBit) == 0);
+      ordinal.v |= winnerAndDeferred.v & deferredBit;
+      winnerAndDeferred = ordinal;
+    }
+    bool isDeferred() const { return winnerAndDeferred.v & deferredBit; }
+    void setDeferred() { winnerAndDeferred.v |= deferredBit; }
   };
   static_assert(sizeof(SlotMeta) == 16,
                 "the fold's per-slot header is paid per name");

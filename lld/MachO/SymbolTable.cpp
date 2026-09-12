@@ -60,9 +60,7 @@ Symbol *SymbolTable::allocateSlot() {
   thread_local llvm::BumpPtrAllocator foldAlloc;
   void *storage = foldAlloc.Allocate(sizeof(SlotMeta) + sizeof(SymbolUnion),
                                      alignof(SymbolUnion));
-  auto *meta = static_cast<SlotMeta *>(storage);
-  meta->firstOrdinal = 0;
-  meta->winnerAndDeferred = 0;
+  auto *meta = new (storage) SlotMeta();
   return reinterpret_cast<Symbol *>(meta + 1);
 }
 
@@ -95,7 +93,11 @@ void SymbolTable::endParallelInput() {
     shards[i].created.clear();
     shards[i].created.shrink_to_fit();
   }
-  parallelSort(created.begin(), created.end());
+  parallelSort(created.begin(), created.end(),
+               [](const std::pair<RecordOrdinal, Symbol *> &a,
+                  const std::pair<RecordOrdinal, Symbol *> &b) {
+                 return a.first < b.first;
+               });
   symVector.reserve(symVector.size() + created.size());
   for (const auto &[ordinal, sym] : created)
     symVector.push_back(sym);
@@ -129,7 +131,8 @@ std::pair<Symbol *, bool> SymbolTable::insert(CachedHashStringRef cachedName,
       Symbol *sym = allocateSlot();
       it->second = sym;
       if (folding) {
-        RecordOrdinal ord = serialCtx ? serialCtx->nextOrdinal() : 0;
+        RecordOrdinal ord =
+            serialCtx ? serialCtx->nextOrdinal() : RecordOrdinal();
         metaOf(sym).firstOrdinal = ord;
         metaOf(sym).setWinner(ord);
         shard.created.push_back(sym);
@@ -460,7 +463,9 @@ Symbol *SymbolTable::foldDefined(const DeferredDefinedRecord &rec) {
     auto *dysym = cast<DylibSymbol>(slot);
     // The condition is symmetric, so it does not matter whether the dylib
     // record or this definition was applied first.
-    const bool overridesWeakDef = !rec.isWeakDef && dysym->isWeakDef();
+    const bool overridesWeakDef =
+        !rec.isWeakDef && dysym->isWeakDef() &&
+        !(weakOverrideSuppressedHook && weakOverrideSuppressedHook(dysym));
     dysym->unreference();
     build(slot, /*fresh=*/false, overridesWeakDef);
     meta.setWinner(ord);
@@ -474,7 +479,7 @@ Symbol *SymbolTable::foldDefined(const DeferredDefinedRecord &rec) {
 Symbol *SymbolTable::foldUndefined(StringRef name, InputFile *file,
                                    bool isWeakRef) {
   ParseContext &ctx = *file->parseCtx;
-  const RecordOrdinal ord = ctx.nextOrdinal();
+  const RecordOrdinal ord = ctx.nextUndefinedOrdinal();
   CachedHashStringRef cachedName(name);
   Shard &shard = shards[shardOf(cachedName)];
   const RefState refState = isWeakRef ? RefState::Weak : RefState::Strong;
@@ -580,6 +585,30 @@ void SymbolTable::applyPendingCoalesces(
   }
 }
 
+void SymbolTable::reserveArchiveSlot(StringRef name, InputFile *archive,
+                                     RecordOrdinal ordinal) {
+  assert(folding);
+  CachedHashStringRef cachedName(name);
+  Shard &shard = shards[shardOf(cachedName)];
+  auto [it, wasInserted] = shard.map.try_emplace(cachedName, nullptr);
+  if (!wasInserted) {
+    SlotMeta &meta = metaOf(it->second);
+    if (ordinal < meta.firstOrdinal)
+      meta.firstOrdinal = ordinal;
+    return;
+  }
+  Symbol *slot = allocateSlot();
+  it->second = slot;
+  shard.created.push_back(slot);
+  SlotMeta &meta = metaOf(slot);
+  meta.firstOrdinal = ordinal;
+  meta.setWinner(ordinal);
+  // A placeholder: the member that provides this name always defines it, so
+  // this is replaced before anything reads it.
+  new (slot) Undefined(name, archive, RefState::Strong,
+                       /*wasBitcodeSymbol=*/false);
+}
+
 Symbol *SymbolTable::addDefinedRecord(const DeferredDefinedRecord &record) {
   if (folding && record.file && record.file->parseCtx) {
     DeferredDefinedRecord rec = record;
@@ -651,7 +680,9 @@ Defined *SymbolTable::addDefined(StringRef name, InputFile *file,
       }
 
     } else if (auto *dysym = dyn_cast<DylibSymbol>(s)) {
-      overridesWeakDef = !isWeakDef && dysym->isWeakDef();
+      overridesWeakDef =
+          !isWeakDef && dysym->isWeakDef() &&
+          !(weakOverrideSuppressedHook && weakOverrideSuppressedHook(dysym));
       dysym->unreference();
     } else if (auto *undef = dyn_cast<Undefined>(s)) {
       if (undef->wasBitcodeSymbol) {
@@ -731,17 +762,39 @@ Symbol *SymbolTable::addUndefined(StringRef name, InputFile *file,
 
   RefState refState = isWeakRef ? RefState::Weak : RefState::Strong;
 
-  if (wasInserted)
+  if (wasInserted) {
     constructOrReplaceSymbol<Undefined>(s, /*wasInserted=*/true, name, file,
                                         refState, /*wasBitcodeSymbol=*/false);
-  else if (auto *lazy = dyn_cast<LazyArchive>(s))
-    lazy->fetchArchiveMember();
+    // The walker leaves no LazyArchive symbol behind for an index entry it did
+    // not extract, so a name referenced after the input phase asks the archives
+    // directly. The hook may extract a member, which replaces s.
+    if (archiveProviderHook)
+      archiveProviderHook(name, UINT32_MAX);
+  }
+  else if (auto *lazy = dyn_cast<LazyArchive>(s)) {
+    // The slot holds a lazy symbol from an archive the walk did not own -- an
+    // LC_LINKER_OPTION library published after the phase. If a walked archive
+    // earlier on the command line also provides this name, that is the one the
+    // serial linker fetched from, because its index entry created this slot
+    // before the later archive ever saw it. The walk leaves no lazy symbol
+    // behind, so the incumbent lazy symbol is not evidence that it did not.
+    if (archiveProviderHook)
+      archiveProviderHook(name, lazy->getFile()->id);
+    if (auto *stillLazy = dyn_cast<LazyArchive>(s))
+      stillLazy->fetchArchiveMember();
+  }
   else if (isa<LazyObject>(s))
     extract(*s->getFile(), s->getName());
-  else if (auto *dynsym = dyn_cast<DylibSymbol>(s))
+  else if (auto *dynsym = dyn_cast<DylibSymbol>(s)) {
     dynsym->reference(refState);
-  else if (auto *undefined = dyn_cast<Undefined>(s))
+    // A LazyArchive symbol registered before this dylib would have shadowed it.
+    if (archiveProviderHook)
+      archiveProviderHook(name, UINT32_MAX);
+  } else if (auto *undefined = dyn_cast<Undefined>(s)) {
     undefined->refState = std::max(undefined->refState, refState);
+    if (archiveProviderHook)
+      archiveProviderHook(name, UINT32_MAX);
+  }
   return s;
 }
 
@@ -826,6 +879,42 @@ Symbol *SymbolTable::addLazyArchive(StringRef name, ArchiveFile *file,
     }
   }
   return s;
+}
+
+void SymbolTable::addResidualLazyArchive(
+    StringRef name, ArchiveFile *file,
+    const object::Archive::Symbol &sym) {
+  auto [s, wasInserted] = insert(name, file);
+  if (wasInserted) {
+    constructOrReplaceSymbol<LazyArchive>(s, /*wasInserted=*/true, file, sym);
+    return;
+  }
+  // A definition, or an earlier archive's lazy symbol, already owns the slot.
+  if (isa<Defined>(s) || isa<CommonSymbol>(s) || s->isLazy())
+    return;
+  if (auto *dysym = dyn_cast<DylibSymbol>(s)) {
+    // A weak dylib definition always yields to an archive member, whichever was
+    // registered first.
+    if (dysym->isWeakDef()) {
+      if (dysym->getRefState() != RefState::Unreferenced)
+        file->fetch(sym);
+      else
+        replaceSymbol<LazyArchive>(s, file, sym);
+      return;
+    }
+    // A strong dylib registered before this archive kept the slot. One
+    // registered after it never had it: the serial linker found a lazy symbol
+    // here and left the dylib definition out.
+    if (dysym->isDynamicLookup() || dysym->getFile()->id < file->id)
+      return;
+    dysym->unreference();
+    replaceSymbol<LazyArchive>(s, file, sym);
+    return;
+  }
+  if (isa<Undefined>(s)) {
+    file->fetch(sym);
+    return;
+  }
 }
 
 Symbol *SymbolTable::addLazyObject(StringRef name, InputFile &file) {

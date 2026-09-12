@@ -59,6 +59,7 @@
 
 #include <deque>
 #include <mutex>
+#include <queue>
 
 #if !_WIN32
 #include <sys/mman.h>
@@ -519,7 +520,7 @@ static InputFile *processFile(std::optional<MemoryBufferRef> buffer,
                 ": Archive::children failed: " + toString(std::move(e)));
       }
     }
-    if (!archiveContents || archiveContents->empty())
+    if ((!archiveContents || archiveContents->empty()) && !deferArchiveIndex)
       file->addLazySymbols();
     loadedArchives[path] = ArchiveFileInfo{file, isCommandLineLoad};
     newFile = file;
@@ -617,11 +618,66 @@ struct ParallelInputPhase {
   // not reallocate.
   std::deque<ParseContext> contexts;
   std::vector<std::pair<ObjFile *, uint32_t>> objects;
+  // Archives whose index registration the walker owns, in command-line order,
+  // each with the ordinal of its position on the command line.
+  std::vector<ArchiveFile *> archives;
+  std::vector<uint32_t> archiveOrdinals;
   uint32_t nextOrdinal = 0;
+};
+
+// Where the first member defining a name lives. The walker needs the earliest
+// provider, because that is the one whose LazyArchive symbol the serial linker
+// would have left in the table.
+struct ArchiveProvider {
+  uint32_t archiveIndex;
+  uint32_t entryIndex;
+  uint64_t childOffset;
+  // Set by the walk when a member defining this name has been extracted. The
+  // serial linker would then have created the name's slot inside that member's
+  // parse, so no later index entry for it extracts anything. Keeping the flag
+  // here folds what was a separate "provided by an extracted member" set into
+  // the provider lookup the walk already has to make.
+  bool extracted = false;
+
+  bool precedes(const ArchiveProvider &other) const {
+    return std::tie(archiveIndex, entryIndex) <
+           std::tie(other.archiveIndex, other.entryIndex);
+  }
+};
+
+struct ProviderShard {
+  llvm::DenseMap<llvm::CachedHashStringRef, ArchiveProvider> map;
+  std::mutex mu;
 };
 } // namespace
 
 static ParallelInputPhase parallelInput;
+
+// Everything the parallel input phase owns across a whole link. A second link in
+// the same process must not see any of it: the provider hook in particular is
+// consulted for the rest of the link and would reach into freed ArchiveFiles.
+static void resetParallelInputPhase();
+
+// See weakOverrideSuppressedHook. Built once, before the walk, from the provider
+// map; read from workers during the member folds and serially afterwards, never
+// written again.
+static llvm::DenseSet<const Symbol *> weakOverrideSuppressed;
+static bool suppressesWeakOverride(const Symbol *sym) {
+  return weakOverrideSuppressed.contains(sym);
+}
+
+static constexpr unsigned numProviderShards = 64;
+static std::unique_ptr<ProviderShard[]> providerShards;
+static unsigned providerShardOf(llvm::CachedHashStringRef name) {
+  return (name.hash() >> 25) & (numProviderShards - 1);
+}
+static ArchiveProvider *lookupArchiveProvider(llvm::CachedHashStringRef name) {
+  if (!providerShards)
+    return nullptr;
+  auto &map = providerShards[providerShardOf(name)].map;
+  auto it = map.find(name);
+  return it == map.end() ? nullptr : &it->second;
+}
 
 static void startParallelInput() {
 #if LLVM_ENABLE_THREADS
@@ -642,8 +698,468 @@ static bool reverseHeldParseOrder() {
   return value;
 }
 
+// Give a file that the phase will parse on a worker its ordinal and context. A
+// direct input takes the next command-line ordinal; an extracted member is an
+// event inside its archive's registration, so it takes that archive's ordinal
+// and a walk value from the archive's own counter.
+static void adoptHeldFile(ObjFile *obj, uint32_t top = UINT32_MAX,
+                          uint32_t walk = 0) {
+  parallelInput.contexts.emplace_back();
+  ParseContext *ctx = &parallelInput.contexts.back();
+  ctx->top = top == UINT32_MAX ? parallelInput.nextOrdinal++ : top;
+  ctx->walk = walk;
+  obj->parseCtx = ctx;
+  obj->deferUnwindRegistration = true;
+  parallelInput.objects.emplace_back(obj, ctx->top);
+}
+
+static void parseHeldFiles(size_t begin) {
+  std::vector<ObjFile *> order;
+  for (size_t i = begin, e = parallelInput.objects.size(); i != e; ++i)
+    order.push_back(parallelInput.objects[i].first);
+  if (reverseHeldParseOrder())
+    std::reverse(order.begin(), order.end());
+  parallelParseActive = true;
+  parallelForEach(order, [](ObjFile *obj) {
+    deferredDiagnostics = &obj->parseCtx->diags;
+    obj->parseFile();
+    deferredDiagnostics = nullptr;
+  });
+  parallelParseActive = false;
+}
+
+// E006 design 7, stage 2: the causal walker.
+//
+// Extraction from an indexed archive is decided by the index and by which
+// members have already been extracted, never by a member's parse, so the
+// decisions stay serial and in order while the parses they trigger go to
+// workers. Returns false if the archives cannot be walked, in which case the
+// caller falls back to addLazySymbols().
+static bool walkArchives() {
+  std::vector<ArchiveFile *> &archives = parallelInput.archives;
+
+  // Reading each archive's symbol table is independent per archive, and has to
+  // be in order within one, because that is all the Archive API offers.
+  std::vector<char> usable(archives.size(), 0);
+  std::vector<DeferredDiagnostics> indexDiags(archives.size());
+  std::unique_ptr<TimeTraceScope> ts(new TimeTraceScope("Read archive indexes"));
+  parallelFor(0, archives.size(), [&](size_t i) {
+    deferredDiagnostics = &indexDiags[i];
+    usable[i] = archives[i]->buildIndex();
+    deferredDiagnostics = nullptr;
+  });
+  for (DeferredDiagnostics &diags : indexDiags)
+    if (!diags.empty())
+      replayDiagnostics(diags);
+  for (char ok : usable)
+    if (!ok)
+      return false;
+
+  // Chunks of index entries. Everything that is per entry rather than per archive
+  // is scheduled this way, because one Rust staticlib or one component archive
+  // can hold most of the entries on the command line and a per-archive
+  // parallelFor would leave it on a single worker.
+  struct EntryChunk {
+    uint32_t archiveIndex;
+    uint32_t begin;
+    uint32_t end;
+  };
+  constexpr uint32_t chunkEntries = 8192;
+  std::vector<EntryChunk> chunks;
+  for (uint32_t i = 0; i != archives.size(); ++i) {
+    uint32_t n = archives[i]->indexEntries.size();
+    for (uint32_t b = 0; b < n; b += chunkEntries)
+      chunks.push_back({i, b, std::min(b + chunkEntries, n)});
+  }
+
+  // Resolving an entry's member offset parses that member's header, so doing it
+  // once per entry -- 157,000 times for libgkrust.a, not once per member -- was
+  // most of what reading the indexes cost.
+  ts.reset(new TimeTraceScope("Resolve archive member offsets"));
+  std::atomic<bool> offsetsOk{true};
+  parallelForEach(chunks, [&](const EntryChunk &chunk) {
+    if (!archives[chunk.archiveIndex]->resolveIndexOffsets(chunk.begin,
+                                                           chunk.end))
+      offsetsOk.store(false, std::memory_order_relaxed);
+  });
+  if (!offsetsOk.load(std::memory_order_relaxed))
+    return false;
+  ts.reset(new TimeTraceScope("Build archive member maps"));
+  parallelFor(0, archives.size(), [&](size_t i) {
+    usable[i] = archives[i]->buildMemberMaps();
+  });
+  for (char ok : usable)
+    if (!ok)
+      return false;
+
+  // Two passes over every index entry, both on workers, both read-only on the
+  // symbol table: the earliest provider of each name, and the entries whose name
+  // is in undefined state now, which are the only ones the serial walk has to
+  // look at. Names a direct object or a preceding dylib already defines can never
+  // be extracted for, so they need no provider.
+  ts.reset();
+  providerShards = std::make_unique<ProviderShard[]>(numProviderShards);
+  // Every member's undefined names, enumerated on workers. This is the walk's
+  // largest serial cost by a wide margin -- not the symbol lookups but the walk
+  // over each member's own symbol table, which first-touches tens of thousands
+  // of pages of a multi-gigabyte archive mapping -- and it depends only on the
+  // archive bytes, so it is pure. A member that is never extracted costs a
+  // worker one wasted scan. Parallelism is per member, not per archive: one
+  // Rust staticlib can hold every member on the command line.
+  {
+    TimeTraceScope timeScope("Prepare archive member undefineds");
+    std::vector<std::pair<ArchiveFile *, uint64_t>> members;
+    for (ArchiveFile *archive : archives)
+      archive->reserveMemberUndefineds(members);
+    std::atomic<bool> allNative{true};
+    parallelForEach(members, [&](std::pair<ArchiveFile *, uint64_t> &m) {
+      if (!m.first->fillMemberUndefineds(m.second))
+        allNative.store(false, std::memory_order_relaxed);
+    });
+    if (!allNative.load(std::memory_order_relaxed))
+      return false;
+    // An extracted member that brings in its own libraries would have those
+    // inputs reference names after the phase has ended. The walk creates no slot
+    // for an index entry it does not extract, so such a name would be created
+    // where it was referenced rather than at its index entry, and symVector's
+    // order -- and with it the symbol table and the stubs -- would differ from
+    // the serial link. Give the whole archive set back to addLazySymbols().
+    for (ArchiveFile *archive : archives)
+      if (archive->memberLinkerOptions.load(std::memory_order_relaxed))
+        return false;
+    // The walk counter's ceiling for one archive: one value per index entry,
+    // visited or not, plus one per member and one per member undefined record.
+    // A member of an earlier archive can be extracted inside this archive's
+    // registration, so the member and undefined terms are summed over every
+    // archive. If that does not fit in the ordinal's walk field, the walk cannot
+    // number its events, and the archives publish their indexes the ordinary way
+    // instead.
+    uint64_t events = 0;
+    for (ArchiveFile *archive : archives)
+      for (const auto &kv : archive->indexChildren)
+        events += 1 + archive->memberUndefineds(kv.first).size();
+    uint64_t maxEntries = 0;
+    for (ArchiveFile *archive : archives)
+      maxEntries = std::max<uint64_t>(maxEntries, archive->indexEntries.size());
+    if (maxEntries + events > ordinalWalkMax)
+      return false;
+  }
+  ts.reset(new TimeTraceScope("Filter archive indexes"));
+  parallelFor(0, archives.size(),
+              [&](size_t archiveIndex) { archives[archiveIndex]->filterIndex(); });
+  ts.reset(new TimeTraceScope("Fold archive providers"));
+  parallelForEach(chunks, [&](const EntryChunk &chunk) {
+    ArchiveFile *archive = archives[chunk.archiveIndex];
+    for (uint32_t entryIndex = chunk.begin; entryIndex != chunk.end;
+         ++entryIndex) {
+      const ArchiveFile::IndexEntry &entry = archive->indexEntries[entryIndex];
+      if (Symbol *sym = symtab->find(entry.name))
+        if (isa<Defined>(sym) || isa<CommonSymbol>(sym))
+          continue;
+      ArchiveProvider provider{chunk.archiveIndex, entryIndex,
+                               entry.childOffset};
+      ProviderShard &shard = providerShards[providerShardOf(entry.name)];
+      std::lock_guard<std::mutex> lock(shard.mu);
+      auto [it, inserted] = shard.map.try_emplace(entry.name, provider);
+      if (!inserted && provider.precedes(it->second))
+        it->second = provider;
+    }
+  });
+
+  // A weak dylib definition that nothing has referenced yet is not what the
+  // serial linker had in the slot when an archive member's definition arrived:
+  // the archive's index entry replaced it with a LazyArchive symbol first, and
+  // addDefined then saw a lazy symbol rather than a weak dylib one, so it set no
+  // override. The walk leaves no lazy symbol behind, so the weak dylib symbol is
+  // still there and both the fold and the post-phase path would set one. Mark
+  // them here -- after the direct objects have taken their references, which is
+  // the state at the archive's own position -- and suppress the override on both
+  // paths. filterIndex() drops such an entry from the candidates for the same
+  // reason, so the walk itself never extracts at it.
+  for (unsigned i = 0; i != numProviderShards; ++i)
+    for (const auto &entry : providerShards[i].map) {
+      Symbol *sym = symtab->find(entry.first);
+      auto *dysym = dyn_cast_or_null<DylibSymbol>(sym);
+      if (!dysym || !dysym->isWeakDef() || dysym->isReferenced())
+        continue;
+      if (dysym->getFile()->id < archives[entry.second.archiveIndex]->id)
+        weakOverrideSuppressed.insert(sym);
+    }
+  weakOverrideSuppressedHook = suppressesWeakOverride;
+
+  ts.reset();
+  // Is the name already satisfied at the point archive `archiveIndex` is
+  // registered? A definition in a direct object, a definition in a member that
+  // has already been extracted, or a strong dylib definition registered before
+  // this archive all suppress the extraction.
+  // Only the part of the suppression rule that needs the symbol table: the
+  // "already provided by an extracted member" part is the provider's `extracted`
+  // flag, which every caller has tested before it gets here.
+  auto definedAlready = [&](uint32_t archiveIndex, Symbol *sym) {
+    if (!sym)
+      return false;
+    if (isa<Defined>(sym) || isa<CommonSymbol>(sym))
+      return true;
+    if (auto *dysym = dyn_cast<DylibSymbol>(sym)) {
+      // A weak dylib definition never suppresses an extraction; a strong one
+      // does exactly when it was registered before this archive.
+      if (dysym->isWeakDef())
+        return false;
+      return dysym->isDynamicLookup() ||
+             dysym->getFile()->id < archives[archiveIndex]->id;
+    }
+    return false;
+  };
+
+  // The point the walk has reached: every index entry before it has been
+  // registered and can satisfy an undefined symbol, and nothing after it has.
+  uint32_t frontierArchive = 0;
+  uint32_t frontierEntry = 0;
+
+  // Every event an archive registration produces -- the index entry itself, the
+  // member it extracts, that member's undefined symbols, and anything those
+  // extract in turn -- sorts inside that archive's command-line position, so it
+  // takes the archive's ordinal and a value from that archive's own monotone walk
+  // counter. Nothing here draws from the command-line counter, which is already
+  // past every input.
+  //
+  // An index entry the walk never visits still needs a position, because
+  // reserveArchiveSlot() puts a name at the earliest entry that names it, and
+  // that entry may be one the walk passed over. The counter therefore leaves a
+  // gap of one value per skipped entry, jumped arithmetically rather than by
+  // touching those entries: the walk only visits candidates, which is where its
+  // gain comes from. `visited` records the block each visited entry got, so the
+  // position of a skipped entry k is one value past the block of the last
+  // visited entry before it, offset by how far past it k is.
+  struct EntryWalk {
+    uint32_t entryIndex;
+    uint32_t walkStart;
+    uint32_t walkEnd;
+  };
+  std::vector<std::vector<EntryWalk>> visited(archives.size());
+  uint32_t registrationTop = 0;
+  uint32_t walkCounter = 0;
+  uint32_t lastVisitedEntry = UINT32_MAX; // "before entry 0"
+  auto walkOfEntry = [&](uint32_t archiveIndex, uint32_t entryIndex) -> uint32_t {
+    const std::vector<EntryWalk> &blocks = visited[archiveIndex];
+    // The last visited entry at or before entryIndex.
+    auto it = std::upper_bound(blocks.begin(), blocks.end(), entryIndex,
+                               [](uint32_t k, const EntryWalk &b) {
+                                 return k < b.entryIndex;
+                               });
+    if (it == blocks.begin())
+      return entryIndex; // no visited entry before it: the gaps start at zero
+    --it;
+    if (it->entryIndex == entryIndex)
+      return it->walkStart;
+    return it->walkEnd + (entryIndex - it->entryIndex - 1);
+  };
+
+  // Index entries a member's undefined symbol has scheduled because its earliest
+  // provider was still ahead of the frontier. The walk merges them into each
+  // archive's candidate list in index order.
+  std::vector<std::priority_queue<uint32_t, std::vector<uint32_t>,
+                                  std::greater<uint32_t>>>
+      scheduled(archives.size());
+
+  const size_t firstMember = parallelInput.objects.size();
+
+  // Extract one member, then walk its own undefined symbols depth first, in
+  // nlist order: that is where the serial linker applied them, and it applied
+  // the whole of an extracted member before moving to the next undefined.
+  std::function<void(uint32_t, uint64_t, StringRef)> extract =
+      [&](uint32_t archiveIndex, uint64_t childOffset, StringRef reason) {
+        ArchiveFile *archive = archives[archiveIndex];
+        if (archive->isFetched(childOffset))
+          return;
+        ObjFile *obj = archive->createIndexedMember(childOffset, reason);
+        if (!obj)
+          return;
+        for (uint32_t entryIndex : archive->memberEntries[childOffset]) {
+          const ArchiveFile::IndexEntry &entry =
+              archive->indexEntries[entryIndex];
+          // If the walk has already passed an index entry for this name, the
+          // serial linker created its slot there, and a definition arriving
+          // later did not move it. A name with no provider entry is one no
+          // index entry can ever ask for, so it needs no slot and no flag.
+          ArchiveProvider *first = lookupArchiveProvider(entry.name);
+          if (!first)
+            continue;
+          // If a member extracted earlier already provides this name, the serial
+          // linker created its slot when that member was parsed, and passing a
+          // later index entry for it created nothing.
+          if (first->extracted)
+            continue;
+          first->extracted = true;
+          // Only an entry the walk has already passed created a slot there.
+          if (first->archiveIndex > frontierArchive ||
+              (first->archiveIndex == frontierArchive &&
+               first->entryIndex > frontierEntry))
+            continue;
+          symtab->reserveArchiveSlot(
+              entry.name.val(), archive,
+              RecordOrdinal{parallelInput.archiveOrdinals[first->archiveIndex],
+                            walkOfEntry(first->archiveIndex, first->entryIndex),
+                            0});
+        }
+        // The member's records apply before those of anything it extracts, so
+        // it takes its ordinal here...
+        adoptHeldFile(obj, registrationTop, walkCounter++);
+
+        // The member's undefined names were enumerated on a worker before the
+        // walk started; the serial walk only reads the list.
+        for (StringRef undefName : archive->memberUndefineds(childOffset)) {
+          // The serial linker applies this undefined record here, so it takes
+          // this sub-position and anything it extracts takes the ones after it.
+          obj->parseCtx->undefinedWalks.push_back(walkCounter++);
+          llvm::CachedHashStringRef name(undefName);
+          // The provider lookup comes first because it is the only one of these
+          // tests that most undefined names fail: a name no archive provides can
+          // never extract anything, whatever the symbol table says about it, and
+          // one whose provider is already extracted was resolved inside that
+          // member's parse. Both are pure tests, so hoisting them above the
+          // table lookup does not change which members are extracted.
+          ArchiveProvider *provider = lookupArchiveProvider(name);
+          if (!provider || provider->extracted)
+            continue;
+          Symbol *sym = symtab->find(name);
+          if (definedAlready(frontierArchive, sym))
+            continue;
+          // Only an index entry the walk has already passed can satisfy this.
+          // One still ahead of the frontier is scheduled so that the walk visits
+          // it in index order when it gets there, which is where the serial
+          // linker's own registration of that entry would have extracted it.
+          if (provider->archiveIndex > frontierArchive ||
+              (provider->archiveIndex == frontierArchive &&
+               provider->entryIndex >= frontierEntry)) {
+            scheduled[provider->archiveIndex].push(provider->entryIndex);
+            continue;
+          }
+          extract(provider->archiveIndex, provider->childOffset, undefName);
+        }
+        obj->parseCtx->completion =
+            RecordOrdinal{registrationTop, walkCounter, 0};
+
+        // ...but the serial linker only published it once its parse, and with
+        // it every nested extraction, had finished.
+        archive->publishIndexedMember(obj, reason);
+      };
+
+  ts.reset(new TimeTraceScope("Select archive members"));
+  for (uint32_t archiveIndex = 0; archiveIndex != archives.size();
+       ++archiveIndex) {
+    ArchiveFile *archive = archives[archiveIndex];
+    frontierArchive = archiveIndex;
+    registrationTop = parallelInput.archiveOrdinals[archiveIndex];
+    walkCounter = 0;
+    lastVisitedEntry = UINT32_MAX;
+    size_t next = 0;
+    auto &pending = scheduled[archiveIndex];
+    while (next != archive->candidateEntries.size() || !pending.empty()) {
+      uint32_t entryIndex;
+      if (next == archive->candidateEntries.size())
+        entryIndex = pending.top();
+      else if (pending.empty())
+        entryIndex = archive->candidateEntries[next];
+      else
+        entryIndex = std::min(archive->candidateEntries[next], pending.top());
+      while (next != archive->candidateEntries.size() &&
+             archive->candidateEntries[next] == entryIndex)
+        ++next;
+      while (!pending.empty() && pending.top() == entryIndex)
+        pending.pop();
+
+      const ArchiveFile::IndexEntry &entry = archive->indexEntries[entryIndex];
+      frontierEntry = entryIndex;
+      if (archive->isFetched(entry.childOffset))
+        continue;
+      // Same two pure tests as the undefined walk: an entry whose name a
+      // member extracted earlier already provides created nothing in the serial
+      // linker, and every candidate entry has a provider by construction (the
+      // provider pass skips only names already defined, which filterIndex also
+      // skips).
+      ArchiveProvider *entryProvider = lookupArchiveProvider(entry.name);
+      if (entryProvider && entryProvider->extracted)
+        continue;
+      Symbol *sym = symtab->find(entry.name);
+      if (definedAlready(archiveIndex, sym))
+        continue;
+      // Only an entry that extracts takes a block of walk values; one the walk
+      // looked at and passed over is a gap, exactly like one it never looked at.
+      // lastVisitedEntry is UINT32_MAX before the first one, so the unsigned
+      // subtraction leaves a gap of exactly entryIndex values.
+      // The candidate list and the scheduled queue are both merged in index
+      // order, so the walk only ever moves forward; the gap arithmetic below
+      // relies on it.
+      assert((lastVisitedEntry == UINT32_MAX || entryIndex > lastVisitedEntry) &&
+             "the walk must visit an archive's entries in index order");
+      walkCounter += entryIndex - lastVisitedEntry - 1;
+      uint32_t walkStart = walkCounter++;
+      lastVisitedEntry = entryIndex;
+      // The block goes in before the extraction, not after: reserveArchiveSlot()
+      // may ask for this very entry's position while the extraction is running
+      // (the frontier rule admits first->entryIndex == frontierEntry), and for
+      // its own entry the answer is walkStart, which is already final. walkEnd is
+      // only ever read for an entry strictly below the one being asked about, so
+      // leaving it provisional until the extraction returns is safe.
+      visited[archiveIndex].push_back({entryIndex, walkStart, walkStart + 1});
+      extract(archiveIndex, entry.childOffset, entry.name.val());
+      visited[archiveIndex].back().walkEnd = walkCounter;
+    }
+  }
+
+  ts.reset(new TimeTraceScope("Parse archive members"));
+  parseHeldFiles(firstMember);
+  ts.reset();
+  return true;
+}
+
+static void resetParallelInputPhase() {
+  archiveProviderHook = nullptr;
+  weakOverrideSuppressedHook = nullptr;
+  weakOverrideSuppressed.clear();
+  providerShards.reset();
+  parallelInput.active = false;
+  parallelInput.contexts.clear();
+  parallelInput.objects.clear();
+  parallelInput.archives.clear();
+  parallelInput.archiveOrdinals.clear();
+  parallelInput.nextOrdinal = 0;
+}
+
+// After the phase, a name referenced for the first time still has to be able to
+// reach an archive member the walker did not extract.
+static void fetchFromArchiveProvider(StringRef name, uint32_t belowArchiveId) {
+  const ArchiveProvider *provider =
+      lookupArchiveProvider(llvm::CachedHashStringRef(name));
+  if (!provider)
+    return;
+  ArchiveFile *archive = parallelInput.archives[provider->archiveIndex];
+  // The caller already holds a lazy symbol from an archive with this id; only an
+  // archive that precedes it on the command line would have owned the slot.
+  if (archive->id >= belowArchiveId)
+    return;
+  if (archive->isFetched(provider->childOffset))
+    return;
+  // The serial linker would have left a LazyArchive symbol in this slot, which
+  // shadows a dylib definition registered after the archive.
+  if (Symbol *sym = symtab->find(name)) {
+    if (isa<Defined>(sym) || isa<CommonSymbol>(sym))
+      return;
+    if (auto *dysym = dyn_cast<DylibSymbol>(sym))
+      if (!dysym->isWeakDef() && (dysym->isDynamicLookup() ||
+                                  dysym->getFile()->id < archive->id))
+        return;
+  }
+  ObjFile *obj = archive->createIndexedMember(provider->childOffset, name);
+  if (!obj)
+    return;
+  obj->parseFile();
+  archive->publishIndexedMember(obj, name);
+}
+
 // Run the held parses and put the symbol table back into its serial mode.
-static void finishParallelInput() {
+static void finishParallelInput(bool moreInputsFollow = false) {
   if (!parallelInput.active)
     return;
   parallelInput.active = false;
@@ -652,19 +1168,47 @@ static void finishParallelInput() {
   auto &objects = parallelInput.objects;
   {
     TimeTraceScope timeScope("Parse held object files");
-    std::vector<ObjFile *> order;
-    order.reserve(objects.size());
-    for (auto &[obj, ordinal] : objects)
-      order.push_back(obj);
-    if (reverseHeldParseOrder())
-      std::reverse(order.begin(), order.end());
-    parallelParseActive = true;
-    parallelForEach(order, [](ObjFile *obj) {
-      deferredDiagnostics = &obj->parseCtx->diags;
-      obj->parseFile();
-      deferredDiagnostics = nullptr;
-    });
-    parallelParseActive = false;
+    parseHeldFiles(0);
+  }
+
+  // The same rule as for extracted members, for the direct objects: an
+  // LC_LINKER_OPTION loads a library after the phase, and a name only that
+  // library references has no slot if the walk skipped its index entry. The held
+  // objects' options have not been merged into unprocessedLCLinkerOptions yet --
+  // that happens below -- so ask their contexts directly. This is what made the
+  // check on unprocessedLCLinkerOptions alone read as empty.
+  if (!moreInputsFollow)
+    for (ParseContext &ctx : parallelInput.contexts)
+      if (!ctx.lcLinkerOptions.empty()) {
+        moreInputsFollow = true;
+        break;
+      }
+
+  // The walker decides extraction from the index instead of from a lazy symbol
+  // per index entry, so it leaves nothing behind for the entries it does not
+  // extract from. That is invisible at the end of the input but not to an input
+  // that follows, so when one does, the held archives publish their indexes the
+  // ordinary way instead -- with one correction, because the dylibs between and
+  // after them have already been registered.
+  bool walked = false;
+  bool publishedSerially = false;
+  if (!parallelInput.archives.empty()) {
+    if (moreInputsFollow) {
+      TimeTraceScope timeScope("Publish archive indexes");
+      ParseContext archiveCtx;
+      for (uint32_t i = 0; i != parallelInput.archives.size(); ++i) {
+        archiveCtx.top = parallelInput.archiveOrdinals[i];
+        archiveCtx.walk = 0;
+        archiveCtx.seq = 0;
+        symtab->serialCtx = &archiveCtx;
+        parallelInput.archives[i]->publishHeldIndex();
+      }
+      symtab->serialCtx = nullptr;
+      publishedSerially = true;
+    } else {
+      TimeTraceScope timeScope("Walk archives");
+      walked = walkArchives();
+    }
   }
 
   {
@@ -686,9 +1230,6 @@ static void finishParallelInput() {
     inlineUnwind.insert(ctx.inlineUnwindFiles.begin(),
                         ctx.inlineUnwindFiles.end());
   }
-  for (auto &[obj, ordinal] : objects)
-    obj->parseCtx = nullptr;
-
   symtab->applyPendingCoalesces(coalesces);
 
   // Replay the records the fold could not apply, and register unwind entries,
@@ -699,11 +1240,24 @@ static void finishParallelInput() {
                           const DeferredDefinedRecord &b) {
     return a.ordinal < b.ordinal;
   });
+  // In completion order, not adoption order: the walker adopts an extracted
+  // member before the members its undefined symbols extract, but those complete
+  // first, so a parent replayed at its own completion would displace a nested
+  // member's weak definition before that member had registered as its owner --
+  // which is exactly the case design 7 section 3 flags these files for.
+  std::vector<std::pair<RecordOrdinal, ObjFile *>> inlineOrder;
+  for (auto &[obj, ordinal] : objects)
+    if (inlineUnwind.contains(obj))
+      inlineOrder.emplace_back(obj->parseCtx
+                                   ? obj->parseCtx->completionOrdinal()
+                                   : RecordOrdinal{ordinal + 1, 0, 0},
+                               obj);
+  llvm::stable_sort(inlineOrder, [](const std::pair<RecordOrdinal, ObjFile *> &a,
+                                    const std::pair<RecordOrdinal, ObjFile *> &b) {
+    return a.first < b.first;
+  });
   size_t next = 0;
-  for (auto &[obj, ordinal] : objects) {
-    if (!inlineUnwind.contains(obj))
-      continue;
-    RecordOrdinal completion = static_cast<RecordOrdinal>(ordinal + 1) << 32;
+  for (auto &[completion, obj] : inlineOrder) {
     while (next != deferred.size() && deferred[next].ordinal < completion)
       symtab->addDefinedRecord(deferred[next++]);
     obj->registerUnwind();
@@ -738,8 +1292,27 @@ static void finishParallelInput() {
         replayDiagnostics(d);
   }
 
+  for (auto &[obj, ordinal] : objects)
+    obj->parseCtx = nullptr;
+
   objects.clear();
   objects.shrink_to_fit();
+
+  if (walked) {
+    archiveProviderHook = fetchFromArchiveProvider;
+  } else if (publishedSerially) {
+    parallelInput.archives.clear();
+    parallelInput.archiveOrdinals.clear();
+  } else {
+    parallelInput.archiveOrdinals.clear();
+    // The walker could not run, so the archives publish their indexes the
+    // ordinary way. Every direct object is already resolved, and every archive
+    // follows every object, so this is the serial order.
+    providerShards.reset();
+    for (ArchiveFile *archive : parallelInput.archives)
+      archive->addLazySymbols();
+    parallelInput.archives.clear();
+  }
   // parallelInput.contexts is deliberately not cleared: deferFile() holds a
   // pointer into it across the call that ends the phase.
 }
@@ -748,19 +1321,31 @@ static void finishParallelInput() {
 // and context the phase needs. Anything that would observe a partially resolved
 // symbol table runs the held parses first.
 static bool beginHeldInput(MemoryBufferRef mbref, bool isLazy,
-                           ParseContext *ctx) {
+                           LoadType loadType, ParseContext *ctx,
+                           bool &holdArchiveIndex) {
   bool holdParse = false;
+  holdArchiveIndex = false;
   if (parallelInput.active) {
     switch (identify_magic(mbref.getBuffer())) {
     case file_magic::macho_object:
-      if (isLazy)
-        finishParallelInput();
+      // An object after an archive can define a name the archive would
+      // otherwise have been extracted for, so the archives that precede it are
+      // walked first and this object is resolved in the ordinary serial way.
+      if (isLazy || !parallelInput.archives.empty())
+        finishParallelInput(/*moreInputsFollow=*/true);
       else
         holdParse = true;
       break;
     case file_magic::archive:
+      // An archive that loads every member does so at its own position, so it
+      // needs the objects before it resolved and the table in its serial state.
+      holdArchiveIndex = loadType == LoadType::CommandLine &&
+                         !config->allLoad && !config->forceLoadObjC;
+      if (!holdArchiveIndex)
+        finishParallelInput(/*moreInputsFollow=*/true);
+      break;
     case file_magic::bitcode:
-      finishParallelInput();
+      finishParallelInput(/*moreInputsFollow=*/true);
       break;
     default:
       break;
@@ -769,18 +1354,38 @@ static bool beginHeldInput(MemoryBufferRef mbref, bool isLazy,
   if (parallelInput.active)
     symtab->serialCtx = ctx;
   deferDirectObjParse = holdParse;
+  deferArchiveIndex = holdArchiveIndex;
   return holdParse;
 }
 
-static void endHeldInput(InputFile *file, bool holdParse, ParseContext *ctx) {
+static void endHeldInput(InputFile *file, bool holdParse, bool holdArchiveIndex,
+                         ParseContext *ctx) {
   deferDirectObjParse = false;
+  deferArchiveIndex = false;
   symtab->serialCtx = nullptr;
-  if (!holdParse)
+  if (holdParse) {
+    auto *obj = cast<ObjFile>(file);
+    obj->parseCtx = ctx;
+    obj->deferUnwindRegistration = true;
+    parallelInput.objects.emplace_back(obj, ctx->top);
     return;
-  auto *obj = cast<ObjFile>(file);
-  obj->parseCtx = ctx;
-  obj->deferUnwindRegistration = true;
-  parallelInput.objects.emplace_back(obj, ctx->fileOrdinal);
+  }
+  if (!holdArchiveIndex)
+    return;
+  // processFile() returns the cached ArchiveFile for a repeated path, whose
+  // index the walker already owns.
+  auto *archive = dyn_cast_or_null<ArchiveFile>(file);
+  if (!archive || llvm::is_contained(parallelInput.archives, archive))
+    return;
+  if (archive->canWalk()) {
+    parallelInput.archives.push_back(archive);
+    parallelInput.archiveOrdinals.push_back(ctx->top);
+    return;
+  }
+  // This archive has to publish its index right here, which means every object
+  // before it must already be resolved.
+  finishParallelInput(/*moreInputsFollow=*/true);
+  archive->addLazySymbols();
 }
 
 static void deferFile(StringRef path, bool isLazy, DeferredFiles &deferred,
@@ -804,13 +1409,15 @@ static void deferFile(StringRef path, bool isLazy, DeferredFiles &deferred,
   if (parallelInput.active) {
     parallelInput.contexts.emplace_back();
     ctx = &parallelInput.contexts.back();
-    ctx->fileOrdinal = parallelInput.nextOrdinal++;
+    ctx->top = parallelInput.nextOrdinal++;
   }
-  bool holdParse = beginHeldInput(mbref, isLazy, ctx);
+  bool holdArchiveIndex = false;
+  bool holdParse =
+      beginHeldInput(mbref, isLazy, loadType, ctx, holdArchiveIndex);
   InputFile *file =
       processFile(buffer, nullptr, path, loadType, isLazy, isExplicit,
                   /*isBundleLoader=*/false, isHidden);
-  endHeldInput(file, holdParse, ctx);
+  endHeldInput(file, holdParse, holdArchiveIndex, ctx);
   applyDylibMetadata(file, isNeeded, isWeak, isReexport);
   checkAndCacheFramework(file, path);
 }
@@ -1859,19 +2466,24 @@ static void createFiles(const InputArgList &args) {
       if (parallelInput.active) {
         parallelInput.contexts.emplace_back();
         ctx = &parallelInput.contexts.back();
-        ctx->fileOrdinal = parallelInput.nextOrdinal++;
+        ctx->top = parallelInput.nextOrdinal++;
       }
-      bool holdParse = beginHeldInput(file.buffer, file.isLazy, ctx);
+      bool holdArchiveIndex = false;
+      bool holdParse = beginHeldInput(file.buffer, file.isLazy, file.loadType,
+                                      ctx, holdArchiveIndex);
       auto inputFile = processFile(file.buffer, &archiveContents, file.path,
                                    file.loadType, file.isLazy, file.isExplicit,
                                    /*isBundleLoader=*/false, file.isHidden);
-      endHeldInput(inputFile, holdParse, ctx);
+      endHeldInput(inputFile, holdParse, holdArchiveIndex, ctx);
       applyDylibMetadata(inputFile, file.isNeeded, file.isWeak,
                          file.isReexport);
       checkAndCacheFramework(inputFile, file.path);
 
-      if (ArchiveFile *archive = dyn_cast_or_null<ArchiveFile>(inputFile))
-        archive->addLazySymbols();
+      // endHeldInput() has already dealt with the index when it held it back:
+      // either the walker owns it or it published it on the spot.
+      if (auto *archive = dyn_cast_or_null<ArchiveFile>(inputFile))
+        if (!holdArchiveIndex)
+          archive->addLazySymbols();
     }
 
     if (!archiveContents.empty())
@@ -1881,8 +2493,9 @@ static void createFiles(const InputArgList &args) {
   }
 #endif
 
-  // Anything still held back is parsed now, before createFiles() returns.
-  finishParallelInput();
+  // Anything still held back is parsed now. LC_LINKER_OPTION libraries are
+  // loaded afterwards and have to see the archives' residual index.
+  finishParallelInput(/*moreInputsFollow=*/!unprocessedLCLinkerOptions.empty());
 }
 
 namespace {
@@ -2283,6 +2896,7 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     thunkMap.clear();
     unprocessedLCLinkerOptions.clear();
     ObjCSelRefsHelper::cleanup();
+    resetParallelInputPhase();
 
     firstTLVDataSection = nullptr;
     tar = nullptr;
@@ -2438,7 +3052,10 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
 
   // The parallel input phase needs the sharded symbol table from the very first
   // symbol, because each of its slots carries a hidden header. At one thread
-  // nothing is sharded and the input phase is bit-for-bit the old one.
+  // nothing is sharded and the input phase is bit-for-bit the old one. The
+  // ordinal field widths have to be settled before the first ordinal, which is
+  // the first -u symbol just below.
+  initRecordOrdinalWidths();
   if (parallel::strategy.ThreadsRequested != 1)
     symtab->enableSharding();
 

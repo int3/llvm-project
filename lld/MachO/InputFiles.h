@@ -22,6 +22,7 @@
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/DebugInfo/DWARF/DWARFUnit.h"
 #include "llvm/Object/Archive.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Threading.h"
@@ -53,12 +54,59 @@ class AliasSymbol;
 struct Relocation;
 enum class RefState : uint8_t;
 
-// A symbol record's position in the historical serial input order. The high 32
-// bits hold the ordinal of the input file that produced the record and the low
-// 32 bits hold the sequence number of the record within that file's parse, so
-// that comparing two ordinals answers "which of these two records would the
-// serial linker have applied first?".
-using RecordOrdinal = uint64_t;
+// Ordinal field widths. The three fields are packed into one 64-bit integer, so
+// they have to share 63 bits -- bit 63 carries SlotMeta's deferred flag. Measured
+// maxima over the eight replayed corpora at eight threads:
+//
+//   field | largest seen                                   | width | headroom
+//   top   | 11,370 (Chromium debug, 11,372 inputs)         |  17   |  11.5x
+//   walk  | 418,243 (Godot iOS: 291,628 index entries plus |  23   |  20x
+//         |  126,615 member and undefined events)          |       |
+//   seq   | 82,488 (Firefox iOS launcher)                  |  23   |  100x
+//
+// They are variables rather than constants so that a test can narrow them and
+// exercise the overflow paths; nothing changes them after
+// initRecordOrdinalWidths() runs, before the first ordinal exists.
+extern unsigned ordinalSeqBits, ordinalWalkBits, ordinalTopBits;
+extern uint32_t ordinalSeqMax, ordinalWalkMax, ordinalTopMax;
+void initRecordOrdinalWidths();
+[[noreturn]] void reportOrdinalOverflow(uint32_t top, uint32_t walk,
+                                        uint32_t seq);
+
+// A symbol record's position in the historical serial input order: comparing two
+// ordinals answers "which of these two records would the serial linker have
+// applied first?". It is the lexicographic triple
+//
+//   top  -- the input's ordinal on the command line;
+//   walk -- zero for an object's or a dylib's own records; for the events an
+//           archive registration produces, that archive's own monotone walk
+//           counter, so that an index entry, the member it extracts and that
+//           member's undefined symbols all sort inside the archive's
+//           command-line position and before whatever the command line lists
+//           after it. The counter advances past the entries the walk does not
+//           visit arithmetically, so a skipped entry still has a position
+//           without the walk having to touch it (see walkArchives()).
+//   seq  -- the record's sequence number within one file's parse.
+//
+// packed lexicographically into one integer, because the fold pays the key's
+// width twice per name in its per-slot header and once per comparison in the
+// compaction sort.
+struct RecordOrdinal {
+  uint64_t v = 0;
+
+  RecordOrdinal() = default;
+  RecordOrdinal(uint32_t top, uint32_t walk, uint32_t seq) {
+    if (LLVM_UNLIKELY(top > ordinalTopMax || walk > ordinalWalkMax ||
+                      seq > ordinalSeqMax))
+      reportOrdinalOverflow(top, walk, seq);
+    v = (static_cast<uint64_t>(top) << (ordinalWalkBits + ordinalSeqBits)) |
+        (static_cast<uint64_t>(walk) << ordinalSeqBits) | seq;
+  }
+
+  bool operator<(const RecordOrdinal &o) const { return v < o.v; }
+  bool operator==(const RecordOrdinal &o) const { return v == o.v; }
+  bool operator!=(const RecordOrdinal &o) const { return v != o.v; }
+};
 
 // A definition that lost the fold, recorded so that the effects it has on
 // *other* files (moving local aliases into the prevailing section, and removing
@@ -102,8 +150,23 @@ struct DeferredDefinedRecord {
 // would otherwise append to a global lives here and is merged back in file
 // order by the coordinator.
 struct ParseContext {
-  uint32_t fileOrdinal = 0;
+  // The input's command-line ordinal and, for an extracted member, the walk
+  // value its archive's registration gave it.
+  uint32_t top = 0;
+  uint32_t walk = 0;
   uint32_t seq = 0;
+  // An extracted member's records interleave with those of the members it
+  // extracts: the serial linker applies the member's defined records, then walks
+  // its undefined symbols, and an undefined that triggers an extraction applies
+  // the whole extracted member -- recursively -- before moving to the next one.
+  // So each of a member's undefined records takes its own position, allocated by
+  // the walker where it enumerated them, and the positions of the members they
+  // extract fall in between. Empty for a direct object, which extracts nothing
+  // and keeps all of its records on one position.
+  llvm::SmallVector<uint32_t, 0> undefinedWalks;
+  uint32_t undefinedSeq = 0;
+  // The ordinal just past everything this file and its extractions occupy.
+  RecordOrdinal completion;
   DeferredDiagnostics diags;
   llvm::SmallVector<PendingCoalesce, 0> coalesces;
   llvm::SmallVector<DeferredDefinedRecord, 0> deferredDefined;
@@ -112,8 +175,17 @@ struct ParseContext {
   // displaces. Their unwind entries must be registered while they still own it.
   llvm::SmallVector<InputFile *, 0> inlineUnwindFiles;
 
-  RecordOrdinal nextOrdinal() {
-    return (static_cast<RecordOrdinal>(fileOrdinal) << 32) | seq++;
+  RecordOrdinal nextOrdinal() { return {top, walk, seq++}; }
+  // The ordinal of this file's next undefined record. They are applied in nlist
+  // order, which is the order the walker enumerated them in.
+  RecordOrdinal nextUndefinedOrdinal() {
+    if (undefinedSeq < undefinedWalks.size())
+      return {top, undefinedWalks[undefinedSeq++], 0};
+    return nextOrdinal();
+  }
+  RecordOrdinal completionOrdinal() const {
+    return completion != RecordOrdinal() ? completion
+                                         : RecordOrdinal{top + 1, 0, 0};
   }
 };
 
@@ -388,8 +460,77 @@ class ArchiveFile final : public InputFile {
 public:
   explicit ArchiveFile(std::unique_ptr<llvm::object::Archive> &&file,
                        bool forceHidden);
-  void addLazySymbols();
+  void addLazySymbols(bool heldIndex = false);
   void fetch(const llvm::object::Archive::Symbol &);
+
+  // --- parallel input phase ---
+  //
+  // The walker (see Driver.cpp) decides which members to extract from the
+  // archive's index rather than from a LazyArchive symbol per index entry, so
+  // the index is read into these two maps on a worker instead.
+  struct IndexEntry {
+    llvm::CachedHashStringRef name;
+    uint64_t childOffset;
+  };
+  // Every index entry, in index order, and the position the walk gave each one
+  // it has passed (UINT32_MAX until then). A symbol an extracted member defines
+  // belongs at the position of the earliest index entry that names it, because
+  // that is where the serial linker created its slot.
+  llvm::SmallVector<IndexEntry, 0> indexEntries;
+  // Index entries whose name is in undefined state once the direct objects are
+  // resolved, in index order. Computed on a worker; the serial walk visits only
+  // these, plus entries a member's undefined symbol schedules.
+  llvm::SmallVector<uint32_t, 0> candidateEntries;
+  // Set if any member carries an LC_LINKER_OPTION; see fillMemberUndefineds().
+  std::atomic<bool> memberLinkerOptions{false};
+  // One per index entry while the index is being read, so that the member
+  // offsets can be resolved in parallel afterwards; dropped once they are.
+  std::vector<llvm::object::Archive::Symbol> indexSymbols;
+  // Each member's child offset, and the index entries it provides.
+  llvm::DenseMap<uint64_t, llvm::object::Archive::Child> indexChildren;
+  llvm::DenseMap<uint64_t, llvm::SmallVector<uint32_t, 2>> memberEntries;
+  // Can the walker own this archive's index? Checked at the archive's position
+  // on the command line, because the answer decides whether the index is
+  // published there or later, so it looks only at the archive's own header and
+  // its first member, never at every member.
+  bool canWalk();
+  // Each member's undefined names, in the order ObjFile::parseSymbols() applies
+  // its undefined records. Enumerating them is the serial walk's largest cost,
+  // and it depends only on the archive bytes, so the walk has workers do it
+  // first: reserveMemberUndefineds() appends one work item per member (serial,
+  // one entry per distinct child), and fillMemberUndefineds() fills that
+  // member's slot on a worker.
+  void reserveMemberUndefineds(
+      std::vector<std::pair<ArchiveFile *, uint64_t>> &work);
+  bool fillMemberUndefineds(uint64_t childOffset);
+  ArrayRef<StringRef> memberUndefineds(uint64_t childOffset) const {
+    auto it = undefinedNames.find(childOffset);
+    assert(it != undefinedNames.end());
+    return it->second;
+  }
+  // Fill candidateEntries. Read-only on the symbol table; safe on a worker.
+  void filterIndex();
+  // buildIndex() reads the archive's symbol table in order, which is all the
+  // Archive API allows, and records a name and the symbol's coordinates per
+  // entry. resolveIndexOffsets() then fills in each entry's member offset --
+  // Symbol::getMember() parses a member header, so this is chunked across
+  // workers -- and buildMemberMaps() builds the per-member maps from the
+  // resolved offsets. Any of them returning false means this archive cannot be
+  // walked, and the link falls back to addLazySymbols(). All three are safe on
+  // a worker; only the first two may run concurrently for one archive.
+  bool buildIndex();
+  bool resolveIndexOffsets(uint32_t begin, uint32_t end);
+  bool buildMemberMaps();
+  bool isFetched(uint64_t childOffset) const { return seen.contains(childOffset); }
+  // Publish the index the ordinary way, for a link whose shape the walker does
+  // not cover.
+  void publishHeldIndex();
+  // fetch() split in two for the walker. The serial linker created a member and
+  // parsed it -- which extracted the members it needs, in full -- before adding
+  // it to inputFiles and reporting it, so a nested extraction is published
+  // first even though its records apply later.
+  ObjFile *createIndexedMember(uint64_t childOffset, StringRef reason);
+  void publishIndexedMember(ObjFile *member, StringRef reason);
   // LLD normally doesn't use Error for error-handling, but the underlying
   // Archive library does, so this is the cleanest way to wrap it.
   Error fetch(const llvm::object::Archive::Child &, StringRef reason);
@@ -397,6 +538,9 @@ public:
   static bool classof(const InputFile *f) { return f->kind() == ArchiveKind; }
 
 private:
+  // Keyed by child offset. Every value is created before any worker runs, so the
+  // workers only write into their own value and never rehash the map.
+  llvm::DenseMap<uint64_t, llvm::SmallVector<StringRef, 0>> undefinedNames;
   Expected<InputFile *> childToObjectFile(const llvm::object::Archive::Child &c,
                                           bool lazy);
   std::unique_ptr<llvm::object::Archive> file;
@@ -435,6 +579,33 @@ extern bool deferDirectObjParse;
 // parse then come from thread-local arenas; outside the region they come from
 // the ordinary ones, which keeps the serial phases' allocation locality.
 extern bool parallelParseActive;
+// While set, a command-line archive does not publish its index as LazyArchive
+// symbols; the walker reads the index instead.
+extern bool deferArchiveIndex;
+
+// Calls fn with the name of every external undefined symbol of a Mach-O object
+// file, in nlist order, without parsing it. This is what lets the walker decide
+// which archive member to extract next without waiting for the parse of the
+// member that triggered it.
+void forEachUndefinedName(MemoryBufferRef mb,
+                          llvm::function_ref<void(StringRef)> fn,
+                          bool *sawLinkerOption = nullptr);
+
+// Set by the parallel input phase's walker for the rest of the link. Where the
+// serial linker would have left a LazyArchive symbol for an index entry it did
+// not extract, the walker leaves nothing, so a name first referenced after the
+// phase (from an LC_LINKER_OPTION library, say) asks this hook instead. The
+// second argument bounds which archives may answer: a slot that already holds a
+// LazyArchive symbol of its own is only overtaken by a walked archive that comes
+// earlier on the command line, which is the one the serial linker would have
+// fetched from.
+extern void (*archiveProviderHook)(StringRef name, uint32_t belowArchiveId);
+
+// Dylib symbols whose weak definition the serial linker would no longer have had
+// in the slot when a definition arrived, because an archive index entry had
+// replaced it with a LazyArchive symbol first. A definition displacing one of
+// these must not set overridesWeakDef, or the output grows a weak-bind entry.
+extern bool (*weakOverrideSuppressedHook)(const Symbol *);
 
 std::optional<MemoryBufferRef> readFile(StringRef path);
 
