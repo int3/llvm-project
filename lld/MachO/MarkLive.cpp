@@ -353,32 +353,24 @@ void markLive() {
   // -u symbols
   for (Symbol *sym : config->explicitUndefineds)
     marker->addSym(sym);
-  // local symbols explicitly marked .no_dead_strip
+  // Local symbols explicitly marked .no_dead_strip. parseSymbols() recorded
+  // their nlist indices, so this touches only the roots instead of every symbol
+  // slot of every object file.
   for (const InputFile *file : inputFiles)
     if (auto *objFile = dyn_cast<ObjFile>(file))
-      for (Symbol *sym : objFile->symbols)
-        if (auto *defined = dyn_cast_or_null<Defined>(sym))
-          if (!defined->isExternal() && defined->noDeadStrip)
-            marker->addSym(defined);
+      for (uint32_t index : objFile->noDeadStripLocals) {
+        auto *defined = cast<Defined>(objFile->symbols[index]);
+        assert(!defined->isExternal() && defined->noDeadStrip);
+        marker->addSym(defined);
+      }
   if (auto *stubBinder =
           dyn_cast_or_null<DylibSymbol>(symtab->find("dyld_stub_binder")))
     marker->addSym(stubBinder);
-  for (ConcatInputSection *isec : inputSections) {
-    // Sections marked no_dead_strip
-    if (isec->getFlags() & S_ATTR_NO_DEAD_STRIP) {
-      marker->enqueue(isec, 0);
-      continue;
-    }
-
-    // mod_init_funcs, mod_term_funcs sections
-    if (sectionType(isec->getFlags()) == S_MOD_INIT_FUNC_POINTERS ||
-        sectionType(isec->getFlags()) == S_MOD_TERM_FUNC_POINTERS) {
-      assert(!config->emitInitOffsets ||
-             sectionType(isec->getFlags()) != S_MOD_INIT_FUNC_POINTERS);
-      marker->enqueue(isec, 0);
-      continue;
-    }
-  }
+  // Sections marked no_dead_strip, and mod_init_funcs / mod_term_funcs
+  // sections. gatherInputSections() collected these on its workers, in
+  // `inputSections` order, so the enqueue order is unchanged.
+  for (ConcatInputSection *isec : deadStripSectionRoots)
+    marker->enqueue(isec, 0);
 
   for (ConcatInputSection *isec : in.initOffsets->inputs())
     marker->enqueue(isec, 0);

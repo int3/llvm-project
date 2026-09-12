@@ -36,6 +36,7 @@ static_assert(sizeof(void *) != 8 || sizeof(ConcatInputSection) ==
               "instances of it");
 
 std::vector<ConcatInputSection *> macho::inputSections;
+std::vector<ConcatInputSection *> macho::deadStripSectionRoots;
 int macho::inputSectionsOrder = 0;
 
 // Call this function to add a new InputSection and have it routed to the

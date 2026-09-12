@@ -379,6 +379,18 @@ bool isEhFrameSection(const InputSection *);
 bool isGccExceptTabSection(const InputSection *);
 
 extern std::vector<ConcatInputSection *> inputSections;
+
+// The subsequence of `inputSections` that markLive() enqueues without looking
+// at any symbol, in `inputSections` order. gatherInputSections() collects these
+// on the workers that already read each section's flags.
+extern std::vector<ConcatInputSection *> deadStripSectionRoots;
+
+// Is this section a dead-strip root on its own, independent of its symbols?
+inline bool isDeadStripRootSection(uint32_t flags) {
+  return (flags & llvm::MachO::S_ATTR_NO_DEAD_STRIP) ||
+         sectionType(flags) == llvm::MachO::S_MOD_INIT_FUNC_POINTERS ||
+         sectionType(flags) == llvm::MachO::S_MOD_TERM_FUNC_POINTERS;
+}
 // This is used as a counter for specyfing input order for input sections
 extern int inputSectionsOrder;
 

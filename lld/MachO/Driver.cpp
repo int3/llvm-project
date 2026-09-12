@@ -2521,6 +2521,10 @@ struct GatheredInputSection {
   std::vector<ConcatInputSection *> ordinary;
   std::vector<SpecialInput> special;
   std::vector<OrdinaryRun> runs;
+  // Indices into `ordinary` of the sections markLive() enqueues on their flags
+  // alone, and this record's base slot in `deadStripSectionRoots`.
+  std::vector<uint32_t> roots;
+  size_t rootBase = 0;
 };
 
 struct GatheredInputFile {
@@ -2551,6 +2555,12 @@ static void classifyInputSection(const Section &section,
                  sectionType(concat->getFlags()) == S_MOD_INIT_FUNC_POINTERS) {
         result.special.push_back({isec, result.ordinary.size()});
       } else {
+        if (config->deadStrip && isDeadStripRootSection(concat->getFlags())) {
+          assert(!config->emitInitOffsets ||
+                 sectionType(concat->getFlags()) !=
+                     llvm::MachO::S_MOD_INIT_FUNC_POINTERS);
+          result.roots.push_back(result.ordinary.size());
+        }
         result.ordinary.push_back(concat);
       }
     } else if (isa<CStringInputSection>(isec) ||
@@ -2584,6 +2594,15 @@ static void gatherInputSections() {
   // for special sections. The resulting ordinary runs have disjoint output
   // slots, so workers can fill them without touching shared graph state.
   size_t inputSectionIndex = inputSections.size();
+  // replaceCommonSymbols() adds sections before this runs; they are not part of
+  // any gathered record, so classify them here. This prefix is empty unless the
+  // link has common symbols.
+  if (config->deadStrip)
+    for (ConcatInputSection *isec :
+         ArrayRef<ConcatInputSection *>(inputSections))
+      if (isDeadStripRootSection(isec->getFlags()))
+        deadStripSectionRoots.push_back(isec);
+  size_t rootIndex = deadStripSectionRoots.size();
   for (size_t fileIndex = 0; fileIndex != files.size(); ++fileIndex) {
     const InputFile *file = files[fileIndex];
     for (GatheredInputSection &gatheredSection :
@@ -2612,14 +2631,22 @@ static void gatherInputSections() {
         addInputSection(special.isec);
       }
       addOrdinaryRun(gatheredSection.ordinary.size());
+      // Roots are a subsequence of `ordinary`, which the runs lay down in
+      // order, so numbering the records here reproduces `inputSections` order.
+      gatheredSection.rootBase = rootIndex;
+      rootIndex += gatheredSection.roots.size();
     }
     if (!file->objCImageInfo.empty())
       in.objCImageInfo->addFile(file);
   }
 
   inputSections.resize(inputSectionIndex);
+  deadStripSectionRoots.resize(rootIndex);
   parallelForEach(gatheredFiles, [](GatheredInputFile &gatheredFile) {
     for (GatheredInputSection &gatheredSection : gatheredFile.sections) {
+      for (size_t j = 0, e = gatheredSection.roots.size(); j != e; ++j)
+        deadStripSectionRoots[gatheredSection.rootBase + j] =
+            gatheredSection.ordinary[gatheredSection.roots[j]];
       for (const GatheredInputSection::OrdinaryRun &run :
            gatheredSection.runs) {
         for (size_t i = run.begin; i != run.end; ++i) {
@@ -2886,6 +2913,7 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     concatOutputSections.clear();
     inputFiles.clear();
     inputSections.clear();
+    deadStripSectionRoots.clear();
     inputSectionsOrder = 0;
     loadedArchives.clear();
     loadedObjectFrameworks.clear();

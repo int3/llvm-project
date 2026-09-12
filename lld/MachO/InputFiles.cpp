@@ -909,6 +909,11 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
       undefineds.push_back(i);
     } else {
       symbols[i] = parseNonSectionSymbol(sym, strtab);
+      // createAbsolute() is the only non-section path that makes a local
+      // Defined, and it derives noDeadStrip straight from n_desc.
+      if ((sym.n_type & N_TYPE) == N_ABS && !(sym.n_type & N_EXT) &&
+          (sym.n_desc & N_NO_DEAD_STRIP))
+        noDeadStripLocals.push_back(i);
     }
   }
 
@@ -931,6 +936,28 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
     symbolIndices[--sectionOffsets[sym.n_sect - 1]] =
         static_cast<uint32_t>(i);
   }
+
+  // Dead-strip roots among this file's local section symbols. The flag and the
+  // scope are both pure nlist reads here; markLive() would otherwise have to
+  // dereference every Symbol in `symbols` to find them.
+  auto recordNoDeadStripLocal = [&](const NList &sym, uint32_t index,
+                                    const InputSection *isec, StringRef name) {
+    if (!(sym.n_desc & N_NO_DEAD_STRIP))
+      return;
+    // The scope test below is the nlist form of createDefined()'s, and has to
+    // stay exactly equivalent to it: createDefined() creates an external Symbol
+    // only under `(n_type & N_EXT) && !shouldIgnoreLabel(isec, name)`, and
+    // everything else -- including an N_EXT label that shouldIgnoreLabel()
+    // rejects, i.e. one in a cfstring, classrefs or selrefs section -- becomes a
+    // local Defined that markLive() must treat as a root. Reading n_type here
+    // rather than the created Symbol's isExternal() is what keeps this off the
+    // dependent-load path; N_PEXT and -load_hidden only change whether an
+    // external symbol is private, never whether it is external, so they do not
+    // enter the test.
+    if ((sym.n_type & N_EXT) && !shouldIgnoreLabel(isec, name))
+      return;
+    noDeadStripLocals.push_back(index);
+  };
 
   for (size_t i = 0; i < sections.size(); ++i) {
     Subsections &subsections = sections[i]->subsections;
@@ -960,6 +987,7 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
         }
         symbols[symIndex] =
             createDefined(sym, name, isec, 0, isec->getSize(), forceHidden);
+        recordNoDeadStripLocal(sym, symIndex, isec, name);
       }
       continue;
     }
@@ -1025,6 +1053,7 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
         isec->hasAltEntry = symbolOffset != 0;
         symbols[symIndex] = createDefined(sym, name, isec, symbolOffset,
                                           symbolSize, forceHidden);
+        recordNoDeadStripLocal(sym, symIndex, isec, name);
         continue;
       }
       auto *concatIsec = cast<ConcatInputSection>(isec);
@@ -1044,6 +1073,7 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
       // subsection.
       symbols[symIndex] = createDefined(sym, name, nextIsec, /*value=*/0,
                                         symbolSize, forceHidden);
+      recordNoDeadStripLocal(sym, symIndex, nextIsec, name);
       // TODO: ld64 appears to preserve the original alignment as well as each
       // subsection's offset from the last aligned address. We should consider
       // emulating that behavior.
@@ -1060,6 +1090,13 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
   // different files.
   for (unsigned i : undefineds)
     symbols[i] = parseNonSectionSymbol(nList[i], strtab);
+
+  // Section symbols are created in per-section, address-sorted order, so the
+  // pushes above are not in nlist order. markLive() consumed these roots in
+  // nlist order; sort so the enqueue order -- and with it -why_live output --
+  // is unchanged. This is over the roots only, not over every symbol.
+  if (noDeadStripLocals.size() > 1)
+    llvm::sort(noDeadStripLocals);
 }
 
 OpaqueFile::OpaqueFile(MemoryBufferRef mb, StringRef segName,

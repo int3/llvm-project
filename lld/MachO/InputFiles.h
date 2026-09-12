@@ -339,6 +339,12 @@ public:
   std::vector<CallGraphEntry> callGraph;
   llvm::DenseMap<ConcatInputSection *, FDE> fdes;
   std::vector<AliasSymbol *> aliases;
+  // Indices into `symbols` of the non-external Defineds that carry
+  // N_NO_DEAD_STRIP, in ascending index order. These are dead-strip roots;
+  // recording them while parseSymbols() already has the nlist entry in hand
+  // spares markLive() a walk over every symbol slot of every object file, with
+  // a dependent Symbol load per slot. See markLive().
+  llvm::SmallVector<uint32_t, 0> noDeadStripLocals;
   // Set by the parallel input phase; see registerUnwind().
   bool deferUnwindRegistration = false;
 
