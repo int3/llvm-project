@@ -25,6 +25,14 @@ public:
   ~TrieBuilder();
   void setImageBase(uint64_t addr) { imageBase = addr; }
   void addSymbol(const Symbol &sym) { exported.push_back(&sym); }
+  // Constructs the trie's nodes and edges. This reads only the exported
+  // symbols' names, kinds and flags; it does not read any address or dylib
+  // ordinal, so it can run before those are assigned.
+  void buildNodes();
+  // Resolves each terminal node's serialized payload from its symbol and
+  // assigns the node offsets. Returns the size in bytes of the serialized
+  // trie. Requires final addresses and dylib ordinals.
+  size_t assignOffsets();
   // Returns the size in bytes of the serialized trie.
   size_t build();
   void writeTo(uint8_t *buf) const;

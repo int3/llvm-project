@@ -1054,8 +1054,7 @@ uint32_t LazyBindingSection::encode(const Symbol &sym) {
 ExportSection::ExportSection()
     : LinkEditSection(segment_names::linkEdit, section_names::export_) {}
 
-void ExportSection::finalizeContents() {
-  trieBuilder.setImageBase(in.header->addr);
+void ExportSection::collectSymbols() {
   for (const Symbol *sym : symtab->getSymbols()) {
     if (const auto *defined = dyn_cast<Defined>(sym)) {
       if (defined->privateExtern || !defined->isLive())
@@ -1067,7 +1066,18 @@ void ExportSection::finalizeContents() {
         trieBuilder.addSymbol(*dysym);
     }
   }
-  size = trieBuilder.build();
+  collected = true;
+}
+
+void ExportSection::buildTrieNodes() { trieBuilder.buildNodes(); }
+
+void ExportSection::finalizeContents() {
+  trieBuilder.setImageBase(in.header->addr);
+  if (!collected) {
+    collectSymbols();
+    trieBuilder.buildNodes();
+  }
+  size = trieBuilder.assignOffsets();
 }
 
 void ExportSection::writeTo(uint8_t *buf) const { trieBuilder.writeTo(buf); }

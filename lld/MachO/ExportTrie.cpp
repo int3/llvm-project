@@ -60,11 +60,17 @@ struct Edge {
 };
 
 struct ExportInfo {
-  uint64_t address;
-  uint64_t ordinal = 0;
+  // The exported symbol. The node's serialized payload is derived from it by
+  // resolve(); everything else about the node is known as soon as the exported
+  // symbol set is.
+  const Symbol *sym;
+  // The image-relative address for an ordinary export, or the dylib ordinal
+  // for a reexport. A symbol's address is only final after address assignment,
+  // and a dylib's ordinal only after the load commands are created, so this is
+  // filled in by resolve() rather than by the constructor.
+  uint64_t value = 0;
   uint8_t flags = 0;
-  ExportInfo(const Symbol &sym, uint64_t imageBase)
-      : address(sym.getVA() - imageBase) {
+  explicit ExportInfo(const Symbol &sym) : sym(&sym) {
     using namespace llvm::MachO;
     if (sym.isWeakDef())
       flags |= EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION;
@@ -75,10 +81,18 @@ struct ExportInfo {
     if (auto *defined = dyn_cast<Defined>(&sym)) {
       if (defined->isAbsolute())
         flags |= EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE;
-    } else if (auto *dysym = dyn_cast<DylibSymbol>(&sym)) {
+    } else if (isa<DylibSymbol>(&sym)) {
       flags |= EXPORT_SYMBOL_FLAGS_REEXPORT;
+    }
+  }
+
+  void resolve(uint64_t imageBase) {
+    if (flags & llvm::MachO::EXPORT_SYMBOL_FLAGS_REEXPORT) {
+      const auto *dysym = cast<DylibSymbol>(sym);
       if (!dysym->isDynamicLookup())
-        ordinal = dysym->getFile()->ordinal;
+        value = dysym->getFile()->ordinal;
+    } else {
+      value = sym->getVA() - imageBase;
     }
   }
 };
@@ -145,9 +159,9 @@ constexpr size_t minimumParallelSymbols = 4096;
 uint32_t TrieNode::getTerminalSize() const {
   uint32_t size = getULEB128Size(info->flags);
   if (info->flags & MachO::EXPORT_SYMBOL_FLAGS_REEXPORT)
-    size += getULEB128Size(info->ordinal) + 1; // + 1 for the null-terminator
+    size += getULEB128Size(info->value) + 1; // + 1 for the null-terminator
   else
-    size += getULEB128Size(info->address);
+    size += getULEB128Size(info->value);
   return size;
 }
 
@@ -185,10 +199,10 @@ void TrieNode::writeTo(uint8_t *buf) const {
     buf += encodeULEB128(terminalSize, buf);
     buf += encodeULEB128(info->flags, buf);
     if (info->flags & MachO::EXPORT_SYMBOL_FLAGS_REEXPORT) {
-      buf += encodeULEB128(info->ordinal, buf);
+      buf += encodeULEB128(info->value, buf);
       *buf++ = 0; // empty originalName string
     } else {
-      buf += encodeULEB128(info->address, buf);
+      buf += encodeULEB128(info->value, buf);
     }
   } else {
     // TrieNode with no Symbol info.
@@ -257,7 +271,7 @@ tailcall:
         node->edges.emplace_back(suffix, newNode);
         node = newNode;
       }
-      node->info = ExportInfo(*sym, imageBase);
+      node->info = ExportInfo(*sym);
       return;
     }
   }
@@ -351,7 +365,7 @@ tailcall:
     mergeFragment(greater);
     if (isTerminal) {
       assert(j - i == 1); // no duplicate symbols
-      node->info = ExportInfo(*pivotSymbol, imageBase);
+      node->info = ExportInfo(*pivotSymbol);
     }
     mergeFragment(equal);
     return;
@@ -363,7 +377,7 @@ tailcall:
 
   if (isTerminal) {
     assert(j - i == 1); // no duplicate symbols
-    node->info = ExportInfo(*pivotSymbol, imageBase);
+    node->info = ExportInfo(*pivotSymbol);
   } else {
     // This is the tail-call-optimized version of the following:
     // sortAndBuild(vec.slice(i, j - i), node, lastPos, pos + 1);
@@ -393,14 +407,27 @@ tailcall:
   }
 }
 
-size_t TrieBuilder::build() {
+void TrieBuilder::buildNodes() {
   if (exported.empty())
-    return 0;
+    return;
 
   TrieNode *root = makeNode(nodes);
   size_t splitBudget =
       std::min<size_t>(parallel::getThreadCount() * 2, size_t(32));
   sortAndBuild(exported, root, 0, 0, nodes, splitBudget);
+}
+
+size_t TrieBuilder::assignOffsets() {
+  if (nodes.empty())
+    return 0;
+
+  // The trie's shape does not depend on addresses or dylib ordinals, so the
+  // terminal payloads are read out of the symbols only here, once both are
+  // final. The traversal order does not matter: each node's payload depends
+  // only on its own symbol.
+  for (TrieNode *node : nodes)
+    if (node->info)
+      node->info->resolve(imageBase);
 
   // Assign each node in the vector an offset in the trie stream, iterating
   // until all uleb128 sizes have stabilized.
@@ -414,6 +441,11 @@ size_t TrieBuilder::build() {
   } while (more);
 
   return offset;
+}
+
+size_t TrieBuilder::build() {
+  buildNodes();
+  return assignOffsets();
 }
 
 void TrieBuilder::writeTo(uint8_t *buf) const {

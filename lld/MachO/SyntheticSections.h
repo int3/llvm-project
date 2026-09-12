@@ -388,6 +388,13 @@ private:
 class ExportSection final : public LinkEditSection {
 public:
   ExportSection();
+  // Selects the exported symbols. Must run on the main thread: recovering an
+  // undefined symbol replaces it in place, so the symbol kinds are only stable
+  // for the symbols this selection keeps.
+  void collectSymbols();
+  // Builds the trie's nodes from the collected symbols. Address-independent,
+  // so it can run on a task group while addresses are assigned.
+  void buildTrieNodes();
   void finalizeContents() override;
   uint64_t getRawSize() const override { return size; }
   bool isNeeded() const override { return size; }
@@ -398,6 +405,7 @@ public:
 private:
   TrieBuilder trieBuilder;
   size_t size = 0;
+  bool collected = false;
 };
 
 // Stores 'data in code' entries that describe the locations of data regions

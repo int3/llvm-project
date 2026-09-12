@@ -52,6 +52,7 @@ public:
   void treatSpecialUndefineds();
   void scanRelocations();
   void joinPrepare();
+  void joinExportTrie();
   void scanSymbols();
   template <class LP> void createOutputSections();
   template <class LP> void createLoadCommands();
@@ -77,6 +78,9 @@ public:
   // Holds the address-independent __LINKEDIT preparation tasks spawned before
   // finalizeAddresses(); destroying or resetting it joins them.
   std::optional<llvm::parallel::TaskGroup> prepareGroup;
+  // Holds the export-trie construction task spawned after scanSymbols();
+  // destroying or resetting it joins the task.
+  std::optional<llvm::parallel::TaskGroup> exportTrieGroup;
   SymtabSection *symtabSection = nullptr;
   IndirectSymtabSection *indirectSymtabSection = nullptr;
   CodeSignatureSection *codeSignatureSection = nullptr;
@@ -1530,7 +1534,10 @@ void Writer::finalizeAddresses() {
 
 void Writer::joinPrepare() { prepareGroup.reset(); }
 
+void Writer::joinExportTrie() { exportTrieGroup.reset(); }
+
 void Writer::finalizeLinkEditSegment() {
+  joinExportTrie();
   joinPrepare();
   TimeTraceScope timeScope("Finalize __LINKEDIT segment");
   // Fill __LINKEDIT contents.
@@ -1739,6 +1746,31 @@ template <class LP> void Writer::run() {
   // these two scan* methods. I.e. from this point onward, for all live
   // InputSections, we should have `isec->canonical() == isec`.
   scanSymbols();
+
+  // The export trie's shape depends only on the exported symbols' names, kinds
+  // and flags, all of which are final once scanSymbols() has run, so it can be
+  // built while the rest of the link assigns addresses. The two values it
+  // serializes that are not final here -- a definition's address and a
+  // reexport's dylib ordinal -- are read out of the symbols after the join, in
+  // ExportSection::finalizeContents().
+  //
+  // The symbol selection itself stays on this thread. Recovering an undefined
+  // symbol (section$start$/segment$start$ names, -U, -undefined
+  // dynamic_lookup) replaces it in place during scanRelocations(), and the
+  // stub helper's and ObjC stubs' setUp() can do the same, so a worker must
+  // not read the kind of a symbol this selection rejects. Symbols created
+  // after the selection are never exported: boundary symbols, __dyld_private
+  // and branch-range extension thunks are private extern, and dyld_stub_binder
+  // and _objc_msgSend become dylib symbols that -exported_symbols_list was
+  // matched against long before this point.
+#if LLVM_ENABLE_THREADS
+  if (parallel::strategy.ThreadsRequested != 1) {
+    in.exports->collectSymbols();
+    exportTrieGroup.emplace();
+    exportTrieGroup->spawn([] { in.exports->buildTrieNodes(); });
+  }
+#endif
+
   if (in.objcStubs->isNeeded())
     in.objcStubs->setUp();
   if (in.objcMethList->isNeeded())
@@ -1750,8 +1782,10 @@ template <class LP> void Writer::run() {
   // Do not proceed if there were undefined or duplicate symbols.
   reportPendingUndefinedSymbols();
   reportPendingDuplicateSymbols();
-  if (errorCount())
+  if (errorCount()) {
+    joinExportTrie();
     return;
+  }
 
   if (in.stubHelper && in.stubHelper->isNeeded())
     in.stubHelper->setUp();
