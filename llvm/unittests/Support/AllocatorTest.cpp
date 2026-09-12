@@ -7,8 +7,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Support/Allocator.h"
+#include "llvm/Support/MemAllocPool.h"
 #include "gtest/gtest.h"
 #include <cstdlib>
+#include <cstring>
+#include <vector>
 
 using namespace llvm;
 
@@ -316,5 +319,73 @@ TEST(AllocatorTest, TestOverAlignedSpecific) {
   }
   EXPECT_EQ(4u, NumDtorCalls);
 }
+
+#if LLVM_ENABLE_HUGEPAGE_POOL
+
+// The huge-page pool that backs allocate_buffer on Linux also serves explicit
+// blocks of at least pool_block_min_size, which the lld executable routes its
+// global operator new to. Such a block must be recognizable, and freeable,
+// from the pointer alone.
+TEST(AllocatorTest, PoolBlockRoundTrip) {
+  const size_t Granule = pool_block_min_size;
+
+  // Requests the pool does not serve: too small, or more aligned than the
+  // block granule.
+  EXPECT_EQ(nullptr, pool_allocate_block(1024, 16));
+  EXPECT_EQ(nullptr, pool_allocate_block(Granule - 1, 16));
+  EXPECT_EQ(nullptr, pool_allocate_block(4 * Granule, 2 * Granule));
+
+  // A carve-out from a chunk and an own mapping, one on each side of the
+  // own-mapping threshold.
+  for (size_t Size : {Granule, Granule + 17, size_t(4) << 20}) {
+    void *P = pool_allocate_block(Size, 16);
+    ASSERT_NE(nullptr, P);
+    EXPECT_TRUE(pool_owns_block(P));
+    // Blocks are granule-aligned, which is what makes the side-table index
+    // that carries the size exact.
+    EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(P) & (Granule - 1));
+    memset(P, 0xa5, Size);
+    EXPECT_EQ(0xa5, static_cast<unsigned char *>(P)[Size - 1]);
+    // Freed without the size being supplied.
+    pool_deallocate_block(P);
+  }
+
+  // Distinct blocks do not overlap, and a pointer that did not come from the
+  // pool is not claimed by it.
+  std::vector<void *> Blocks;
+  for (int I = 0; I != 64; ++I) {
+    void *P = pool_allocate_block(Granule + 4096, Granule);
+    ASSERT_NE(nullptr, P);
+    memset(P, I, Granule + 4096);
+    Blocks.push_back(P);
+  }
+  for (int I = 0; I != 64; ++I)
+    EXPECT_EQ(I, static_cast<unsigned char *>(Blocks[I])[Granule + 4095]);
+  for (void *P : Blocks)
+    pool_deallocate_block(P);
+
+  void *Malloced = malloc(Granule + 4096);
+  EXPECT_FALSE(pool_owns_block(Malloced));
+  free(Malloced);
+}
+
+// allocate_buffer keeps working for the sizes on either side of the pool's own
+// thresholds, and a buffer that came from the pool is freed by the pool while
+// one that did not is freed by operator delete; deallocate_buffer tells them
+// apart with the same range test.
+TEST(AllocatorTest, PoolBufferRoundTrip) {
+  for (size_t Size : {size_t(64), size_t(4096), size_t(64) << 10,
+                      size_t(1) << 20, size_t(3) << 20}) {
+    for (size_t Align : {size_t(1), size_t(16), size_t(4096)}) {
+      void *P = allocate_buffer(Size, Align);
+      ASSERT_NE(nullptr, P);
+      EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(P) & (Align - 1));
+      memset(P, 0x5a, Size);
+      deallocate_buffer(P, Size, Align);
+    }
+  }
+}
+
+#endif // LLVM_ENABLE_HUGEPAGE_POOL
 
 }  // anonymous namespace

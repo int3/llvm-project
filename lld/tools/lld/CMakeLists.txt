@@ -3,8 +3,18 @@ set(LLVM_LINK_COMPONENTS
   TargetParser
   )
 
+# Replacing the global operator new is a decision for the standalone lld
+# executable, not for every tool in the multicall binary, so it is left out of
+# the llvm-driver build.
+if(LLVM_TOOL_LLVM_DRIVER_BUILD)
+  set(LLD_OPERATOR_NEW_SOURCES "")
+else()
+  set(LLD_OPERATOR_NEW_SOURCES PoolOperatorNew.cpp)
+endif()
+
 add_lld_tool(lld
   lld.cpp
+  ${LLD_OPERATOR_NEW_SOURCES}
 
   SUPPORT_PLUGINS
   GENERATE_DRIVER
