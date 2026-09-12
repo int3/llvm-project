@@ -25,6 +25,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/Support/Endian.h"
+#include "llvm/Support/Parallel.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/raw_ostream.h"
@@ -414,31 +415,73 @@ macho::PriorityBuilder::buildInputSectionPriorities() {
     orderFileNamePrefixMask |= getOrderFileNamePrefixBit(entry.first);
   }
 
-  auto addSym = [&](const Defined *sym) {
+  // The order-file walk touches every symbol slot of every object file, and the
+  // dominant cost is the dependent load of each Symbol. Everything needed to
+  // decide whether a slot can possibly match the order file is a pure read
+  // (kind, absoluteness, name, the prefix mask and a read-only lookup in
+  // `priorities`), so at more than one thread the filter runs on workers over
+  // chunks of `inputFiles` and each chunk records only the candidates it found,
+  // paired with the matched entry. The serial pass then folds those candidates
+  // in the original file-then-slot order, so the `min`, the `isCold` clearing
+  // and the file-scoped priority resolution -- which uses the non-thread-safe
+  // string saver -- are unchanged.
+  //
+  // Carrying the matched entry keeps the serial pass from re-hashing the name:
+  // `priorities` is not mutated here, so the entry pointers stay valid.
+  using Candidate = std::pair<const Defined *, const SymbolPriorityEntry *>;
+  auto matchOrderFile = [&](const Defined *sym) -> const SymbolPriorityEntry * {
     if (sym->isAbsolute())
-      return;
+      return nullptr;
     StringRef name = sym->getName();
     if (orderFileNamePrefixMask != ~uint64_t{0} &&
         (name.size() < 4 ||
          !(orderFileNamePrefixMask & getOrderFileNamePrefixBit(name))))
-      return;
-    std::optional<int> symbolPriority = getSymbolPriority(sym);
-    if (!symbolPriority)
-      return;
-    auto *isec = sym->isec();
+      return nullptr;
+    auto it = priorities.find(utils::getRootSymbol(name));
+    return it == priorities.end() ? nullptr : &it->second;
+  };
+  auto applyCandidate = [&](const Candidate &candidate) {
+    auto *isec = candidate.first->isec();
+    int symbolPriority = candidate.second->getPriority(isec->getFile());
     int &priority = sectionPriorities[isec];
-    priority = std::min(priority, *symbolPriority);
+    priority = std::min(priority, symbolPriority);
     // Order file takes precedence over cold partitioning.
     isec->isCold = false;
   };
 
   // TODO: Make sure this handles weak symbols correctly.
-  for (const InputFile *file : inputFiles) {
-    if (isa<ObjFile>(file))
+  ArrayRef<InputFile *> files = inputFiles.getArrayRef();
+  constexpr size_t filesPerChunk = 64;
+  size_t numChunks = (files.size() + filesPerChunk - 1) / filesPerChunk;
+  if (numChunks <= 1 || parallel::strategy.ThreadsRequested == 1) {
+    for (const InputFile *file : files) {
+      if (isa<ObjFile>(file))
+        for (Symbol *sym : file->symbols)
+          if (auto *d = dyn_cast_or_null<Defined>(sym))
+            if (const SymbolPriorityEntry *entry = matchOrderFile(d))
+              applyCandidate({d, entry});
+    }
+    return sectionPriorities;
+  }
+
+  std::vector<SmallVector<Candidate, 0>> chunkHits(numChunks);
+  parallelFor(0, numChunks, [&](size_t chunkIndex) {
+    SmallVector<Candidate, 0> &hits = chunkHits[chunkIndex];
+    size_t begin = chunkIndex * filesPerChunk;
+    size_t end = std::min(begin + filesPerChunk, files.size());
+    for (const InputFile *file : files.slice(begin, end - begin)) {
+      if (!isa<ObjFile>(file))
+        continue;
       for (Symbol *sym : file->symbols)
         if (auto *d = dyn_cast_or_null<Defined>(sym))
-          addSym(d);
-  }
+          if (const SymbolPriorityEntry *entry = matchOrderFile(d))
+            hits.emplace_back(d, entry);
+    }
+  });
+
+  for (const SmallVector<Candidate, 0> &hits : chunkHits)
+    for (const Candidate &candidate : hits)
+      applyCandidate(candidate);
 
   return sectionPriorities;
 }
