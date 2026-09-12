@@ -1029,7 +1029,12 @@ static bool walkArchives() {
           if (!provider || provider->extracted)
             continue;
           Symbol *sym = symtab->find(name);
-          if (definedAlready(frontierArchive, sym))
+          // Against the provider's archive, not the one being walked: the serial
+          // linker created this name's slot at the provider's index entry and left
+          // a LazyArchive symbol there, which a dylib export registered after that
+          // entry could not displace. So a strong dylib suppresses this extraction
+          // exactly when it precedes the provider.
+          if (definedAlready(provider->archiveIndex, sym))
             continue;
           // Only an index entry the walk has already passed can satisfy this.
           // One still ahead of the frontier is scheduled so that the walk visits
