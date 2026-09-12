@@ -588,6 +588,14 @@ void SymbolTable::reserveArchiveSlot(StringRef name, InputFile *archive,
   assert(folding);
   CachedHashStringRef cachedName(name);
   Shard &shard = shards[shardOf(cachedName)];
+  // The walker streams each extracted member's parse to a worker as soon as the
+  // member has its position, so the select loop's reservations now run while
+  // workers fold into the same shards. Both of this function's effects commute
+  // with a fold's: firstOrdinal is a minimum, and the winner it sets on a fresh
+  // slot is overwritten unconditionally by the providing member's definition
+  // (foldDefined's UndefinedKind case), which always arrives. Only the map
+  // mutation and the header writes need the lock.
+  std::lock_guard<std::mutex> lock(shard.mu);
   auto [it, wasInserted] = shard.map.try_emplace(cachedName, nullptr);
   if (!wasInserted) {
     SlotMeta &meta = metaOf(it->second);

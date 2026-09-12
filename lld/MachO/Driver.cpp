@@ -57,9 +57,12 @@
 #include "llvm/TextAPI/Architecture.h"
 #include "llvm/TextAPI/PackedVersion.h"
 
+#include <atomic>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <queue>
+#include <thread>
 
 #if !_WIN32
 #include <sys/mman.h>
@@ -701,6 +704,19 @@ struct ParallelInputPhase {
   // exactly the window in which they are still running.
   std::unique_ptr<llvm::parallel::TaskGroup> prepass;
   llvm::parallel::TaskGroup *prepassGroup = nullptr;
+  // Holds every streamed member parse the select loop has spawned. Owned by the
+  // phase rather than by walkArchives() for the same reason as the prepass: a
+  // fatal() raised on the main thread inside the select loop never unwinds, so
+  // the driver's cleanup callback has to be able to reach these tasks and wait
+  // for them before it frees the archive buffers and the symbol arena they are
+  // still writing. Same two-handle shape: the raw pointer is what spawns go
+  // through, and it is null for exactly the window in which unique_ptr::reset()
+  // is waiting.
+  std::unique_ptr<llvm::parallel::TaskGroup> memberParses;
+  llvm::parallel::TaskGroup *memberParseGroup = nullptr;
+  // Adopted members not yet parsed. Read by the select loop, decremented by the
+  // tasks; it outlives walkArchives()'s frame for the fatal() case above.
+  std::atomic<int> memberParsesInFlight{0};
 };
 
 // Where the first member defining a name lives. The walker needs the earliest
@@ -716,6 +732,22 @@ struct ArchiveProvider {
   // here folds what was a separate "provided by an extracted member" set into
   // the provider lookup the walk already has to make.
   bool extracted = false;
+  // The pre-walk answer to definedAlready() for this name, captured on a worker
+  // during the provider fold -- before the select loop starts, and so before any
+  // streamed member parse can have folded a record. The select loop must not read
+  // the symbol table while workers fold into it, and it does not have to: the
+  // answer it needs is a function of the table as it stood once the direct objects
+  // and the dylibs were resolved and nothing else was, which is exactly this
+  // snapshot. See "Streaming the member parses" in walkArchives().
+  //
+  // A provider is only inserted for a name that is neither Defined nor Common at
+  // that point, so the only state that can suppress an extraction is a non-weak
+  // dylib definition: `strongDylib`, with either `dylibAlways` (a dynamic-lookup
+  // symbol, which suppresses against every archive) or `dylibId`, the defining
+  // dylib's file id, which suppresses against an archive ordered after it.
+  bool strongDylib = false;
+  bool dylibAlways = false;
+  int dylibId = 0;
 
   bool precedes(const ArchiveProvider &other) const {
     return std::tie(archiveIndex, entryIndex) <
@@ -895,6 +927,18 @@ static void joinArchivePrepass(bool willWalk) {
   parallelInput.prepassGroup = nullptr;
 }
 
+// Wait for every member parse the select loop streamed. Called at the end of the
+// walk, and again from the driver's cleanup callback for the link that left the
+// walk through a fatal().
+static void joinStreamedMemberParses() {
+  if (!parallelInput.memberParses)
+    return;
+  parallelInput.memberParseGroup = nullptr;
+  parallelInput.memberParses.reset(); // The destructor waits for the tasks.
+  parallelInput.memberParsesInFlight.store(0, std::memory_order_relaxed);
+  parallelParseActive = false;
+}
+
 // Test hook. Reversing the order in which the workers take the held files apart
 // exercises the fold's out-of-order paths deterministically, at any thread
 // count; the output must not change.
@@ -1033,8 +1077,13 @@ static bool walkArchives() {
     for (uint32_t entryIndex = chunk.begin; entryIndex != chunk.end;
          ++entryIndex) {
       const ArchiveFile::IndexEntry &entry = archive->indexEntries[entryIndex];
+      ArchiveProvider provider{chunk.archiveIndex, entryIndex,
+                               entry.childOffset};
       // The direct objects are resolved and nothing mutates the table until the
-      // walk begins, so this lookup needs no lock.
+      // walk begins, so this lookup needs no lock. It now answers three things:
+      // the candidate test, the provider rule, and the walk's suppression
+      // snapshot, which the select loop reads in place of the table once the
+      // member parses stream behind it.
       Symbol *sym = symtab->find(entry.name);
       if (sym) {
         // A name a direct object or a preceding dylib already defines can never
@@ -1050,20 +1099,29 @@ static bool walkArchives() {
         if (isa<Undefined>(sym)) {
           candidates.push_back(entryIndex);
         } else if (auto *dysym = dyn_cast<DylibSymbol>(sym)) {
+          const bool weak = dysym->isWeakDef();
+          const bool dynamicLookup = dysym->isDynamicLookup();
           // A weak dylib definition never suppresses an extraction; a strong one
           // does exactly when it was registered before this archive.
           if (dysym->isReferenced() &&
-              (dysym->isWeakDef() ||
-               (!dysym->isDynamicLookup() &&
-                dysym->getFile()->id > archive->id)))
+              (weak || (!dynamicLookup && dysym->getFile()->id > archive->id)))
             candidates.push_back(entryIndex);
+          // The same rule again for the snapshot (see ArchiveProvider), left
+          // unresolved because the walk applies it against the *provider's*
+          // archive, which this pass does not know. getFile() is null for a
+          // dynamic-lookup symbol, which suppresses against every archive, so it
+          // is recorded as a flag and the id is not read.
+          if (!weak) {
+            provider.strongDylib = true;
+            provider.dylibAlways = dynamicLookup;
+            if (!dynamicLookup)
+              provider.dylibId = dysym->getFile()->id;
+          }
         }
       }
       // A name nothing has mentioned yet is not a candidate, but it still needs a
       // provider: a member the walk extracts later can be the first to reference
       // it.
-      ArchiveProvider provider{chunk.archiveIndex, entryIndex,
-                               entry.childOffset};
       ProviderShard &shard = providerShards[providerShardOf(entry.name)];
       std::lock_guard<std::mutex> lock(shard.mu);
       auto [it, inserted] = shard.map.try_emplace(entry.name, provider);
@@ -1115,20 +1173,19 @@ static bool walkArchives() {
   // Only the part of the suppression rule that needs the symbol table: the
   // "already provided by an extracted member" part is the provider's `extracted`
   // flag, which every caller has tested before it gets here.
-  auto definedAlready = [&](uint32_t archiveIndex, Symbol *sym) {
-    if (!sym)
+  // Answered from the provider's pre-walk snapshot rather than from the symbol
+  // table, because workers are folding streamed member parses into the table
+  // while this loop runs. The snapshot is the value find() returned at the point
+  // the loop begins: a name with no provider entry was Defined or Common then
+  // (the fold skips exactly those), and a name with one was neither, so all that
+  // is left to record is the strong-dylib case.
+  auto definedAlready = [&](uint32_t archiveIndex,
+                            const ArchiveProvider &provider) {
+    if (!provider.strongDylib)
       return false;
-    if (isa<Defined>(sym) || isa<CommonSymbol>(sym))
-      return true;
-    if (auto *dysym = dyn_cast<DylibSymbol>(sym)) {
-      // A weak dylib definition never suppresses an extraction; a strong one
-      // does exactly when it was registered before this archive.
-      if (dysym->isWeakDef())
-        return false;
-      return dysym->isDynamicLookup() ||
-             dysym->getFile()->id < archives[archiveIndex]->id;
-    }
-    return false;
+    // A weak dylib definition never suppresses an extraction; a strong one does
+    // exactly when it was registered before this archive.
+    return provider.dylibAlways || provider.dylibId < archives[archiveIndex]->id;
   };
 
   // The point the walk has reached: every index entry before it has been
@@ -1192,6 +1249,86 @@ static bool walkArchives() {
 
   const size_t firstMember = parallelInput.objects.size();
 
+  // Streaming the member parses (design step S5).
+  //
+  // A member's whole position in the serial order is fixed on the main thread at
+  // extraction time -- its ordinal (adoptHeldFile), the sub-position of each of
+  // its own undefined records, and its completion ordinal -- and so are the
+  // `seen` set, -why_load order, inputFiles order and the order its deferred
+  // diagnostics replay in, which is parallelInput.contexts order. None of that
+  // depends on the parse. So the parse is spawned at the end of extract(), once
+  // the member's undefined walk has taken its sub-positions, and the select loop
+  // goes on while workers fold. The phase's window becomes max(select, parse)
+  // instead of select + parse.
+  //
+  // What the concurrent folds could have reached, and how each is handled:
+  //
+  //  * definedAlready() would have read a table that workers are mutating: not
+  //    only can a lock-free find() rehash under it, but a slot's contents can
+  //    change between the lookup and the predicate. It no longer reads the table
+  //    at all -- the answer is the provider's pre-walk snapshot, which is the
+  //    value find() returned before any member parse started. During the loop the
+  //    only serial mutation of the table is reserveArchiveSlot(), which leaves an
+  //    Undefined placeholder that definedAlready() reads as "not defined", so the
+  //    snapshot stays exact. The extraction decisions are therefore both
+  //    unchanged and independent of worker timing.
+  //
+  //    This also settles the reviewer's named concern about `definedAlready`
+  //    under concurrent folds. The concern was a weak dylib slot that a member's
+  //    strong definition displaces mid-walk, and the interaction with
+  //    weakOverrideSuppressed: if the walk read the live table, the answer for
+  //    such a name would depend on whether the displacing member's fold had
+  //    landed yet, which is a race, not a semantics question. The walk does not
+  //    read the live table, so the weak-dylib answer is the one the pre-walk
+  //    state gives, which is what the serial linker had at the archive's own
+  //    position -- and it is the same state weakOverrideSuppressed was built
+  //    from, one pass earlier, so the two cannot disagree. For a name an
+  //    extracted member defines, the walk still decides by provider->extracted,
+  //    set on the main thread before the member is queued, and never consults a
+  //    slot the member's fold will write.
+  //
+  //  * reserveArchiveSlot() inserts into a shard while workers fold into it, so
+  //    it takes the shard lock now; see SymbolTable.cpp for why its effects are
+  //    order-independent.
+  //
+  //  * Everything else the loop touches while workers run is either main-thread
+  //    only (the `seen` set, the provider map's `extracted` flags, inputFiles,
+  //    the walk counters) or read-only for the whole loop (memberUndefineds, the
+  //    provider map's keys, weakOverrideSuppressed).
+  //
+  // LLD_REVERSE_HELD_PARSE keeps its old meaning by turning streaming off: it
+  // exists to force one deterministic out-of-order fold order, and streaming
+  // would make that order a race instead. LLD_NO_STREAM_MEMBER_PARSE turns it off
+  // on its own, so that a link can be compared against itself both ways.
+  const bool stream = !reverseHeldParseOrder() &&
+                      !::getenv("LLD_NO_STREAM_MEMBER_PARSE");
+  // The executor already bounds the number of parses actually running to the
+  // worker count. This bounds how far the select loop may run ahead of them, so a
+  // link extracting tens of thousands of members does not queue them all at once,
+  // and it is the knob to turn down if a screen shows system time rising.
+  const int inFlightCap =
+      std::max<int>(1, static_cast<int>(llvm::parallel::getThreadCount()));
+  if (stream) {
+    parallelInput.memberParses =
+        std::make_unique<llvm::parallel::TaskGroup>();
+    parallelInput.memberParseGroup = parallelInput.memberParses.get();
+    parallelInput.memberParsesInFlight.store(0, std::memory_order_relaxed);
+    parallelParseActive = true;
+  }
+  auto streamParse = [&](ObjFile *obj) {
+    std::atomic<int> &inFlight = parallelInput.memberParsesInFlight;
+    while (inFlight.load(std::memory_order_acquire) >= inFlightCap)
+      std::this_thread::yield();
+    inFlight.fetch_add(1, std::memory_order_acq_rel);
+    parallelInput.memberParseGroup->spawn([obj]() {
+      deferredDiagnostics = &obj->parseCtx->diags;
+      obj->parseFile();
+      deferredDiagnostics = nullptr;
+      parallelInput.memberParsesInFlight.fetch_sub(1,
+                                                   std::memory_order_acq_rel);
+    });
+  };
+
   // Extract one member, then walk its own undefined symbols depth first, in
   // nlist order: that is where the serial linker applied them, and it applied
   // the whole of an extracted member before moving to the next undefined.
@@ -1253,13 +1390,12 @@ static bool walkArchives() {
           ArchiveProvider *provider = lookupArchiveProvider(name);
           if (!provider || provider->extracted)
             continue;
-          Symbol *sym = symtab->find(name);
           // Against the provider's archive, not the one being walked: the serial
           // linker created this name's slot at the provider's index entry and left
           // a LazyArchive symbol there, which a dylib export registered after that
           // entry could not displace. So a strong dylib suppresses this extraction
           // exactly when it precedes the provider.
-          if (definedAlready(provider->archiveIndex, sym))
+          if (definedAlready(provider->archiveIndex, *provider))
             continue;
           // Only an index entry the walk has already passed can satisfy this.
           // One still ahead of the frontier is scheduled so that the walk visits
@@ -1279,6 +1415,11 @@ static bool walkArchives() {
         // ...but the serial linker only published it once its parse, and with
         // it every nested extraction, had finished.
         archive->publishIndexedMember(obj, reason);
+
+        // Everything above fixed this member's place in the serial order, so its
+        // parse can run behind the rest of the select loop.
+        if (stream)
+          streamParse(obj);
       };
 
   ts.reset(new TimeTraceScope("Select archive members"));
@@ -1356,10 +1497,12 @@ static bool walkArchives() {
       // merged pass gives an entry a provider unless its name is already
       // defined, which is also the first thing that disqualifies a candidate).
       ArchiveProvider *entryProvider = lookupArchiveProvider(entry.name);
-      if (entryProvider && entryProvider->extracted)
+      // A candidate entry with no provider at all is one the fold found already
+      // Defined or Common, which is what definedAlready()'s first test used to
+      // answer from the table: nothing to extract here either way.
+      if (!entryProvider || entryProvider->extracted)
         continue;
-      Symbol *sym = symtab->find(entry.name);
-      if (definedAlready(archiveIndex, sym))
+      if (definedAlready(archiveIndex, *entryProvider))
         continue;
       // Only an entry that extracts takes a block of walk values; one the walk
       // looked at and passed over is a gap, exactly like one it never looked at.
@@ -1385,9 +1528,14 @@ static bool walkArchives() {
     }
   }
 
-  ts.reset(new TimeTraceScope("Parse archive members"));
-  parseHeldFiles(firstMember);
   ts.reset();
+  if (stream) {
+    TimeTraceScope joinScope("Join streamed member parses");
+    joinStreamedMemberParses();
+  } else {
+    TimeTraceScope parseScope("Parse archive members");
+    parseHeldFiles(firstMember);
+  }
   return true;
 }
 
@@ -1408,6 +1556,9 @@ static void resetParallelInputPhase() {
   parallelInput.prepass.reset();
   parallelInput.prepassGroup = nullptr;
   parallelInput.prepassStates.clear();
+  // Already joined at the end of the walk; this is for the link that never
+  // reached one, and the destructor still waits.
+  joinStreamedMemberParses();
   prepassCancelled.store(false, std::memory_order_relaxed);
 }
 
@@ -1421,7 +1572,9 @@ static void fetchFromArchiveProvider(StringRef name, uint32_t belowArchiveId) {
   ArchiveFile *archive = parallelInput.archives[provider->archiveIndex];
   // The caller already holds a lazy symbol from an archive with this id; only an
   // archive that precedes it on the command line would have owned the slot.
-  if (archive->id >= belowArchiveId)
+  // InputFile::id is a non-negative int; the hook takes the caller's archive id
+  // as uint32_t.
+  if (static_cast<uint32_t>(archive->id) >= belowArchiveId)
     return;
   if (archive->isFetched(provider->childOffset))
     return;
@@ -3249,6 +3402,12 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     // else here frees what they read; the prepass is pure, so abandoning what
     // has not started costs only the work already spent.
     joinArchivePrepass(/*willWalk=*/false);
+    // Same hazard for the streamed member parses, which are not pure: they are
+    // writing the symbol table and reading the archive buffers this callback is
+    // about to release. A fatal() on the main thread inside the select loop --
+    // the error limit reached in createIndexedMember(), say -- gets here with
+    // them still running.
+    joinStreamedMemberParses();
     resolvedFrameworks.clear();
     resolvedLibraries.clear();
     cachedReads.clear();
