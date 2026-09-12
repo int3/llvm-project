@@ -2946,6 +2946,7 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     unprocessedLCLinkerOptions.clear();
     ObjCSelRefsHelper::cleanup();
     resetParallelInputPhase();
+    resetPriorityBuilder();
 
     firstTLVDataSection = nullptr;
     tar = nullptr;

@@ -76,6 +76,12 @@ public:
   // contains.
   llvm::DenseMap<const InputSection *, int> buildInputSectionPriorities();
 
+  // Drop everything parsed so far. Order-file entries are keyed by StringRefs
+  // into the order file's MemoryBuffer and the call graph profile accumulates,
+  // so a driver that runs more than once in a process (library mode,
+  // LLD_IN_TEST=2) must reset the global builder between runs.
+  void reset();
+
 private:
   // The symbol with the smallest priority should be ordered first in the output
   // section (modulo input section contiguity constraints).
@@ -99,6 +105,12 @@ private:
 };
 
 extern PriorityBuilder priorityBuilder;
+
+// Discard everything parsed into priorityBuilder. The builder is a global whose
+// order-file entries are keyed by StringRefs into the order file's MemoryBuffer
+// and whose call graph profile accumulates across calls, so a driver that runs
+// more than once in a process (library mode, LLD_IN_TEST=2) must reset it.
+void resetPriorityBuilder();
 } // namespace lld::macho
 
 #endif
