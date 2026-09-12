@@ -111,6 +111,10 @@ void finishTapiPipeline();
 // Starts preparing an already-read TBD buffer. The buffer identifier must be
 // the path loadDylib() will look up, and must outlive the pipeline.
 void pipelineTapiFile(llvm::MemoryBufferRef buffer);
+// Starts preparing the TBD an LC_LINKER_OPTION names, from the worker which
+// parsed that option. Silent and speculative: resolveLCLinkerOptions() still
+// resolves, reads, diagnoses and publishes the name in its own sorted order.
+void pipelineAutolinkName(llvm::StringRef name, bool isFramework);
 
 void resetLoadedDylibs();
 

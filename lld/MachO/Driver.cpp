@@ -58,6 +58,7 @@
 #include "llvm/TextAPI/PackedVersion.h"
 
 #include <deque>
+#include <mutex>
 
 #if !_WIN32
 #include <sys/mman.h>
@@ -869,6 +870,15 @@ static void addFramework(StringRef name, bool isNeeded, bool isWeak,
   error("framework not found for -framework " + name);
 }
 
+// The LC_LINKER_OPTION names collected so far. An object-heavy link names the
+// same few dozen libraries and frameworks tens of thousands of times, and
+// resolveLCLinkerOptions() sorts and uniques whatever it is given, so one name
+// only has to be collected once. Held objects are parsed on workers, so
+// insertion is lock guarded; the lock is taken once per option.
+static std::mutex autolinkNamesMutex;
+static DenseSet<CachedHashStringRef> autolinkLibraryNames;
+static DenseSet<CachedHashStringRef> autolinkFrameworkNames;
+
 // Parses LC_LINKER_OPTION contents, which can add additional command line
 // flags. This directly parses the flags instead of using the standard argument
 // parser to improve performance.
@@ -889,15 +899,41 @@ void macho::parseLCLinkerOption(
 
   unsigned i = 0;
   StringRef arg = argv[i];
+  StringRef name;
+  bool isFramework = false;
   if (arg.consume_front("-l")) {
     if (config->ignoreAutoLinkOptions.contains(arg))
       return;
+    name = arg;
   } else if (arg == "-framework") {
-    StringRef name = argv[++i];
+    name = argv[++i];
     if (config->ignoreAutoLinkOptions.contains(name))
       return;
+    isFramework = true;
   } else {
     error(arg + " is not allowed in LC_LINKER_OPTION");
+    // A malformed option is left entirely alone: it is forwarded unchanged so
+    // that every occurrence still reaches resolveLCLinkerOptions() as before,
+    // and no empty name is ever entered into the sets or probed on disk.
+    LCLinkerOptions.append(argv);
+    return;
+  }
+
+  // Collect each name once.
+  if (argv.size() == (isFramework ? 2u : 1u)) {
+    bool isNew;
+    {
+      std::lock_guard<std::mutex> lock(autolinkNamesMutex);
+      isNew = (isFramework ? autolinkFrameworkNames : autolinkLibraryNames)
+                  .insert(CachedHashStringRef(name))
+                  .second;
+    }
+    if (!isNew)
+      return;
+    // First sighting: start this name's TBD parse now, from this worker, so
+    // that it overlaps the rest of the object walk instead of running inside
+    // resolveLCLinkerOptions().
+    pipelineAutolinkName(name, isFramework);
   }
 
   LCLinkerOptions.append(argv);
@@ -1730,7 +1766,6 @@ static void prepareCommandLineTapiFiles(const InputArgList &args) {
 
 static void createFiles(const InputArgList &args) {
   TimeTraceScope timeScope("Load input files");
-  llvm::scope_exit endTapiPipeline([] { finishTapiPipeline(); });
   prepareCommandLineTapiFiles(args);
   // This loop should be reserved for options whose exact ordering matters.
   // Other options should be handled via filtered() and/or getLastArg().
@@ -2242,6 +2277,8 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     loadedArchives.clear();
     loadedObjectFrameworks.clear();
     missingAutolinkWarnings.clear();
+    autolinkLibraryNames.clear();
+    autolinkFrameworkNames.clear();
     syntheticSections.clear();
     thunkMap.clear();
     unprocessedLCLinkerOptions.clear();
@@ -2875,6 +2912,9 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     TimeTraceScope timeScope("ExecuteLinker");
 
     initLLVM(); // must be run before any call to addFile()
+    // The pipeline outlives createFiles(): autolinked TBDs are started from the
+    // object parses and consumed by resolveLCLinkerOptions() below.
+    llvm::scope_exit endTapiPipeline([] { finishTapiPipeline(); });
     createFiles(args);
 
     // Now that all dylibs have been loaded, search for those that should be

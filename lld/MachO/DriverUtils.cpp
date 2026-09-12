@@ -237,6 +237,9 @@ macho::PreparedTapiFile &
 macho::PreparedTapiFile::operator=(PreparedTapiFile &&) = default;
 macho::PreparedTapiFile::~PreparedTapiFile() = default;
 
+// Defined with the pipeline below.
+static bool isPipelinedTapiPath(CachedHashStringRef path);
+
 static void prepareTapiFile(PreparedTapiFile *file) {
   Expected<std::unique_ptr<InterfaceFile>> result =
       TextAPIReader::get(file->buffer);
@@ -257,6 +260,10 @@ void macho::prepareTapiFiles(ArrayRef<MemoryBufferRef> buffers,
     // loadDylib() will reuse the existing file, but the deferred entry still
     // needs to be consumed to apply its metadata in the original order.
     if (it != loadedDylibs.end() && it->second)
+      continue;
+    // Already being prepared by the pipeline, which takePreparedTapiFile()
+    // prefers; preparing it again here would only duplicate the parse.
+    if (isPipelinedTapiPath(path))
       continue;
     prepared.emplace_back(buffer);
   }
@@ -442,6 +449,105 @@ void macho::pipelineTapiFile(MemoryBufferRef buffer) {
   if (PreparedTapiFile *file = addPipelinedTapiFile(
           state, buffer.getBufferIdentifier(), buffer.getBuffer(),
           /*owned=*/nullptr, /*ownPath=*/false))
+    state->group.spawn([state, file] { runTapiPipelineTask(state, file); });
+}
+
+static bool isPipelinedTapiPath(CachedHashStringRef path) {
+  TapiPipelineState *state = tapiPipeline.get();
+  if (!state)
+    return false;
+  std::lock_guard<std::mutex> lock(state->mutex);
+  return state->files.contains(path);
+}
+
+// Silent mirrors of findPathCombination(), findLibrary() and findFramework()
+// for the autolink pipeline. They run on parse workers, so they must not save a
+// string, must not log a search and must not touch the dependency tracker: the
+// ordered resolveLCLinkerOptions() still performs the real, diagnosed lookup.
+// A miss here only means that this autolinked input is not prepared.
+static bool probePathCombination(const Twine &name,
+                                 const std::vector<StringRef> &roots,
+                                 ArrayRef<StringRef> extensions,
+                                 SmallVectorImpl<char> &out) {
+  SmallString<261> base;
+  for (StringRef dir : roots) {
+    base = dir;
+    path::append(base, name);
+    for (StringRef ext : extensions) {
+      SmallString<261> location = base;
+      location += ext;
+      if (fs::exists(location)) {
+        out.assign(location.begin(), location.end());
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool probeLibraryName(StringRef name, SmallVectorImpl<char> &out) {
+  if (name.ends_with(".o"))
+    return probePathCombination(name, config->librarySearchPaths, {""}, out);
+  if (config->searchDylibsFirst) {
+    if (probePathCombination("lib" + name, config->librarySearchPaths,
+                             {".tbd", ".dylib", ".so"}, out))
+      return true;
+    return probePathCombination("lib" + name, config->librarySearchPaths,
+                                {".a"}, out);
+  }
+  return probePathCombination("lib" + name, config->librarySearchPaths,
+                              {".tbd", ".dylib", ".so", ".a"}, out);
+}
+
+static bool probeFrameworkName(StringRef name, SmallVectorImpl<char> &out) {
+  StringRef suffix;
+  std::tie(name, suffix) = name.split(",");
+  for (StringRef dir : config->frameworkSearchPaths) {
+    SmallString<260> symlink = dir;
+    path::append(symlink, name + ".framework", name);
+    if (!suffix.empty()) {
+      // As in findFramework(), the symlink must be resolved before the suffix
+      // is applied, and a realpath failure falls through to the plain lookup.
+      SmallString<260> location;
+      if (!fs::real_path(symlink, location)) {
+        SmallString<261> suffixed(location.str());
+        suffixed += suffix;
+        if (fs::exists(suffixed)) {
+          out.assign(suffixed.begin(), suffixed.end());
+          return true;
+        }
+      }
+    }
+    if (probeDylibPath(symlink.str(), out))
+      return true;
+  }
+  return false;
+}
+
+void macho::pipelineAutolinkName(StringRef name, bool isFramework) {
+  TapiPipelineState *state = tapiPipeline.get();
+  if (!state)
+    return;
+
+  SmallString<261> resolved;
+  if (isFramework ? !probeFrameworkName(name, resolved)
+                  : !probeLibraryName(name, resolved))
+    return;
+
+  // Not readFile(): that diagnoses a failure and records a --reproduce member
+  // at the ordered position. The pipeline is disabled under --reproduce anyway.
+  ErrorOr<std::unique_ptr<MemoryBuffer>> mbOrErr =
+      MemoryBuffer::getFile(resolved, /*IsText=*/false,
+                            /*RequiresNullTerminator=*/false);
+  if (!mbOrErr)
+    return;
+  MemoryBufferRef mbref = (*mbOrErr)->getMemBufferRef();
+  if (identify_magic(mbref.getBuffer()) != file_magic::tapi_file)
+    return;
+  StringRef content = mbref.getBuffer();
+  if (PreparedTapiFile *file =
+          addPipelinedTapiFile(state, resolved, content, std::move(*mbOrErr),
+                               /*ownPath=*/true))
     state->group.spawn([state, file] { runTapiPipelineTask(state, file); });
 }
 
