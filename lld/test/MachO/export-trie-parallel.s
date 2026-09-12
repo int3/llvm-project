@@ -13,7 +13,10 @@
 # RUN: llvm-objdump --macho --exports-trie %t/threads8.dylib | FileCheck %s
 
 # The generated names diverge after a long common prefix. The count also makes
-# child offsets cross the two-byte ULEB128 boundary. Define the exceptional
+# child offsets cross the two-byte ULEB128 boundary. The node count is also
+# above the threshold at which assignOffsets() switches from the serial
+# Gauss-Seidel offset fixpoint to the parallel Jacobi one, so the --threads=1
+# comparisons below are what checks that the two fixpoints agree byte for byte. Define the exceptional
 # names out of lexical order to keep the serial-order splice observable.
 # CHECK-DAG: _parallel_branch_0{{$}}
 # CHECK-DAG: _parallel_branch_4095{{$}}

@@ -399,6 +399,9 @@ public:
   uint64_t getRawSize() const override { return size; }
   bool isNeeded() const override { return size; }
   void writeTo(uint8_t *buf) const override;
+  // The trie's node count, valid once buildTrieNodes() has run. Only used to
+  // order this owner against the other __LINKEDIT owners.
+  size_t getTrieNodeCount() const { return trieBuilder.nodeCount(); }
 
   bool hasWeakSymbol = false;
 

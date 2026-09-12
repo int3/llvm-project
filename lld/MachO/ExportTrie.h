@@ -35,6 +35,9 @@ public:
   size_t assignOffsets();
   // Returns the size in bytes of the serialized trie.
   size_t build();
+  // The number of trie nodes, valid once buildNodes() has run. Used to decide
+  // how large this owner is relative to the other __LINKEDIT owners.
+  size_t nodeCount() const { return nodes.size(); }
   void writeTo(uint8_t *buf) const;
 
 private:

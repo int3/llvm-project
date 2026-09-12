@@ -44,6 +44,7 @@
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/Support/LEB128.h"
 #include "llvm/Support/Parallel.h"
+#include "llvm/Support/TimeProfiler.h"
 #include <optional>
 
 using namespace llvm;
@@ -108,6 +109,8 @@ struct macho::TrieNode {
   size_t offset = 0;
 
   uint32_t getTerminalSize() const;
+  // The serialized size of this node, given its children's current offsets.
+  size_t getNodeSize() const;
   // Returns whether the new estimated offset differs from the old one.
   bool updateOffset(size_t &nextOffset);
   void writeTo(uint8_t *buf) const;
@@ -165,7 +168,7 @@ uint32_t TrieNode::getTerminalSize() const {
   return size;
 }
 
-bool TrieNode::updateOffset(size_t &nextOffset) {
+size_t TrieNode::getNodeSize() const {
   // Size of the whole node (including the terminalSize and the outgoing edges.)
   // In contrast, terminalSize only records the size of the other data in the
   // node.
@@ -184,6 +187,11 @@ bool TrieNode::updateOffset(size_t &nextOffset) {
     nodeSize += edge.substring.size() + 1             // String length.
                 + getULEB128Size(edge.child->offset); // Offset len.
   }
+  return nodeSize;
+}
+
+bool TrieNode::updateOffset(size_t &nextOffset) {
+  size_t nodeSize = getNodeSize();
   // On input, 'nextOffset' is the new preferred location for this node.
   bool result = (offset != nextOffset);
   // Store new location in node object for use by parents.
@@ -421,23 +429,97 @@ size_t TrieBuilder::assignOffsets() {
   if (nodes.empty())
     return 0;
 
+  llvm::TimeTraceScope timeScope("Assign export trie offsets");
+
+  const bool runParallel =
+      parallel::getThreadCount() > 1 && nodes.size() >= minimumParallelSymbols;
+
   // The trie's shape does not depend on addresses or dylib ordinals, so the
   // terminal payloads are read out of the symbols only here, once both are
   // final. The traversal order does not matter: each node's payload depends
-  // only on its own symbol.
-  for (TrieNode *node : nodes)
-    if (node->info)
-      node->info->resolve(imageBase);
+  // only on its own symbol, so this pass is a plain parallelFor.
+  if (runParallel) {
+    parallelFor(0, nodes.size(), [&](size_t i) {
+      if (nodes[i]->info)
+        nodes[i]->info->resolve(imageBase);
+    });
+  } else {
+    for (TrieNode *node : nodes)
+      if (node->info)
+        node->info->resolve(imageBase);
+  }
 
-  // Assign each node in the vector an offset in the trie stream, iterating
-  // until all uleb128 sizes have stabilized.
+  if (!runParallel) {
+    // Assign each node in the vector an offset in the trie stream, iterating
+    // until all uleb128 sizes have stabilized.
+    size_t offset;
+    bool more;
+    do {
+      offset = 0;
+      more = false;
+      for (TrieNode *node : nodes)
+        more |= node->updateOffset(offset);
+    } while (more);
+
+    return offset;
+  }
+
+  // The loop above is the Gauss-Seidel form of the fixpoint: a node's size is
+  // computed from the offsets its predecessors were given in the same sweep.
+  // Below is the Jacobi form of the same iteration -- every node's size is
+  // computed in parallel from the *previous* sweep's offsets, and a prefix sum
+  // over those sizes assigns the new offsets. The two agree on every offset,
+  // and therefore on every serialized byte: a node's size is a monotone
+  // function of its children's offsets (getULEB128Size is monotone), so both
+  // iterations start at all-zero offsets and only ever raise an offset, both
+  // stay below the least fixpoint, and both stop only at a fixpoint -- and a
+  // fixpoint reached monotonically from below is the least one.
+  //
+  // The prefix sum is itself chunked: each chunk sums its own sizes, the chunk
+  // totals are prefix-summed serially (there are a few dozen), and a second
+  // parallelFor lays the offsets down inside each chunk from its base. Both
+  // passes over the nodes are parallel; only the per-chunk scan is serial.
+  const size_t nodeCount = nodes.size();
+  const size_t chunkCount = std::min(
+      nodeCount, std::max<size_t>(1, parallel::getThreadCount() * 4));
+  const size_t chunkSize = (nodeCount + chunkCount - 1) / chunkCount;
+  std::vector<size_t> sizes(nodeCount);
+  std::vector<size_t> chunkBases(chunkCount);
+  std::vector<uint8_t> chunkChanged(chunkCount);
   size_t offset;
   bool more;
   do {
+    parallelFor(0, chunkCount, [&](size_t chunk) {
+      size_t begin = chunk * chunkSize;
+      size_t end = std::min(begin + chunkSize, nodeCount);
+      size_t sum = 0;
+      for (size_t i = begin; i != end; ++i) {
+        sizes[i] = nodes[i]->getNodeSize();
+        sum += sizes[i];
+      }
+      chunkBases[chunk] = sum;
+    });
     offset = 0;
+    for (size_t chunk = 0; chunk != chunkCount; ++chunk) {
+      size_t total = chunkBases[chunk];
+      chunkBases[chunk] = offset;
+      offset += total;
+    }
+    parallelFor(0, chunkCount, [&](size_t chunk) {
+      size_t begin = chunk * chunkSize;
+      size_t end = std::min(begin + chunkSize, nodeCount);
+      size_t nodeOffset = chunkBases[chunk];
+      bool changed = false;
+      for (size_t i = begin; i != end; ++i) {
+        changed |= nodes[i]->offset != nodeOffset;
+        nodes[i]->offset = nodeOffset;
+        nodeOffset += sizes[i];
+      }
+      chunkChanged[chunk] = changed;
+    });
     more = false;
-    for (TrieNode *node : nodes)
-      more |= node->updateOffset(offset);
+    for (uint8_t changed : chunkChanged)
+      more |= changed != 0;
   } while (more);
 
   return offset;

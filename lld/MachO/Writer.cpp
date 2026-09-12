@@ -1643,6 +1643,19 @@ void Writer::finalizeLinkEditSegment() {
       indirectSymtabSection, dataInCodeSection,
   };
 
+  // On export-heavy links (Rust, Swift) the export trie's offset fixpoint is
+  // the phase's longest owner, not function starts or the symbol table, and
+  // starting it fourth leaves it waiting for a free thread while the phase has
+  // already opened. Put it first when its node count exceeds the symbol
+  // table's entry count. The owners are independent; the order they run in
+  // does not affect the output.
+  if (in.exports && symtabSection &&
+      in.exports->getTrieNodeCount() > symtabSection->getNumSymbols()) {
+    auto *it = llvm::find(linkEditSections, in.exports);
+    assert(it != linkEditSections.end());
+    std::rotate(linkEditSections.begin(), it, it + 1);
+  }
+
   parallelForEach(linkEditSections.begin(), linkEditSections.end(),
                   [](LinkEditSection *osec) {
                     if (!osec)
