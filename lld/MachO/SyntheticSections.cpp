@@ -2811,7 +2811,9 @@ bool ObjCMethListSection::isMethodList(const ConcatInputSection *isec) {
                                objc::symbol_names::instanceMethods,
                                objc::symbol_names::categoryInstanceMethods,
                                objc::symbol_names::categoryClassMethods};
-  if (!isec)
+  // The bit is clear for every section with no "__OBJC_$_"-prefixed symbol,
+  // which is the overwhelming majority; those cost no symbol dereference here.
+  if (!isec || !isec->mayBeMethodList)
     return false;
   for (const Symbol *sym : isec->symbols) {
     auto *def = dyn_cast_or_null<Defined>(sym);

@@ -8,6 +8,7 @@
 
 #include "Symbols.h"
 #include "InputFiles.h"
+#include "ObjC.h"
 #include "SyntheticSections.h"
 #include "llvm/Demangle/Demangle.h"
 
@@ -69,6 +70,15 @@ Defined::Defined(StringRef name, InputFile *file, InputSection *isec,
       cold(cold), weakDef(isWeakDef), external(isExternal), originalIsec(isec),
       value(value), size(size) {
   if (isec) {
+    // All four ObjC method-list symbol names start with methodListPrefix --
+    // static_asserted in ObjC.h -- and the name is hot here, so
+    // ObjCMethListSection::isMethodList() can reject a section without
+    // dereferencing any of its symbols. Every Defined reaches its section
+    // through this constructor -- the object parse, the common replacement and
+    // the ObjC category merger alike -- so the bit cannot be missed.
+    // transplantSymbolsAtOffset() propagates it for symbols that move.
+    if (name.starts_with(objc::symbol_names::methodListPrefix))
+      isec->mayBeMethodList = true;
     isec->symbols.push_back(this);
     // Maintain sorted order.
     for (auto it = isec->symbols.rbegin(), rend = isec->symbols.rend();

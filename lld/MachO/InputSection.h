@@ -73,12 +73,15 @@ protected:
       : sectionKind(kind), keepUnique(false), hasAltEntry(false), isCold(false),
         isCode(sections::isCodeSection(section.name, section.segname,
                                        section.flags)),
-        align(align), data(data), section(section) {}
+        mayBeMethodList(false), align(align), data(data), section(section) {}
 
   InputSection(const InputSection &rhs)
       : sectionKind(rhs.sectionKind), keepUnique(false), hasAltEntry(false),
-        isCold(rhs.isCold), isCode(rhs.isCode), align(rhs.align),
-        data(rhs.data), section(rhs.section) {}
+        isCold(rhs.isCold), isCode(rhs.isCode),
+        // A copy starts with no symbols of its own; the bit is set again for
+        // each symbol later attached to the new subsection.
+        mayBeMethodList(false), align(rhs.align), data(rhs.data),
+        section(rhs.section) {}
 
   Kind sectionKind;
 
@@ -104,6 +107,13 @@ public:
   // is computed once at construction instead of re-comparing names at every
   // isCodeSection() query.
   bool isCode : 1;
+  // Might this section be an ObjC relative-method-list candidate? The Defined
+  // constructor sets it when a symbol whose name starts with "__OBJC_$_" -- the
+  // common prefix of the four method-list symbol names -- is attached to this
+  // section. It is a conservative filter only: isMethodList() still runs its
+  // full check on a section that carries the bit, but is spared dereferencing
+  // every symbol of every other subsection.
+  bool mayBeMethodList : 1;
   uint32_t align = 1;
 
   OutputSection *parent = nullptr;

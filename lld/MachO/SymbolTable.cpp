@@ -196,6 +196,10 @@ static void transplantSymbolsAtOffset(InputSection *fromIsec,
                                return !symSucceedsOff(toOff, s);
                              }) &&
          "Symbols in toIsec must be partitioned by toOff.");
+  // A transplanted local can be the method-list symbol, so the candidate bit
+  // has to follow the symbols. It is conservative, so an over-approximation
+  // here is harmless.
+  toIsec->mayBeMethodList |= fromIsec->mayBeMethodList;
   auto insertIt = llvm::upper_bound(toIsec->symbols, toOff, symSucceedsOff);
   llvm::erase_if(fromIsec->symbols, [&](Symbol *s) {
     auto *d = cast<Defined>(s);
