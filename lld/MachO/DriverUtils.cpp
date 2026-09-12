@@ -463,8 +463,15 @@ takePreparedTapiFile(CachedHashStringRef path,
     std::unique_lock<std::mutex> lock(state->mutex);
     auto it = state->files.find(path);
     if (it != state->files.end()) {
+      // The entry itself is stable, because only this function removes one and
+      // unique_ptr keeps its address fixed.
       PreparedTapiFile *file = it->second.get();
       state->cv.wait(lock, [file] { return file->done; });
+      // The wait released the mutex, so a worker discovering re-exports may have
+      // inserted into the map and rehashed it. Look the entry up again rather
+      // than erasing through an iterator from before the wait.
+      it = state->files.find(path);
+      assert(it != state->files.end());
       owner = std::move(it->second);
       state->files.erase(it);
       return file;
