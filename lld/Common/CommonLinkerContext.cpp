@@ -11,6 +11,7 @@
 #include "lld/Common/Memory.h"
 
 #include "llvm/CodeGen/CommandFlags.h"
+#include "llvm/Support/MemAlloc.h"
 
 using namespace llvm;
 using namespace lld;
@@ -47,8 +48,13 @@ CommonLinkerContext::~CommonLinkerContext() {
   for (auto &it : instances)
     it.second->~SpecificAllocBase();
 
-  if (lctx == this)
+  if (lctx == this) {
     lctx = nullptr;
+    // Give the huge-page buffer pool back to the system, so a driver that runs
+    // more than once in a process (library mode, LLD_IN_TEST=2) does not
+    // accumulate pool chunks.
+    release_buffer_pool();
+  }
 }
 
 CommonLinkerContext &lld::commonContext() {

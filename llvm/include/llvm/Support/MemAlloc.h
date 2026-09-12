@@ -83,5 +83,14 @@ allocate_buffer(size_t Size, size_t Alignment);
 /// most likely using the above helper.
 LLVM_ABI void deallocate_buffer(void *Ptr, size_t Size, size_t Alignment);
 
+/// Release any memory the buffer allocator holds in reserve.
+///
+/// On Linux, buffers of at least 4 KiB come from huge-page-advised pool chunks
+/// that are not returned to the system when a buffer is deallocated. This
+/// releases the chunks that no longer hold a live buffer, so a process that
+/// links repeatedly in-process does not accumulate them. Buffers that are
+/// still live keep their chunk mapped. A no-op elsewhere.
+LLVM_ABI void release_buffer_pool();
+
 } // namespace llvm
 #endif
