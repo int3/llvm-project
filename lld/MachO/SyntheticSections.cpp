@@ -1186,27 +1186,102 @@ void FunctionStartsSection::prepare() {
   prepared = true;
 }
 
-void FunctionStartsSection::finalizeContents() {
-  raw_svector_ostream os{contents};
-  std::vector<uint64_t> addrs;
-  if (prepared) {
-    addrs.reserve(candidates.size());
-    for (const Defined *defined : candidates)
-      addrs.push_back(defined->getVA());
-  } else {
-    forEachFunctionStart(
-        [&](const Defined *defined) { addrs.push_back(defined->getVA()); });
-  }
-  llvm::sort(addrs);
-  uint64_t addr = in.header->addr;
+// Encodes the sorted addresses as the ULEB delta stream, exactly as the serial
+// loop in finalizeContents() does. `refAddr` is the address the serial encoder
+// would be holding when it reaches addrs.front().
+static void encodeFunctionStarts(ArrayRef<uint64_t> addrs, uint64_t refAddr,
+                                 SmallVectorImpl<uint8_t> &out) {
+  uint8_t buf[16];
+  uint64_t addr = refAddr;
   for (uint64_t nextAddr : addrs) {
     uint64_t delta = nextAddr - addr;
     if (delta == 0)
       continue;
-    encodeULEB128(delta, os);
+    out.append(buf, buf + encodeULEB128(delta, buf));
     addr = nextAddr;
   }
-  os << '\0';
+}
+
+void FunctionStartsSection::finalizeContents() {
+  std::vector<uint64_t> addrs;
+
+  if (parallel::strategy.ThreadsRequested == 1) {
+    // Serial path, unchanged: no zero-filled resize and no chunk buffers.
+    raw_svector_ostream os{contents};
+    if (prepared) {
+      addrs.reserve(candidates.size());
+      for (const Defined *defined : candidates)
+        addrs.push_back(defined->getVA());
+    } else {
+      forEachFunctionStart(
+          [&](const Defined *defined) { addrs.push_back(defined->getVA()); });
+    }
+    llvm::sort(addrs);
+    uint64_t addr = in.header->addr;
+    for (uint64_t nextAddr : addrs) {
+      uint64_t delta = nextAddr - addr;
+      if (delta == 0)
+        continue;
+      encodeULEB128(delta, os);
+      addr = nextAddr;
+    }
+    os << '\0';
+    candidates.clear();
+    candidates.shrink_to_fit();
+    return;
+  }
+
+  if (prepared) {
+    // The candidate list was gathered during address finalization, so by now
+    // its Defined -> isec -> parent chains are cold; fill the addresses on
+    // workers. Positional writes to distinct slots do not race.
+    addrs.resize(candidates.size());
+    parallelFor(0, candidates.size(),
+                [&](size_t i) { addrs[i] = candidates[i]->getVA(); });
+  } else {
+    forEachFunctionStart(
+        [&](const Defined *defined) { addrs.push_back(defined->getVA()); });
+  }
+  // Plain uint64 values with a total order: any correct sort yields the same
+  // sequence, so the encoded deltas below are unchanged.
+  parallelSort(addrs.begin(), addrs.end());
+
+  // Encode the delta stream in chunks on workers. The addresses are sorted, so
+  // the address the serial encoder would hold on entering a chunk is simply the
+  // previous chunk's last address: an equal address leaves it unchanged and a
+  // larger one replaces it. The chunks are therefore the serial encoder's bytes
+  // cut into pieces; a prefix sum of their sizes gives each its final offset.
+  const size_t numAddrs = addrs.size();
+  size_t numChunks = 1;
+  if (numAddrs > 8192)
+    numChunks = std::min<size_t>(parallel::getThreadCount() * 4,
+                                 numAddrs / 4096);
+  const size_t chunkSize = (numAddrs + numChunks - 1) / numChunks;
+  if (chunkSize == 0)
+    numChunks = 0;
+  else
+    numChunks = (numAddrs + chunkSize - 1) / chunkSize;
+
+  std::vector<SmallVector<uint8_t, 0>> chunks(numChunks);
+  parallelFor(0, numChunks, [&](size_t c) {
+    size_t lo = c * chunkSize;
+    size_t hi = std::min(lo + chunkSize, numAddrs);
+    chunks[c].reserve((hi - lo) * 2);
+    encodeFunctionStarts(ArrayRef<uint64_t>(addrs).slice(lo, hi - lo),
+                         lo == 0 ? in.header->addr : addrs[lo - 1], chunks[c]);
+  });
+
+  std::vector<size_t> offsets(numChunks);
+  size_t total = 0;
+  for (size_t c = 0; c < numChunks; ++c) {
+    offsets[c] = total;
+    total += chunks[c].size();
+  }
+  contents.resize_for_overwrite(total + 1);
+  parallelFor(0, numChunks, [&](size_t c) {
+    memcpy(contents.data() + offsets[c], chunks[c].data(), chunks[c].size());
+  });
+  contents[total] = '\0';
 
   candidates.clear();
   candidates.shrink_to_fit();
@@ -1719,12 +1794,25 @@ void SymtabSection::finalizeContents() {
     collectSymbols(symtab->getSymbols(), /*isPrefix=*/true);
 
   emitStabs();
-  uint32_t symtabIndex = getNumStabs();
-  for (const SymtabEntry &entry :
-       concat<SymtabEntry>(localSymbols, externalSymbols))
-    cast<Defined>(entry.sym)->setSymtabIndex(symtabIndex++);
-  for (const SymtabEntry &entry : undefinedSymbols)
-    cast<DylibSymbol>(entry.sym)->symtabIndex = symtabIndex++;
+  // Indices are purely positional, and every entry names a distinct Symbol
+  // (locals are per-file Defineds, externals and undefineds are unique in the
+  // symbol table), so these writes neither race nor depend on iteration
+  // order. The symbols have not been touched since collection, so this walk
+  // is a cold pointer chase worth spreading over the workers.
+  const uint32_t stabBase = getNumStabs();
+  const size_t numLocals = localSymbols.size();
+  const size_t numExternals = externalSymbols.size();
+  parallelFor(0, numLocals, [&](size_t i) {
+    cast<Defined>(localSymbols[i].sym)->setSymtabIndex(stabBase + i);
+  });
+  parallelFor(0, numExternals, [&](size_t i) {
+    cast<Defined>(externalSymbols[i].sym)
+        ->setSymtabIndex(stabBase + numLocals + i);
+  });
+  parallelFor(0, undefinedSymbols.size(), [&](size_t i) {
+    cast<DylibSymbol>(undefinedSymbols[i].sym)->symtabIndex =
+        stabBase + numLocals + numExternals + i;
+  });
 
   preparedSymbols.clear();
   preparedSymbols.shrink_to_fit();
@@ -3002,13 +3090,17 @@ void ChainedFixupsSection::finalizeContents() {
     loc.offset =
         loc.isec->parent->getSegmentOffset() + loc.isec->getOffset(loc.offset);
 
-  llvm::sort(locations, [](const Location &a, const Location &b) {
+  // llvm::sort is already unstable, so parallelSort adds no ordering risk for
+  // equal keys; the page starts and fixup chains below depend only on the
+  // sorted (segment, offset) sequence.
+  auto locationLess = [](const Location &a, const Location &b) {
     const OutputSegment *segA = a.isec->parent->parent;
     const OutputSegment *segB = b.isec->parent->parent;
     if (segA == segB)
       return a.offset < b.offset;
     return segA->addr < segB->addr;
-  });
+  };
+  parallelSort(locations.begin(), locations.end(), locationLess);
 
   auto sameSegment = [](const Location &a, const Location &b) {
     return a.isec->parent->parent == b.isec->parent->parent;

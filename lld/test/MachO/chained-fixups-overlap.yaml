@@ -1,0 +1,137 @@
+# REQUIRES: aarch64
+
+## Two 8-byte pointer relocations four bytes apart in the same __data section
+## cannot be chained. The assembler will not emit overlapping relocations, so
+## the object is built from YAML. The diagnostic names the offending location,
+## which is found by walking the sorted location list, so check that the
+## message survives sorting the list on the thread pool, at any thread count.
+
+# RUN: rm -rf %t; mkdir -p %t
+# RUN: yaml2obj %s -o %t/overlap.o
+# RUN: not %no-lsystem-lld -arch arm64 -dylib -install_name @rpath/test.dylib \
+# RUN:     -no_uuid -fixup_chains --threads=1 %t/overlap.o -o %t/t1.dylib 2>&1 | \
+# RUN:     FileCheck %s
+# RUN: not %no-lsystem-lld -arch arm64 -dylib -install_name @rpath/test.dylib \
+# RUN:     -no_uuid -fixup_chains --threads=2 %t/overlap.o -o %t/t2.dylib 2>&1 | \
+# RUN:     FileCheck %s
+# RUN: not %no-lsystem-lld -arch arm64 -dylib -install_name @rpath/test.dylib \
+# RUN:     -no_uuid -fixup_chains --threads=8 %t/overlap.o -o %t/t8.dylib 2>&1 | \
+# RUN:     FileCheck %s
+
+# CHECK: error: __DATA,__data, offset 4: fixups overlap
+
+--- !mach-o
+FileHeader:
+  magic:           0xFEEDFACF
+  cputype:         0x100000C
+  cpusubtype:      0x0
+  filetype:        0x1
+  ncmds:           3
+  sizeofcmds:      336
+  flags:           0x0
+  reserved:        0x0
+LoadCommands:
+  - cmd:             LC_SEGMENT_64
+    cmdsize:         232
+    segname:         ''
+    vmaddr:          0
+    vmsize:          20
+    fileoff:         368
+    filesize:        20
+    maxprot:         7
+    initprot:        7
+    nsects:          2
+    flags:           0
+    Sections:
+      - sectname:        __text
+        segname:         __TEXT
+        addr:            0x0
+        size:            4
+        offset:          0x170
+        align:           0
+        reloff:          0x0
+        nreloc:          0
+        flags:           0x80000400
+        reserved1:       0x0
+        reserved2:       0x0
+        reserved3:       0x0
+        content:         C0035FD6
+      - sectname:        __data
+        segname:         __DATA
+        addr:            0x4
+        size:            16
+        offset:          0x174
+        align:           0
+        reloff:          0x188
+        nreloc:          2
+        flags:           0x0
+        reserved1:       0x0
+        reserved2:       0x0
+        reserved3:       0x0
+        content:         '00000000000000000000000000000000'
+        relocations:
+          - address:         0x4
+            symbolnum:       2
+            pcrel:           false
+            length:          3
+            extern:          true
+            type:            0
+            scattered:       false
+            value:           0
+          - address:         0x0
+            symbolnum:       2
+            pcrel:           false
+            length:          3
+            extern:          true
+            type:            0
+            scattered:       false
+            value:           0
+  - cmd:             LC_SYMTAB
+    cmdsize:         24
+    symoff:          408
+    nsyms:           3
+    stroff:          456
+    strsize:         16
+  - cmd:             LC_DYSYMTAB
+    cmdsize:         80
+    ilocalsym:       0
+    nlocalsym:       2
+    iextdefsym:      2
+    nextdefsym:      1
+    iundefsym:       3
+    nundefsym:       0
+    tocoff:          0
+    ntoc:            0
+    modtaboff:       0
+    nmodtab:         0
+    extrefsymoff:    0
+    nextrefsyms:     0
+    indirectsymoff:  0
+    nindirectsyms:   0
+    extreloff:       0
+    nextrel:         0
+    locreloff:       0
+    nlocrel:         0
+LinkEditData:
+  NameList:
+    - n_strx:          10
+      n_type:          0xE
+      n_sect:          1
+      n_desc:          0
+      n_value:         0
+    - n_strx:          4
+      n_type:          0xE
+      n_sect:          2
+      n_desc:          0
+      n_value:         4
+    - n_strx:          1
+      n_type:          0xF
+      n_sect:          1
+      n_desc:          0
+      n_value:         0
+  StringTable:
+    - ''
+    - _x
+    - ltmp1
+    - ltmp0
+...

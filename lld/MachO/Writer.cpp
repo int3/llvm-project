@@ -1323,18 +1323,41 @@ void Writer::finalizeLinkEditSegment() {
   joinPrepare();
   TimeTraceScope timeScope("Finalize __LINKEDIT segment");
   // Fill __LINKEDIT contents.
+  // parallelFor hands out these indices in order, so list the owners longest
+  // first: function starts, the symbol table and chained fixups dominate the
+  // phase, and each spreads its own loops over the pool. Starting them first
+  // lets the small owners' threads help them instead of the reverse. The
+  // owners are independent, and the phase's result does not depend on the
+  // order they run in.
   std::array<LinkEditSection *, 10> linkEditSections{
-      in.rebase,         in.binding,
-      in.weakBinding,    in.lazyBinding,
-      in.exports,        in.chainedFixups,
-      symtabSection,     indirectSymtabSection,
-      dataInCodeSection, functionStartsSection,
+      functionStartsSection, symtabSection,
+      in.chainedFixups,      in.exports,
+      in.rebase,             in.binding,
+      in.weakBinding,        in.lazyBinding,
+      indirectSymtabSection, dataInCodeSection,
   };
 
   parallelForEach(linkEditSections.begin(), linkEditSections.end(),
                   [](LinkEditSection *osec) {
-                    if (osec)
+                    if (!osec)
+                      return;
+                    // One scope per LINKEDIT owner, so --time-trace shows which
+                    // owner is the critical path of this phase. A scope on a
+                    // thread-pool worker is dropped unless that thread has its
+                    // own profiler, so give it one (the main thread, which runs
+                    // one of these tasks itself, already has one).
+                    bool ownProfiler =
+                        config->timeTraceEnabled && !timeTraceProfilerEnabled();
+                    if (ownProfiler)
+                      timeTraceProfilerInitialize(config->timeTraceGranularity,
+                                                  "finalizeLinkEditSection");
+                    {
+                      TimeTraceScope timeScope("Finalize LINKEDIT section",
+                                               osec->name);
                       osec->finalizeContents();
+                    }
+                    if (ownProfiler)
+                      timeTraceProfilerFinishThread();
                   });
 
   // Now that __LINKEDIT is filled out, do a proper calculation of its
