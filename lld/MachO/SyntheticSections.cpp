@@ -28,6 +28,7 @@
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/xxhash.h"
 
+#include <cstring>
 #include <limits>
 
 #if defined(__APPLE__)
@@ -2549,6 +2550,19 @@ void WordLiteralSection::addInput(WordLiteralInputSection *isec) {
   inputs.push_back(isec);
 }
 
+// A literal section's data is a range of the mapped input file, so it carries
+// the file's alignment, not the literal's: dereferencing it as a uint32_t,
+// uint64_t or UInt128 is undefined whenever the section does not happen to
+// start on that boundary, and UndefinedBehaviorSanitizer reports it on every
+// link that folds eight-byte literals. The value is only ever a map key and is
+// never reinterpreted, so copying the bytes out keeps the key identical on
+// every host while letting the compiler emit the same single unaligned load.
+template <class T> static T readLiteral(const uint8_t *buf, size_t off) {
+  T value;
+  memcpy(&value, buf + off, sizeof(T));
+  return value;
+}
+
 void WordLiteralSection::finalizeContents() {
   for (WordLiteralInputSection *isec : inputs) {
     // We do all processing of the InputSection here, so it will be effectively
@@ -2560,7 +2574,7 @@ void WordLiteralSection::finalizeContents() {
       for (size_t off = 0, e = isec->data.size(); off < e; off += 4) {
         if (!isec->isLive(off))
           continue;
-        uint32_t value = *reinterpret_cast<const uint32_t *>(buf + off);
+        uint32_t value = readLiteral<uint32_t>(buf, off);
         literal4Map.try_emplace(value, literal4Map.size());
       }
       break;
@@ -2569,7 +2583,7 @@ void WordLiteralSection::finalizeContents() {
       for (size_t off = 0, e = isec->data.size(); off < e; off += 8) {
         if (!isec->isLive(off))
           continue;
-        uint64_t value = *reinterpret_cast<const uint64_t *>(buf + off);
+        uint64_t value = readLiteral<uint64_t>(buf, off);
         literal8Map.try_emplace(value, literal8Map.size());
       }
       break;
@@ -2578,7 +2592,7 @@ void WordLiteralSection::finalizeContents() {
       for (size_t off = 0, e = isec->data.size(); off < e; off += 16) {
         if (!isec->isLive(off))
           continue;
-        UInt128 value = *reinterpret_cast<const UInt128 *>(buf + off);
+        UInt128 value = readLiteral<UInt128>(buf, off);
         literal16Map.try_emplace(value, literal16Map.size());
       }
       break;
