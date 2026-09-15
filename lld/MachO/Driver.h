@@ -67,6 +67,10 @@ std::string createResponseFile(const llvm::opt::InputArgList &args);
 // Check for both libfoo.dylib and libfoo.tbd (in that order).
 std::optional<StringRef> resolveDylibPath(llvm::StringRef path);
 
+// fs::exists(), answered from the autolink pipeline's probes when one of them
+// already asked about this path. See its definition in DriverUtils.cpp.
+bool memoizedExists(const llvm::Twine &path);
+
 DylibFile *loadDylib(llvm::MemoryBufferRef mbref, DylibFile *umbrella = nullptr,
                      bool isBundleLoader = false,
                      bool explicitlyLinked = false);

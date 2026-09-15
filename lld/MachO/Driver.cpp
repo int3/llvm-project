@@ -148,8 +148,9 @@ static std::optional<StringRef> findFramework(StringRef name) {
       SmallString<260> location;
       if (!fs::real_path(symlink, location)) {
         // only append suffix if realpath() succeeds
-        Twine suffixed = location + suffix;
-        if (fs::exists(suffixed))
+        SmallString<261> suffixed(location.str());
+        suffixed += suffix;
+        if (memoizedExists(suffixed))
           return resolvedFrameworks[key] = saver().save(suffixed.str());
       }
       // Suffix lookup failed, fall through to the no-suffix case.

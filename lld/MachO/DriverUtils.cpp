@@ -17,6 +17,7 @@
 #include "lld/Common/Reproduce.h"
 #include "llvm/ADT/CachedHashString.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/BinaryFormat/Magic.h"
 #include "llvm/LTO/LTO.h"
 #include "llvm/Option/Arg.h"
@@ -29,6 +30,7 @@
 #include "llvm/TextAPI/InterfaceFile.h"
 #include "llvm/TextAPI/TextAPIReader.h"
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 
 using namespace llvm;
@@ -213,12 +215,12 @@ std::optional<StringRef> macho::resolveDylibPath(StringRef dylibPath) {
   // they are consistent.
   SmallString<261> tbdPath = dylibPath;
   path::replace_extension(tbdPath, ".tbd");
-  bool tbdExists = fs::exists(tbdPath);
+  bool tbdExists = memoizedExists(tbdPath);
   searchedDylib(tbdPath, tbdExists);
   if (tbdExists)
     return saver().save(tbdPath.str());
 
-  bool dylibExists = fs::exists(dylibPath);
+  bool dylibExists = memoizedExists(dylibPath);
   searchedDylib(dylibPath, dylibExists);
   if (dylibExists)
     return saver().save(dylibPath);
@@ -336,6 +338,45 @@ struct TapiPipelineState {
 };
 } // namespace
 
+// The autolink pipeline's silent probes ask the filesystem exactly the
+// questions the ordered findFramework()/findDylib() -> resolveDylibPath()
+// lookup asks again, later, on the main thread. Remember every answer so that
+// the ordered side pays a hash lookup instead of an access(2). The ordered
+// side still logs the search and feeds the dependency tracker at its own
+// position, so -dependency_info records, -t output and diagnostics are
+// produced in exactly the same order; the only observable difference would be
+// a file appearing on or vanishing from disk between the probe and the lookup.
+//
+// The memo exists only while the pipeline does, so a single-threaded link (or
+// --reproduce) pays nothing at all.
+namespace {
+struct ExistsMemo {
+  llvm::StringMap<bool> map;
+  std::mutex mutex;
+};
+} // namespace
+
+static std::unique_ptr<ExistsMemo> existsMemo;
+
+bool macho::memoizedExists(const Twine &pathTwine) {
+  ExistsMemo *memo = existsMemo.get();
+  if (!memo)
+    return fs::exists(pathTwine);
+
+  SmallString<261> buf;
+  StringRef path = pathTwine.toStringRef(buf);
+  {
+    std::lock_guard<std::mutex> lock(memo->mutex);
+    auto it = memo->map.find(path);
+    if (it != memo->map.end())
+      return it->second;
+  }
+  bool exists = fs::exists(path);
+  std::lock_guard<std::mutex> lock(memo->mutex);
+  memo->map[path] = exists;
+  return exists;
+}
+
 static std::unique_ptr<TapiPipelineState> tapiPipeline;
 
 static void runTapiPipelineTask(TapiPipelineState *state,
@@ -374,11 +415,11 @@ static bool probeDylibPath(const Twine &candidate, SmallVectorImpl<char> &out) {
   StringRef path = candidate.toStringRef(buf);
   SmallString<261> tbdPath = path;
   llvm::sys::path::replace_extension(tbdPath, ".tbd");
-  if (fs::exists(tbdPath)) {
+  if (memoizedExists(tbdPath)) {
     out.assign(tbdPath.begin(), tbdPath.end());
     return true;
   }
-  if (fs::exists(path)) {
+  if (memoizedExists(path)) {
     out.assign(path.begin(), path.end());
     return true;
   }
@@ -412,7 +453,7 @@ static bool probeReexportPath(StringRef path, SmallVectorImpl<char> &out) {
         SmallString<261> candidate = dir;
         llvm::sys::path::append(candidate, stem);
         candidate += ext;
-        if (fs::exists(candidate)) {
+        if (memoizedExists(candidate)) {
           out.assign(candidate.begin(), candidate.end());
           return true;
         }
@@ -473,6 +514,7 @@ static void runTapiPipelineTask(TapiPipelineState *state,
 
 void macho::startTapiPipeline() {
   assert(!tapiPipeline);
+  existsMemo = std::make_unique<ExistsMemo>();
   tapiPipeline = std::make_unique<TapiPipelineState>();
 }
 
@@ -509,7 +551,7 @@ static bool probePathCombination(const Twine &name,
     for (StringRef ext : extensions) {
       SmallString<261> location = base;
       location += ext;
-      if (fs::exists(location)) {
+      if (memoizedExists(location)) {
         out.assign(location.begin(), location.end());
         return true;
       }
@@ -545,7 +587,7 @@ static bool probeFrameworkName(StringRef name, SmallVectorImpl<char> &out) {
       if (!fs::real_path(symlink, location)) {
         SmallString<261> suffixed(location.str());
         suffixed += suffix;
-        if (fs::exists(suffixed)) {
+        if (memoizedExists(suffixed)) {
           out.assign(suffixed.begin(), suffixed.end());
           return true;
         }
@@ -592,6 +634,8 @@ void macho::finishTapiPipeline() {
   // ~TapiPipelineState destroys the task group first, joining every worker
   // before the state they use goes away.
   tapiPipeline.reset();
+  // Only after the probes are joined, since they share the memo.
+  existsMemo.reset();
 }
 
 // Returns the prepared entry for \p path, waiting for a pipelined parse which
@@ -772,8 +816,9 @@ macho::findPathCombination(const Twine &name,
     base = dir;
     path::append(base, name);
     for (StringRef ext : extensions) {
-      Twine location = base + ext;
-      bool exists = fs::exists(location);
+      SmallString<261> location = base;
+      location += ext;
+      bool exists = memoizedExists(location);
       searchedDylib(location, exists);
       if (exists)
         return saver().save(location.str());
