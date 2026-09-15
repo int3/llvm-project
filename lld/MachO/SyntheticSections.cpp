@@ -2592,7 +2592,11 @@ void WordLiteralSection::finalizeContents() {
       for (size_t off = 0, e = isec->data.size(); off < e; off += 16) {
         if (!isec->isLive(off))
           continue;
-        UInt128 value = readLiteral<UInt128>(buf, off);
+        // UInt128 is a std::pair, which is not trivially default
+        // constructible, so memcpy-ing into one warns under
+        // -Wnontrivial-memcall. Read the two halves and build the pair.
+        UInt128 value(readLiteral<uint64_t>(buf, off),
+                      readLiteral<uint64_t>(buf, off + 8));
         literal16Map.try_emplace(value, literal16Map.size());
       }
       break;
