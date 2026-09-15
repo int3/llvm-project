@@ -25,6 +25,7 @@
 #include "llvm/Support/LEB128.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Parallel.h"
+#include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/xxhash.h"
 
 #include <limits>
@@ -1070,7 +1071,10 @@ void ExportSection::collectSymbols() {
   collected = true;
 }
 
-void ExportSection::buildTrieNodes() { trieBuilder.buildNodes(); }
+void ExportSection::buildTrieNodes() {
+  TimeTraceScope timeScope("Build export trie nodes");
+  trieBuilder.buildNodes();
+}
 
 void ExportSection::finalizeContents() {
   trieBuilder.setImageBase(in.header->addr);
@@ -1191,6 +1195,7 @@ template <class AddFn> static void forEachFunctionStart(AddFn add) {
 }
 
 void FunctionStartsSection::prepare() {
+  TimeTraceScope timeScope("Prepare function starts");
   forEachFunctionStart([&](const Defined *defined) {
     candidates.push_back(defined);
   });
@@ -1407,6 +1412,7 @@ static void stableSortByFileId(std::vector<StabsSymbol> &syms) {
 // `parallel` is set when prepareStabs() runs this on the prepare worker during
 // address assignment; the serial finalizeContents() path keeps the plain walk.
 void SymtabSection::gatherStabsSymbols(bool parallel) {
+  TimeTraceScope timeScope("Gather STABS symbols");
   stabsSymbols.clear();
   const size_t numLocals = localSymbols.size();
   const size_t numEntries = numLocals + externalSymbols.size();
@@ -1749,6 +1755,7 @@ static bool isLocalSymtabEntry(Defined *defined) {
 // link whose prepare task is not the critical path. `strx` is the deferred
 // ordinal, which is positional (locals are numbered first, from zero).
 void SymtabSection::collectLocalSymbolsParallel() {
+  TimeTraceScope timeScope("Prepare symtab local walk");
   assert(localSymbols.empty() && "the prefix pass gathers locals first");
   ArrayRef<InputFile *> files = inputFiles.getArrayRef();
   const size_t numFiles = files.size();
@@ -1851,20 +1858,23 @@ void SymtabSection::collectSymbols(ArrayRef<Symbol *> syms, bool isPrefix) {
       localSymbolsHandler(in.stubHelper->dyldPrivate);
   }
 
-  for (Symbol *sym : syms) {
-    if (!sym->isLive())
-      continue;
-    if (auto *defined = dyn_cast<Defined>(sym)) {
-      if (!defined->includeInSymtab)
+  {
+    TimeTraceScope timeScope("Prepare symtab external walk");
+    for (Symbol *sym : syms) {
+      if (!sym->isLive())
         continue;
-      assert(defined->isExternal());
-      if (defined->privateExtern)
-        localSymbolsHandler(defined);
-      else
-        addSymbol(externalSymbols, defined);
-    } else if (auto *dysym = dyn_cast<DylibSymbol>(sym)) {
-      if (dysym->isReferenced())
-        addSymbol(undefinedSymbols, sym);
+      if (auto *defined = dyn_cast<Defined>(sym)) {
+        if (!defined->includeInSymtab)
+          continue;
+        assert(defined->isExternal());
+        if (defined->privateExtern)
+          localSymbolsHandler(defined);
+        else
+          addSymbol(externalSymbols, defined);
+      } else if (auto *dysym = dyn_cast<DylibSymbol>(sym)) {
+        if (dysym->isReferenced())
+          addSymbol(undefinedSymbols, sym);
+      }
     }
   }
 
@@ -1873,14 +1883,23 @@ void SymtabSection::collectSymbols(ArrayRef<Symbol *> syms, bool isPrefix) {
     std::vector<CachedHashStringRef> names(normalSymbolOrdinal,
                                             CachedHashStringRef("", 0));
     std::vector<uint32_t> offsets(normalSymbolOrdinal);
-    for (SymtabEntry &entry : concat<SymtabEntry>(
-             localSymbols, externalSymbols, undefinedSymbols))
-      names[entry.strx] = CachedHashStringRef(entry.sym->getName(), 0);
-
-    parallelFor(0, names.size(), [&](size_t i) {
-      names[i] = CachedHashStringRef(names[i].val());
-    });
-    stringTableSection.addStringsInOrder(names, offsets);
+    {
+      TimeTraceScope timeScope("Prepare symtab names fill");
+      for (SymtabEntry &entry : concat<SymtabEntry>(
+               localSymbols, externalSymbols, undefinedSymbols))
+        names[entry.strx] = CachedHashStringRef(entry.sym->getName(), 0);
+    }
+    {
+      TimeTraceScope timeScope("Prepare symtab name hashing");
+      parallelFor(0, names.size(), [&](size_t i) {
+        names[i] = CachedHashStringRef(names[i].val());
+      });
+    }
+    {
+      TimeTraceScope timeScope("Prepare symtab string batch");
+      stringTableSection.addStringsInOrder(names, offsets);
+    }
+    TimeTraceScope timeScope("Prepare symtab offset patch");
     for (SymtabEntry &entry : concat<SymtabEntry>(
              localSymbols, externalSymbols, undefinedSymbols))
       entry.strx = offsets[entry.strx];
@@ -2133,8 +2152,11 @@ void StringTableSection::addStringsInOrder(
 
   std::array<std::vector<uint32_t>, stringMapShards> occurrences;
   const uint32_t count = names.size();
-  for (uint32_t i = 0; i != count; ++i)
-    occurrences[names[i].hash() >> 28].push_back(i);
+  {
+    TimeTraceScope timeScope("Bucket string batch");
+    for (uint32_t i = 0; i != count; ++i)
+      occurrences[names[i].hash() >> 28].push_back(i);
+  }
 
   // A shard map's values are byte offsets once a batch has finished, so a
   // string already interned cannot be deduplicated through the same map entry
@@ -2145,6 +2167,8 @@ void StringTableSection::addStringsInOrder(
   static_assert(alreadyInterned != 0, "sentinel must not be a valid index");
 
   std::vector<uint32_t> firstOccurrence(names.size());
+  {
+  TimeTraceScope timeScope("Insert string shards");
   parallelFor(0, stringMapShards, [&](size_t shard) {
     auto &stringMap = stringMaps[shard];
     if (!haveInterned) {
@@ -2168,19 +2192,24 @@ void StringTableSection::addStringsInOrder(
       firstOccurrence[index] = batchIt->second;
     }
   });
+  }
 
   // Preserve addString()'s exact first-occurrence order. STABS are emitted
   // after the normal-symbol pass and use the completed shard maps through
   // addString().
-  for (uint32_t i = 0; i != count; ++i) {
-    if (firstOccurrence[i] != i)
-      continue;
-    offsets[i] = size;
-    recordWriteChunk();
-    strings.push_back(names[i].val());
-    size += names[i].size() + 1;
+  {
+    TimeTraceScope timeScope("Lay out string batch");
+    for (uint32_t i = 0; i != count; ++i) {
+      if (firstOccurrence[i] != i)
+        continue;
+      offsets[i] = size;
+      recordWriteChunk();
+      strings.push_back(names[i].val());
+      size += names[i].size() + 1;
+    }
   }
 
+  TimeTraceScope mergeScope("Merge string shards");
   parallelFor(0, stringMapShards, [&](size_t shard) {
     for (uint32_t index : occurrences[shard])
       if (firstOccurrence[index] != alreadyInterned)

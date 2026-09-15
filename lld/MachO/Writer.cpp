@@ -1620,9 +1620,19 @@ void Writer::finalizeAddresses() {
   }
 }
 
-void Writer::joinPrepare() { prepareGroup.reset(); }
+void Writer::joinPrepare() {
+  if (!prepareGroup)
+    return;
+  TimeTraceScope timeScope("Join symbol table prepare");
+  prepareGroup.reset();
+}
 
-void Writer::joinExportTrie() { exportTrieGroup.reset(); }
+void Writer::joinExportTrie() {
+  if (!exportTrieGroup)
+    return;
+  TimeTraceScope timeScope("Join export trie");
+  exportTrieGroup.reset();
+}
 
 void Writer::finalizeLinkEditSegment() {
   joinExportTrie();
@@ -1868,7 +1878,18 @@ template <class LP> void Writer::run() {
   if (parallel::strategy.ThreadsRequested != 1) {
     in.exports->collectSymbols();
     exportTrieGroup.emplace();
-    exportTrieGroup->spawn([] { in.exports->buildTrieNodes(); });
+    exportTrieGroup->spawn([] {
+      // A scope on a thread-pool worker is dropped unless that thread has its
+      // own profiler, so give the task one.
+      bool ownProfiler =
+          config->timeTraceEnabled && !timeTraceProfilerEnabled();
+      if (ownProfiler)
+        timeTraceProfilerInitialize(config->timeTraceGranularity,
+                                    "buildExportTrie");
+      in.exports->buildTrieNodes();
+      if (ownProfiler)
+        timeTraceProfilerFinishThread();
+    });
   }
 #endif
 
@@ -1930,9 +1951,23 @@ template <class LP> void Writer::run() {
   if (parallel::strategy.ThreadsRequested != 1) {
     symtabSection->snapshotSymbols();
     prepareGroup.emplace();
-    prepareGroup->spawn([this] { symtabSection->prepare(); });
+    // A scope on a thread-pool worker is dropped unless that thread has its
+    // own profiler, so give each prepare task one.
+    auto spawnPrepare = [this](const char *name, auto body) {
+      prepareGroup->spawn([name, body] {
+        bool ownProfiler =
+            config->timeTraceEnabled && !timeTraceProfilerEnabled();
+        if (ownProfiler)
+          timeTraceProfilerInitialize(config->timeTraceGranularity, name);
+        body();
+        if (ownProfiler)
+          timeTraceProfilerFinishThread();
+      });
+    };
+    spawnPrepare("prepareSymtab", [this] { symtabSection->prepare(); });
     if (functionStartsSection)
-      prepareGroup->spawn([this] { functionStartsSection->prepare(); });
+      spawnPrepare("prepareFunctionStarts",
+                   [this] { functionStartsSection->prepare(); });
   }
 #endif
 
