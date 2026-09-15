@@ -60,6 +60,7 @@
 #include <atomic>
 #include <deque>
 #include <memory>
+#include <numeric>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -3249,6 +3250,91 @@ static void addSynthenticMethnames() {
   in.objcMethnameSection->isec->markLive(0);
 }
 
+// The relocation parse is the last large unscoped parallel region of the link,
+// and it is badly unbalanced. parallelFor() hands out contiguous chunks of
+// items/(workers*4) files in command-line order, so on the Firefox iOS client
+// the two 3.4 MB Swift objects (Metrics.o and FxNimbus.o) land in the same
+// 40-file chunk and whichever thread draws it parses alone for ~20 ms after
+// every other thread has run out of work. Hand the largest objects out one at
+// a time, largest first, and keep parallelFor()'s chunking for the long tail
+// of small objects so that a link with tens of thousands of tiny inputs does
+// not pay an atomic per file.
+//
+// parseRegularRelocations() only reads its own file and writes that file's
+// subsections, so the order is unobservable in the output.
+static void parseRegularRelocationsParallel() {
+  TimeTraceScope timeScope("Parse relocations");
+
+  std::vector<ObjFile *> objs;
+  objs.reserve(inputFiles.size());
+  for (InputFile *file : inputFiles.getArrayRef())
+    if (auto *obj = dyn_cast<ObjFile>(file);
+        obj && !obj->lazy && obj->isCompatible())
+      objs.push_back(obj);
+  if (objs.empty())
+    return;
+
+  size_t n = objs.size();
+  size_t numWorkers =
+      parallel::strategy.ThreadsRequested == 1
+          ? 1
+          : std::min(n, static_cast<size_t>(parallel::getThreadCount()));
+  if (numWorkers <= 1) {
+    for (ObjFile *obj : objs)
+      obj->parseRegularRelocations();
+    return;
+  }
+
+  // Hoist the largest objects to the front, largest first, and leave the tail
+  // in command-line order. A full size sort also fixes the imbalance, but it
+  // costs 1.7% on the Firefox desktop link at flat CPU and flat instructions:
+  // objects that were built and named together are parsed together today, and
+  // scattering the tail costs more in memory locality than the balance is
+  // worth. Only the head has to move.
+  size_t singles = std::min(n, numWorkers * 8);
+  std::vector<size_t> order(n);
+  std::iota(order.begin(), order.end(), 0);
+  std::partial_sort(order.begin(), order.begin() + singles, order.end(),
+                    [&](size_t a, size_t b) {
+                      size_t sa = objs[a]->mb.getBufferSize();
+                      size_t sb = objs[b]->mb.getBufferSize();
+                      return sa != sb ? sa > sb : a < b;
+                    });
+  std::vector<bool> hoisted(n, false);
+  std::vector<ObjFile *> ordered;
+  ordered.reserve(n);
+  for (size_t i = 0; i < singles; ++i) {
+    ordered.push_back(objs[order[i]]);
+    hoisted[order[i]] = true;
+  }
+  for (size_t i = 0; i < n; ++i)
+    if (!hoisted[i])
+      ordered.push_back(objs[i]);
+  objs.swap(ordered);
+
+  size_t chunkSize = std::max<size_t>(1, (n - singles) / (numWorkers * 4));
+  std::atomic<size_t> next{0};
+  auto worker = [&] {
+    size_t i = next.load(std::memory_order_relaxed);
+    while (i < n) {
+      size_t end = std::min(n, i + (i < singles ? size_t(1) : chunkSize));
+      // On failure the compare-exchange reloads i, so the bound is recomputed.
+      if (!next.compare_exchange_weak(i, end, std::memory_order_relaxed,
+                                      std::memory_order_relaxed))
+        continue;
+      for (; i < end; ++i)
+        objs[i]->parseRegularRelocations();
+      i = next.load(std::memory_order_relaxed);
+    }
+  };
+
+  // As in parallelFor(): one worker runs on the calling thread.
+  parallel::TaskGroup tg;
+  for (size_t i = 1; i < numWorkers; ++i)
+    tg.spawn(worker);
+  worker();
+}
+
 static void referenceStubBinder() {
   bool needsStubHelper = config->outputType == MH_DYLIB ||
                          config->outputType == MH_EXECUTE ||
@@ -4164,11 +4250,7 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
       inputFiles.insert(make<OpaqueFile>(MemoryBufferRef(), segName, sectName));
     }
 
-    parallelForEach(inputFiles.getArrayRef(), [](InputFile *file) {
-      if (auto *obj = dyn_cast<ObjFile>(file);
-          obj && !obj->lazy && obj->isCompatible())
-        obj->parseRegularRelocations();
-    });
+    parseRegularRelocationsParallel();
 
     gatherInputSections();
 
