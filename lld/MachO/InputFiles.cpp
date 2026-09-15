@@ -72,6 +72,7 @@
 #include "llvm/Support/BinaryStreamReader.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Parallel.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/StringSaver.h"
 #include "llvm/Support/SaveAndRestore.h"
@@ -2263,6 +2264,9 @@ DylibFile::DylibFile(MemoryBufferRef mb, DylibFile *umbrella,
     : InputFile(DylibKind, mb), refState(RefState::Unreferenced),
       explicitlyLinked(explicitlyLinked), isBundleLoader(isBundleLoader) {
   assert(!isBundleLoader || !umbrella);
+  // A Mach-O dylib publishes its exports inline, so a pending batch has to
+  // become visible first.
+  symtab->publishDylibBatch();
   if (umbrella == nullptr)
     umbrella = this;
   this->umbrella = umbrella;
@@ -2648,6 +2652,32 @@ void macho::prepareTapiSymbols(const InterfaceFile &interface,
       break;
     }
   }
+
+  // Pre-partition by symbol-table shard, so that the batched publication walks
+  // one shard's names without re-hashing or scanning the other 63/64ths.
+  if (prepared.normalNames.empty())
+    return;
+  constexpr unsigned numShards = SymbolTable::numDylibShards;
+  prepared.shardStart.assign(numShards + 1, 0);
+  for (const PreparedTapiName &name : prepared.normalNames)
+    ++prepared.shardStart[SymbolTable::shardOfName(name.name) + 1];
+  for (unsigned s = 0; s != numShards; ++s)
+    prepared.shardStart[s + 1] += prepared.shardStart[s];
+  SmallVector<uint32_t, 64> cursor(prepared.shardStart.begin(),
+                                   prepared.shardStart.end() - 1);
+  prepared.shardOrder.resize(prepared.normalNames.size());
+  for (uint32_t i = 0, e = prepared.normalNames.size(); i != e; ++i)
+    prepared.shardOrder[cursor[SymbolTable::shardOfName(
+        prepared.normalNames[i].name)]++] = i;
+}
+
+// Whether a prepared TAPI file's names go to the driver-owned batch instead of
+// being inserted here. At one thread there is no batch at all: the inline path
+// costs nothing extra and skips the sequence bookkeeping. While the input fold
+// runs, records carry ordinals instead.
+static bool isBatchingDylibNames() {
+  return inAutolinkRound && llvm::parallel::strategy.ThreadsRequested != 1 &&
+         !symtab->isFolding();
 }
 
 DylibFile::DylibFile(const InterfaceFile &interface, DylibFile *umbrella,
@@ -2716,6 +2746,13 @@ DylibFile::DylibFile(const InterfaceFile &interface, DylibFile *umbrella,
     // $ld$hide is the only thing that fills hiddenSymbols, and it has run by
     // now, so an empty set stays empty for the rest of this loop.
     const bool anyHidden = !exportingFile->hiddenSymbols.empty();
+    if (isBatchingDylibNames()) {
+      // Hand the name loop to the driver-owned batch; it is replayed across the
+      // shards at the next run boundary, in this file's rank order.
+      symbols.assign(preparedSymbols->normalNames.size(), nullptr);
+      symtab->deferDylibNames(this, exportingFile, preparedSymbols, anyHidden);
+      return;
+    }
     symbols.reserve(preparedSymbols->normalNames.size());
     for (const PreparedTapiName &prepared : preparedSymbols->normalNames) {
       if (anyHidden && exportingFile->hiddenSymbols.contains(prepared.name))
@@ -2725,6 +2762,10 @@ DylibFile::DylibFile(const InterfaceFile &interface, DylibFile *umbrella,
     }
     return;
   }
+
+  // The rest of this constructor publishes inline, so a pending batch has to
+  // become visible first.
+  symtab->publishDylibBatch();
 
   std::vector<const llvm::MachO::Symbol *> ownedNormalSymbols;
   ownedNormalSymbols.reserve(interface.symbolsCount());
@@ -2867,9 +2908,14 @@ void DylibFile::applyPreparedLDSymbol(const PreparedLDSymbol &record) {
       auto *dylib = getSyntheticDylib(
           record.installName, newCurrentVersionForSymbol,
           newCompatibilityVersion);
-      dylib->symbols.push_back(
-          symtab->addDylib(saver().save(record.symbolName), dylib,
-                           /*isWeakDef=*/false, /*isTlv=*/false));
+      StringRef savedName = saver().save(record.symbolName);
+      if (isBatchingDylibNames()) {
+        symtab->deferDylibSymbol(CachedHashStringRef(savedName), dylib);
+        return;
+      }
+      dylib->symbols.push_back(symtab->addDylib(savedName, dylib,
+                                                /*isWeakDef=*/false,
+                                                /*isTlv=*/false));
       return;
     }
 
@@ -2882,6 +2928,10 @@ void DylibFile::applyPreparedLDSymbol(const PreparedLDSymbol &record) {
     this->installName = saver().save(record.installName);
     return;
   case PreparedLDAction::Hide:
+    // Every pending record was produced before this hide, and the replay reads
+    // hiddenSymbols as it inserts, so the batch has to be published first for
+    // those names to see the set the serial linker showed them.
+    symtab->publishDylibBatch();
     exportingFile->hiddenSymbols.insert(record.hiddenName);
     return;
   }

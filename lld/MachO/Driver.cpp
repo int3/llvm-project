@@ -2035,7 +2035,11 @@ void macho::parseLCLinkerOption(
   LCLinkerOptions.append(argv);
 }
 
+bool macho::inAutolinkRound = false;
+
 void macho::resolveLCLinkerOptions() {
+  inAutolinkRound = true;
+  llvm::scope_exit roundsDone([] { inAutolinkRound = false; });
   while (!unprocessedLCLinkerOptions.empty()) {
     SmallVector<StringRef> LCLinkerOptions(unprocessedLCLinkerOptions);
     unprocessedLCLinkerOptions.clear();
@@ -2085,6 +2089,13 @@ void macho::resolveLCLinkerOptions() {
       if (loadedObjectFrameworks.contains(file.path))
         continue;
 
+      // A dylib run's names may stay batched across other dylibs of the run,
+      // because nothing between two of them reads the table. Anything else --
+      // the libswiftCompatibility archives here -- resolves against the state
+      // the serial linker had at its position, so the run ends first.
+      if (identify_magic(file.buffer.getBuffer()) != file_magic::tapi_file)
+        flushAutolinkBatch();
+
       auto inputFile = processFile(file.buffer, nullptr, file.path,
                                    file.loadType, file.isLazy, file.isExplicit,
                                    /*isBundleLoader=*/false, file.isHidden);
@@ -2092,8 +2103,10 @@ void macho::resolveLCLinkerOptions() {
                          file.isReexport);
       checkAndCacheFramework(inputFile, file.path);
     }
+    flushAutolinkBatch();
     clearPreparedTapiFiles();
   }
+  flushAutolinkBatch();
 }
 
 static void addFileList(StringRef path, bool isLazy,

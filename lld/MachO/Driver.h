@@ -103,6 +103,15 @@ void setPreparedTapiFiles(
     llvm::ArrayRef<PreparedTapiFile *> preparedTapiFiles);
 void clearPreparedTapiFiles();
 
+// True only while resolveLCLinkerOptions() is loading one round's inputs. The
+// batched dylib publication is scoped to that: it is the only place where a
+// dylib run is bounded by a flush on both sides.
+extern bool inAutolinkRound;
+
+// Publishes the pending dylib batch and tears down the interfaces retired since
+// the previous flush, which is the run boundary the batched publication needs.
+void flushAutolinkBatch();
+
 // Pipelined TAPI preparation: TBD parses started before the ordered input walk
 // and overlapped with it. Preparation is speculative; the ordered walk still
 // reads, diagnoses and publishes every input exactly as before.

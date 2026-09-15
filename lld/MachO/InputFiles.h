@@ -28,6 +28,7 @@
 #include "llvm/Support/Threading.h"
 #include "llvm/TextAPI/TextAPIReader.h"
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -404,7 +405,14 @@ public:
 
   void parseLoadCommands(MemoryBufferRef mb);
   void parseReexports(const llvm::MachO::InterfaceFile &interface);
-  bool isReferenced() const { return numReferencedSymbols > 0; }
+  bool isReferenced() const {
+    return numReferencedSymbols.load(std::memory_order_relaxed) > 0;
+  }
+  // Read by the batched publication from several shards at once; $ld$hide
+  // inserts only on the ordered thread, with any pending batch flushed first.
+  bool isHiddenSymbol(llvm::CachedHashStringRef name) const {
+    return hiddenSymbols.contains(name);
+  }
   bool isExplicitlyLinked() const;
   void setExplicitlyLinked() { explicitlyLinked = true; }
 
@@ -418,7 +426,9 @@ public:
   uint32_t compatibilityVersion = 0;
   uint32_t currentVersion = 0;
   int64_t ordinal = 0; // Ordinal numbering starts from 1, so 0 is a sentinel
-  unsigned numReferencedSymbols = 0;
+  // The batched dylib publication constructs DylibSymbols for one file from
+  // several shards at once, and the count is only read after the join.
+  std::atomic<unsigned> numReferencedSymbols{0};
   RefState refState;
   bool reexport = false;
   bool forceNeeded = false;

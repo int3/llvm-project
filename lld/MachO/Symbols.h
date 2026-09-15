@@ -288,7 +288,7 @@ public:
       : Symbol(DylibKind, name, file), shouldReexport(false),
         refState(refState), weakDef(isWeakDef), tlv(isTlv) {
     if (file && refState > RefState::Unreferenced)
-      file->numReferencedSymbols++;
+      file->numReferencedSymbols.fetch_add(1, std::memory_order_relaxed);
   }
 
   uint64_t getVA() const;
@@ -319,15 +319,16 @@ public:
   void reference(RefState newState) {
     assert(newState > RefState::Unreferenced);
     if (refState == RefState::Unreferenced && file)
-      getFile()->numReferencedSymbols++;
+      getFile()->numReferencedSymbols.fetch_add(1, std::memory_order_relaxed);
     refState = std::max(refState, newState);
   }
 
   void unreference() {
     // dynamic_lookup symbols have no file.
     if (refState > RefState::Unreferenced && file) {
-      assert(getFile()->numReferencedSymbols > 0);
-      getFile()->numReferencedSymbols--;
+      assert(getFile()->numReferencedSymbols.load(std::memory_order_relaxed) >
+             0);
+      getFile()->numReferencedSymbols.fetch_sub(1, std::memory_order_relaxed);
     }
   }
 

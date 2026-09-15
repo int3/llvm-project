@@ -9,6 +9,7 @@
 #include "Config.h"
 #include "Driver.h"
 #include "InputFiles.h"
+#include "SymbolTable.h"
 #include "TapiSymbols.h"
 
 #include "lld/Common/Args.h"
@@ -283,6 +284,33 @@ void macho::setPreparedTapiFiles(
 }
 
 void macho::clearPreparedTapiFiles() { ::preparedTapiFiles.clear(); }
+
+namespace {
+// A parsed interface whose DylibFile has been constructed, kept alive until the
+// batch that refers to its prepared symbols has been published.
+struct RetiredTapiFile {
+  std::unique_ptr<llvm::MachO::InterfaceFile> interfaceFile;
+  std::unique_ptr<PreparedTapiFile> owner;
+};
+} // namespace
+
+static std::vector<RetiredTapiFile> tapiGraveyard;
+
+void macho::flushAutolinkBatch() {
+  symtab->publishDylibBatch();
+  if (tapiGraveyard.empty())
+    return;
+  std::vector<RetiredTapiFile> dead;
+  dead.swap(tapiGraveyard);
+  // ~InterfaceFile is ~6 ms of DenseMap and allocator teardown per autolink
+  // round on a large closure, on the ordered thread with the workers idle. The
+  // files are independent, so it goes to the workers instead. RSS is unchanged:
+  // the memory is still released at this point in the link.
+  llvm::parallelForEach(dead, [](RetiredTapiFile &file) {
+    file.interfaceFile.reset();
+    file.owner.reset();
+  });
+}
 
 //===----------------------------------------------------------------------===//
 // Pipelined TAPI preparation
@@ -682,6 +710,12 @@ DylibFile *macho::loadDylib(MemoryBufferRef mbref, DylibFile *umbrella,
     newFile = file;
     if (newFile->exportingFile)
       newFile->parseReexports(*interfaceFile);
+    // The batch refers to prepared->normalNames until the next run boundary, so
+    // the interface outlives this scope when the names were deferred.
+    if (preparedSymbols && inAutolinkRound &&
+        llvm::parallel::strategy.ThreadsRequested != 1)
+      tapiGraveyard.push_back(
+          {std::move(interfaceFile), std::move(preparedOwner)});
   } else {
     assert(magic == file_magic::macho_dynamically_linked_shared_lib ||
            magic == file_magic::macho_dynamically_linked_shared_lib_stub ||
@@ -724,6 +758,7 @@ DylibFile *macho::loadDylib(MemoryBufferRef mbref, DylibFile *umbrella,
 
 void macho::resetLoadedDylibs() {
   loadedDylibs.clear();
+  tapiGraveyard.clear();
   preparedTapiFiles.clear();
   finishTapiPipeline();
 }

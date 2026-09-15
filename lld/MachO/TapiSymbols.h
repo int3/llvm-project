@@ -97,6 +97,13 @@ struct PreparedTapiSymbols {
   // final names, ordered by interface symbol name (interface symbol order is
   // non-deterministic) and then by the order the names are derived in.
   std::vector<PreparedTapiName> normalNames;
+  // normalNames pre-partitioned by symbol-table shard for the batched
+  // publication: shardOrder[shardStart[s] .. shardStart[s + 1]) are the indices
+  // of the names routed to shard s, in normalNames order. Computed here so that
+  // the publish step neither re-hashes nor re-scans. Empty when there are no
+  // normal names.
+  std::vector<uint32_t> shardStart;
+  std::vector<uint32_t> shardOrder;
 };
 
 } // namespace lld::macho

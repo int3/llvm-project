@@ -32,6 +32,7 @@ class MachHeaderSection;
 class Symbol;
 class Defined;
 class Undefined;
+struct PreparedTapiSymbols;
 
 /*
  * Note that the SymbolTable handles name collisions by calling
@@ -76,6 +77,34 @@ public:
                         bool referencedDynamically);
 
   ArrayRef<Symbol *> getSymbols() const { return symVector; }
+
+  // The shard a name is routed to. Public so that a worker preparing a TAPI
+  // file can partition its names before the ordered walk reaches it.
+  static constexpr unsigned numDylibShards = 64;
+  static unsigned shardOfName(llvm::CachedHashStringRef name) {
+    return (name.hash() >> 25) & (numDylibShards - 1);
+  }
+
+  // --- Batched dylib publication -------------------------------------------
+  //
+  // A prepared TAPI file's names are final names with hashes in the ordered
+  // constructor's exact order, and addDylib()'s outcome for a name depends only
+  // on that name's slot and on the sequence of records for that name. So an
+  // autolink run's name loops can be collected as ranked records and replayed
+  // one thread per shard, without locks, at the run's boundary. The ordered
+  // thread keeps everything else: diagnostics, -t, inputFiles order, the
+  // re-export recursion and the synthetic-dylib bookkeeping.
+  //
+  // deferDylibNames() takes one prepared file's whole name loop;
+  // deferDylibSymbol() takes a single $ld$previous name, which inserts at the
+  // constructor's position and so needs its own record. A record's rank is its
+  // position in the batch, which is that serial position.
+  void deferDylibNames(DylibFile *file, DylibFile *exportingFile,
+                       PreparedTapiSymbols *prepared, bool anyHidden);
+  void deferDylibSymbol(llvm::CachedHashStringRef name, DylibFile *owner);
+  // Replays the batch and appends the slots it created to symVector in rank
+  // order. Must run before anything else reads or writes the table.
+  void publishDylibBatch();
   Symbol *find(llvm::CachedHashStringRef name);
   Symbol *find(StringRef name) { return find(llvm::CachedHashStringRef(name)); }
 
@@ -158,7 +187,7 @@ private:
     return *(reinterpret_cast<SlotMeta *>(sym) - 1);
   }
 
-  static constexpr unsigned numShards = 64;
+  static constexpr unsigned numShards = numDylibShards;
   // The shards are lock domains only. Slots are not allocated from them: a slot
   // drawn from a per-shard arena would put consecutive symbols in 64 different
   // places, and every later phase walks symVector or chases Symbol* out of a
@@ -167,9 +196,13 @@ private:
     llvm::DenseMap<llvm::CachedHashStringRef, Symbol *> map;
     std::vector<Symbol *> created;
     std::mutex mu;
+    // Slots created while a dylib batch is published. One thread owns a shard
+    // for the duration, so the arena needs no lock, and a shard's slots stay
+    // contiguous in the order that shard created them.
+    llvm::BumpPtrAllocator arena;
   };
   static unsigned shardOf(llvm::CachedHashStringRef name) {
-    return (name.hash() >> 25) & (numShards - 1);
+    return shardOfName(name);
   }
   Symbol *allocateSlot();
   // The fold's per-slot header is only paid for slots that exist while the fold
@@ -195,6 +228,29 @@ private:
   bool sharded = false;
   // True only while workers may be folding records.
   bool folding = false;
+
+  // One deferred dylib publication: either a prepared file's whole name loop,
+  // or a single $ld$previous name added to a synthetic dylib.
+  struct DylibBatchRecord {
+    // The file whose symbols[] the created slots are written back into; null
+    // for a $ld$previous record.
+    DylibFile *file = nullptr;
+    // The dylib the names are published for (the umbrella, or the synthetic
+    // dylib of a $ld$previous record).
+    DylibFile *exportingFile = nullptr;
+    PreparedTapiSymbols *prepared = nullptr;
+    llvm::CachedHashStringRef name{llvm::StringRef()};
+    Symbol *result = nullptr;
+    // Publication sequence of this record's first name. base + index increases
+    // exactly as the ordered constructor's insert order did.
+    uint32_t base = 0;
+    bool anyHidden = false;
+  };
+  std::vector<DylibBatchRecord> dylibBatch;
+  // True only while publishDylibBatch()'s per-shard walk runs.
+  bool publishing = false;
+  Symbol *addDylibImpl(llvm::CachedHashStringRef name, DylibFile *file,
+                       bool isWeakDef, bool isTlv, bool *wasInsertedOut);
 };
 
 void reportPendingUndefinedSymbols();

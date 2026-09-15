@@ -13,6 +13,7 @@
 #include "InputSection.h"
 #include "Symbols.h"
 #include "SyntheticSections.h"
+#include "TapiSymbols.h"
 #include "lld/Common/ErrorHandler.h"
 #include "lld/Common/Memory.h"
 #include "llvm/Demangle/Demangle.h"
@@ -122,7 +123,16 @@ std::pair<Symbol *, bool> SymbolTable::insert(CachedHashStringRef cachedName,
     Shard &shard = shards[shardOf(cachedName)];
     auto [it, wasInserted] = shard.map.try_emplace(cachedName, nullptr);
     if (wasInserted) {
-      Symbol *sym = allocateSlot();
+      Symbol *sym;
+      if (publishing) {
+        // symVector's entry is appended by publishDylibBatch() once the whole
+        // batch's creation order is known, so nothing is pushed here.
+        sym = reinterpret_cast<Symbol *>(
+            shard.arena.Allocate(sizeof(SymbolUnion), alignof(SymbolUnion)));
+        it->second = sym;
+        return {sym, true};
+      }
+      sym = allocateSlot();
       it->second = sym;
       if (folding) {
         RecordOrdinal ord =
@@ -833,8 +843,16 @@ Symbol *SymbolTable::addDylib(StringRef name, DylibFile *file, bool isWeakDef,
 
 Symbol *SymbolTable::addDylib(CachedHashStringRef cachedName, DylibFile *file,
                               bool isWeakDef, bool isTlv) {
+  return addDylibImpl(cachedName, file, isWeakDef, isTlv, nullptr);
+}
+
+Symbol *SymbolTable::addDylibImpl(CachedHashStringRef cachedName,
+                                  DylibFile *file, bool isWeakDef, bool isTlv,
+                                  bool *wasInsertedOut) {
   StringRef name = cachedName.val();
   auto [s, wasInserted] = insert(cachedName, file);
+  if (wasInsertedOut)
+    *wasInsertedOut = wasInserted;
 
   RefState refState = RefState::Unreferenced;
   if (!wasInserted) {
@@ -862,6 +880,90 @@ Symbol *SymbolTable::addDylib(CachedHashStringRef cachedName, DylibFile *file,
   }
 
   return s;
+}
+
+void SymbolTable::deferDylibNames(DylibFile *file, DylibFile *exportingFile,
+                                  PreparedTapiSymbols *prepared,
+                                  bool anyHidden) {
+  if (prepared->normalNames.empty())
+    return;
+  assert(prepared->shardStart.size() == numShards + 1);
+  DylibBatchRecord rec;
+  rec.file = file;
+  rec.exportingFile = exportingFile;
+  rec.prepared = prepared;
+  rec.anyHidden = anyHidden;
+  dylibBatch.push_back(rec);
+}
+
+void SymbolTable::deferDylibSymbol(CachedHashStringRef name, DylibFile *owner) {
+  DylibBatchRecord rec;
+  rec.exportingFile = owner;
+  rec.name = name;
+  dylibBatch.push_back(rec);
+}
+
+void SymbolTable::publishDylibBatch() {
+  if (dylibBatch.empty())
+    return;
+  assert(!folding && !publishing);
+
+  uint32_t total = 0;
+  for (DylibBatchRecord &rec : dylibBatch) {
+    rec.base = total;
+    total += rec.prepared ? rec.prepared->normalNames.size() : 1;
+  }
+  // Indexed by publication sequence, so that the slots a shard creates land in
+  // the order the serial linker would have created them without a sort: the
+  // creating record for a name is the same one either way, because the
+  // per-shard walk sees that name's records in global rank order.
+  std::vector<Symbol *> createdBySeq(total, nullptr);
+
+  publishing = true;
+  parallelFor(0, numShards, [&](size_t s) {
+    for (DylibBatchRecord &rec : dylibBatch) {
+      if (!rec.prepared) {
+        if (shardOf(rec.name) != s)
+          continue;
+        bool wasInserted = false;
+        rec.result = addDylibImpl(rec.name, rec.exportingFile,
+                                  /*isWeakDef=*/false, /*isTlv=*/false,
+                                  &wasInserted);
+        if (wasInserted)
+          createdBySeq[rec.base] = rec.result;
+        continue;
+      }
+      const PreparedTapiSymbols &prep = *rec.prepared;
+      for (uint32_t k = prep.shardStart[s], e = prep.shardStart[s + 1]; k != e;
+           ++k) {
+        uint32_t j = prep.shardOrder[k];
+        const PreparedTapiName &prepName = prep.normalNames[j];
+        if (rec.anyHidden && rec.exportingFile->isHiddenSymbol(prepName.name))
+          continue;
+        bool wasInserted = false;
+        Symbol *sym =
+            addDylibImpl(prepName.name, rec.exportingFile, prepName.isWeakDef,
+                         prepName.isTlv, &wasInserted);
+        rec.file->symbols[j] = sym;
+        if (wasInserted)
+          createdBySeq[rec.base + j] = sym;
+      }
+    }
+  });
+  publishing = false;
+
+  symVector.reserve(symVector.size() + total);
+  for (Symbol *sym : createdBySeq)
+    if (sym)
+      symVector.push_back(sym);
+
+  // $ld$previous adds its symbol to the synthetic dylib's own vector, in the
+  // ordered constructor's position.
+  for (DylibBatchRecord &rec : dylibBatch)
+    if (!rec.prepared && rec.result)
+      rec.exportingFile->symbols.push_back(rec.result);
+
+  dylibBatch.clear();
 }
 
 Symbol *SymbolTable::addDynamicLookup(StringRef name) {
