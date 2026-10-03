@@ -58,6 +58,7 @@
 #include "llvm/TextAPI/PackedVersion.h"
 
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <memory>
 #include <numeric>
@@ -716,6 +717,16 @@ struct ParallelInputPhase {
   // is waiting.
   std::unique_ptr<llvm::parallel::TaskGroup> memberParses;
   llvm::parallel::TaskGroup *memberParseGroup = nullptr;
+  // Holds the held object files' parses, which are spawned in chunks behind the
+  // argument walk instead of all at once at its end. Created by
+  // startParallelInput() and joined by finishParallelInput(), or by the cleanup
+  // callback for a link that leaves the walk through a fatal(). `streamedObjects`
+  // is how many of `objects` have been spawned.
+  std::unique_ptr<llvm::parallel::TaskGroup> heldParse;
+  size_t streamedObjects = 0;
+  // Held objects already parsed when an inline dylib drained the streamed
+  // parse (drainStreamedHeldParse()); the rest are parsed at the phase's end.
+  size_t drainedObjects = 0;
   // Adopted members not yet parsed. Read by the select loop, decremented by the
   // tasks; it outlives walkArchives()'s frame for the fatal() case above.
   std::atomic<int> memberParsesInFlight{0};
@@ -791,6 +802,104 @@ static ArchiveProvider *lookupArchiveProvider(llvm::CachedHashStringRef name) {
   return it == map.end() ? nullptr : &it->second;
 }
 
+static bool reverseHeldParseOrder();
+
+// Test hooks for the streamed held parse. LLD_NO_STREAM_HELD_PARSE parses the
+// held objects all at once at the end of the phase, as before streaming, so a
+// link can be compared against itself both ways. LLD_HELD_PARSE_CHUNK sets the
+// chunk size, so that a small test streams at all, and LLD_HELD_PARSE_DELAY_US
+// sleeps before each held parse, so that the main thread's dylib publication
+// runs while the folds are still in flight.
+static bool streamHeldParse() {
+  static bool value = !reverseHeldParseOrder() &&
+                      ::getenv("LLD_NO_STREAM_HELD_PARSE") == nullptr;
+  return value;
+}
+
+static size_t heldParseChunk() {
+  static size_t value = [] {
+    unsigned n = 0;
+    if (const char *v = ::getenv("LLD_HELD_PARSE_CHUNK"))
+      if (llvm::to_integer(v, n) && n != 0)
+        return static_cast<size_t>(n);
+    // Chunks rather than one task per object: a spawn per object was measurably
+    // dearer in condition-variable traffic (S5), and 32 gives Chromium's 11,000
+    // objects about 360 tasks.
+    return static_cast<size_t>(32);
+  }();
+  return value;
+}
+
+static unsigned heldParseDelayUs() {
+  static unsigned value = [] {
+    unsigned n = 0;
+    if (const char *v = ::getenv("LLD_HELD_PARSE_DELAY_US"))
+      llvm::to_integer(v, n);
+    return n;
+  }();
+  return value;
+}
+
+static void parseHeldObject(ObjFile *obj) {
+  deferredDiagnostics = &obj->parseCtx->diags;
+  obj->parseFile();
+  deferredDiagnostics = nullptr;
+}
+
+// Spawn the held objects that have not been spawned yet as one task.
+static void spawnHeldParseChunk() {
+  auto &objects = parallelInput.objects;
+  size_t begin = parallelInput.streamedObjects, end = objects.size();
+  if (begin == end)
+    return;
+  SmallVector<ObjFile *, 32> chunk;
+  chunk.reserve(end - begin);
+  for (size_t i = begin; i != end; ++i)
+    chunk.push_back(objects[i].first);
+  parallelInput.streamedObjects = end;
+  // From the first spawn on, the main thread's inserts can meet a fold in the
+  // same shard, and its allocations go to its own arenas. Before it nothing is
+  // concurrent, so a walk that holds no object pays nothing.
+  if (begin == 0) {
+    symtab->setHeldParseLive(true);
+    parallelParseActive = true;
+  }
+  parallelInput.heldParse->spawn([chunk = std::move(chunk)] {
+    unsigned delay = heldParseDelayUs();
+    for (ObjFile *obj : chunk) {
+      if (delay)
+        std::this_thread::sleep_for(std::chrono::microseconds(delay));
+      parseHeldObject(obj);
+    }
+  });
+}
+
+// Wait for every streamed held parse and take the symbol table out of its
+// locked mode. Called at the end of the phase, and again from the driver's
+// cleanup callback for the link that left the walk through a fatal(): the tasks
+// write the symbol table and read the object buffers that the callback is about
+// to release.
+static void joinHeldParse() {
+  if (!parallelInput.heldParse)
+    return;
+  parallelInput.heldParse.reset(); // The destructor waits for the tasks.
+  parallelInput.streamedObjects = 0;
+  symtab->setHeldParseLive(false);
+  parallelParseActive = false;
+}
+
+// See Driver.h. Only an input that cannot defer its dylib names gets here (a
+// TBD the pipeline did not prepare); every corpus defers them all.
+void macho::drainStreamedHeldParse() {
+  if (!parallelInput.heldParse)
+    return;
+  TimeTraceScope timeScope("Drain streamed held parse");
+  spawnHeldParseChunk();
+  joinHeldParse();
+  parallelInput.drainedObjects = parallelInput.objects.size();
+  flushAutolinkBatch();
+}
+
 static void startParallelInput() {
 #if LLVM_ENABLE_THREADS
   // Check ThreadsRequested rather than getThreadCount(), which would create an
@@ -799,6 +908,19 @@ static void startParallelInput() {
     return;
   parallelInput.active = true;
   symtab->beginParallelInput();
+  // The held objects are parsed on workers while the main thread is still
+  // walking the command line, in chunks spawned from endHeldInput(), instead of
+  // all at once when the phase ends. Nothing the walk decides reads a held
+  // parse's result, and the fold is already order-independent (it runs in
+  // arbitrary worker order, and LLD_REVERSE_HELD_PARSE tests the reverse), so
+  // this changes when the parses run, never what they produce. What it adds is
+  // concurrency with the walk's own symbol table inserts, which take the shard
+  // lock while the parse is live (SymbolTable::addDylibImpl), and with the walk's
+  // allocations, which go to the main thread's own arenas from the first spawn.
+  if (streamHeldParse()) {
+    parallelInput.heldParse = std::make_unique<llvm::parallel::TaskGroup>();
+    parallelInput.streamedObjects = 0;
+  }
 #endif
 }
 
@@ -971,11 +1093,7 @@ static void parseHeldFiles(size_t begin) {
   if (reverseHeldParseOrder())
     std::reverse(order.begin(), order.end());
   parallelParseActive = true;
-  parallelForEach(order, [](ObjFile *obj) {
-    deferredDiagnostics = &obj->parseCtx->diags;
-    obj->parseFile();
-    deferredDiagnostics = nullptr;
-  });
+  parallelForEach(order, parseHeldObject);
   parallelParseActive = false;
 }
 
@@ -1553,6 +1671,10 @@ static void resetParallelInputPhase() {
   parallelInput.archiveOrdinals.clear();
   parallelInput.nextOrdinal = 0;
   parallelInput.heldLinkerOptions = false;
+  // Already joined at the end of the phase; this is for the link that never
+  // reached one.
+  joinHeldParse();
+  parallelInput.drainedObjects = 0;
   // Already joined at the end of the phase; the reset() is for the link that
   // never reached one, and its destructor still waits.
   parallelInput.prepass.reset();
@@ -1624,7 +1746,21 @@ static void finishParallelInput(bool moreInputsFollow = false) {
   }
   {
     TimeTraceScope timeScope("Parse held object files");
-    parseHeldFiles(0);
+    if (parallelInput.heldParse) {
+      // Most of the held objects were spawned behind the argument walk; what is
+      // left is the last partial chunk and the tail of the running ones.
+      spawnHeldParseChunk();
+      joinHeldParse();
+    } else {
+      parseHeldFiles(parallelInput.drainedObjects);
+    }
+  }
+  // The dylib names deferred while the parse streamed, now that every held
+  // object has folded, which is the serial order. The walk below still sees
+  // every command-line dylib published, as it did when they went in inline.
+  {
+    TimeTraceScope timeScope("Publish command-line dylib names");
+    flushAutolinkBatch();
   }
 
   // The same rule as for extracted members, for the direct objects: an
@@ -1851,6 +1987,10 @@ static void endHeldInput(InputFile *file, bool holdParse, bool holdArchiveIndex,
     obj->parseCtx = ctx;
     obj->deferUnwindRegistration = true;
     parallelInput.objects.emplace_back(obj, ctx->top);
+    if (parallelInput.heldParse &&
+        parallelInput.objects.size() - parallelInput.streamedObjects >=
+            heldParseChunk())
+      spawnHeldParseChunk();
     return;
   }
   if (!holdArchiveIndex)
@@ -3499,6 +3639,9 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     // else here frees what they read; the prepass is pure, so abandoning what
     // has not started costs only the work already spent.
     joinArchivePrepass(/*willWalk=*/false);
+    // And for the held object parses streamed behind the argument walk, which
+    // write the symbol table and read the object buffers.
+    joinHeldParse();
     // Same hazard for the streamed member parses, which are not pure: they are
     // writing the symbol table and reading the archive buffers this callback is
     // about to release. A fatal() on the main thread inside the select loop --

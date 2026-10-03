@@ -95,6 +95,8 @@ struct PreparedTapiFile {
   // Pipelined entries are published by a worker thread; guarded by the
   // pipeline mutex. Entries prepared up front are already done.
   bool done = true;
+  // A pipelined entry's sequence number in TapiPipelineState::started.
+  uint64_t seq = 0;
   // A pipelined entry owns the path and the buffer it was read from, because
   // it is created outside the ordered walk.
   std::string pathStorage;
@@ -115,6 +117,11 @@ extern bool inAutolinkRound;
 // Publishes the pending dylib batch and tears down the interfaces retired since
 // the previous flush, which is the run boundary the batched publication needs.
 void flushAutolinkBatch();
+
+// Joins the held object parse streaming behind the input walk, publishes the
+// dylib names batched while it ran, and parses the rest of the phase's held
+// objects at its end instead. For an input that has to publish inline.
+void drainStreamedHeldParse();
 
 // Pipelined TAPI preparation: TBD parses started before the ordered input walk
 // and overlapped with it. Preparation is speculative; the ordered walk still

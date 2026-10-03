@@ -17,6 +17,7 @@
 #include "lld/Common/Reproduce.h"
 #include "llvm/ADT/CachedHashString.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/BinaryFormat/Magic.h"
 #include "llvm/LTO/LTO.h"
@@ -27,6 +28,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/TimeProfiler.h"
 #include "llvm/TextAPI/InterfaceFile.h"
 #include "llvm/TextAPI/TextAPIReader.h"
 #include <condition_variable>
@@ -332,6 +334,15 @@ struct TapiPipelineState {
   llvm::DenseMap<CachedHashStringRef, std::unique_ptr<PreparedTapiFile>> files;
   std::mutex mutex;
   std::condition_variable cv;
+  // Entries whose preparation has begun, by sequence number, so that the main
+  // thread can claim one that no worker has started and prepare it itself. The
+  // executor runs the newest task first, so a TBD spawned before the argument
+  // walk can sit under every task spawned during it -- the streamed held object
+  // parses, the archive prepass -- and the walk would wait for all of them when
+  // it reaches that TBD. A number rather than the entry's address: the claiming
+  // side frees the entry while the unstarted task may still be queued.
+  llvm::DenseSet<uint64_t> started;
+  uint64_t nextSeq = 0;
   // Declared last so that it is destroyed first: the group joins its workers
   // while the state they use is still alive.
   llvm::parallel::TaskGroup group;
@@ -380,10 +391,10 @@ bool macho::memoizedExists(const Twine &pathTwine) {
 static std::unique_ptr<TapiPipelineState> tapiPipeline;
 
 static void runTapiPipelineTask(TapiPipelineState *state,
-                                PreparedTapiFile *file);
+                                PreparedTapiFile *file, uint64_t seq);
 
-// Registers one already-read TBD. Returns null when the path is already
-// pipelined. \p ownPath copies the path, for callers whose path is transient.
+// Registers one already-read TBD and spawns its preparation. Returns null when
+// the path is already pipelined. \p ownPath copies the path, for callers whose path is transient.
 static PreparedTapiFile *addPipelinedTapiFile(TapiPipelineState *state,
                                               StringRef path, StringRef content,
                                               std::unique_ptr<MemoryBuffer> owned,
@@ -399,10 +410,19 @@ static PreparedTapiFile *addPipelinedTapiFile(TapiPipelineState *state,
   entry->done = false;
   PreparedTapiFile *file = entry.get();
 
-  std::lock_guard<std::mutex> lock(state->mutex);
-  if (!state->files.try_emplace(CachedHashStringRef(path), std::move(entry))
-           .second)
-    return nullptr;
+  uint64_t seq;
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (!state->files.try_emplace(CachedHashStringRef(path), std::move(entry))
+             .second)
+      return nullptr;
+    seq = state->nextSeq++;
+    file->seq = seq;
+  }
+  // Spawned here, with the sequence number taken under the lock: once the entry
+  // is in the map the main thread may claim, prepare and free it at any time.
+  state->group.spawn(
+      [state, file, seq] { runTapiPipelineTask(state, file, seq); });
   return file;
 }
 
@@ -493,15 +513,19 @@ static void pipelineReexports(TapiPipelineState *state,
     if (identify_magic(mbref.getBuffer()) != file_magic::tapi_file)
       continue;
     StringRef content = mbref.getBuffer();
-    if (PreparedTapiFile *child =
-            addPipelinedTapiFile(state, resolved, content,
-                                 std::move(*mbOrErr), /*ownPath=*/true))
-      state->group.spawn([state, child] { runTapiPipelineTask(state, child); });
+    addPipelinedTapiFile(state, resolved, content, std::move(*mbOrErr),
+                         /*ownPath=*/true);
   }
 }
 
 static void runTapiPipelineTask(TapiPipelineState *state,
-                                PreparedTapiFile *file) {
+                                PreparedTapiFile *file, uint64_t seq) {
+  {
+    // Claimed by the main thread, which has prepared it and may have freed it.
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (!state->started.insert(seq).second)
+      return;
+  }
   prepareTapiFile(file);
   if (file->interfaceFile)
     pipelineReexports(state, *file->interfaceFile);
@@ -521,10 +545,8 @@ void macho::startTapiPipeline() {
 void macho::pipelineTapiFile(MemoryBufferRef buffer) {
   TapiPipelineState *state = tapiPipeline.get();
   assert(state);
-  if (PreparedTapiFile *file = addPipelinedTapiFile(
-          state, buffer.getBufferIdentifier(), buffer.getBuffer(),
-          /*owned=*/nullptr, /*ownPath=*/false))
-    state->group.spawn([state, file] { runTapiPipelineTask(state, file); });
+  addPipelinedTapiFile(state, buffer.getBufferIdentifier(), buffer.getBuffer(),
+                       /*owned=*/nullptr, /*ownPath=*/false);
 }
 
 static bool isPipelinedTapiPath(CachedHashStringRef path) {
@@ -624,10 +646,8 @@ void macho::pipelineAutolinkName(StringRef name, bool isFramework) {
   if (identify_magic(mbref.getBuffer()) != file_magic::tapi_file)
     return;
   StringRef content = mbref.getBuffer();
-  if (PreparedTapiFile *file =
-          addPipelinedTapiFile(state, resolved, content, std::move(*mbOrErr),
-                               /*ownPath=*/true))
-    state->group.spawn([state, file] { runTapiPipelineTask(state, file); });
+  addPipelinedTapiFile(state, resolved, content, std::move(*mbOrErr),
+                       /*ownPath=*/true);
 }
 
 void macho::finishTapiPipeline() {
@@ -653,7 +673,22 @@ takePreparedTapiFile(CachedHashStringRef path,
       // The entry itself is stable, because only this function removes one and
       // unique_ptr keeps its address fixed.
       PreparedTapiFile *file = it->second.get();
-      state->cv.wait(lock, [file] { return file->done; });
+      if (!file->done && state->started.insert(file->seq).second) {
+        // No worker has started it: prepare it here rather than wait behind
+        // every task spawned since. Same function, same result.
+        lock.unlock();
+        {
+          TimeTraceScope timeScope("Prepare pipelined TBD on main");
+          prepareTapiFile(file);
+          if (file->interfaceFile)
+            pipelineReexports(state, *file->interfaceFile);
+        }
+        lock.lock();
+        file->done = true;
+      } else if (!file->done) {
+        TimeTraceScope timeScope("Wait for pipelined TBD");
+        state->cv.wait(lock, [file] { return file->done; });
+      }
       // The wait released the mutex, so a worker discovering re-exports may have
       // inserted into the map and rehashed it. Look the entry up again rather
       // than erasing through an iterator from before the wait.
@@ -743,6 +778,9 @@ DylibFile *macho::loadDylib(MemoryBufferRef mbref, DylibFile *umbrella,
             ": empty prepared TAPI file");
       return nullptr;
     }
+    // Whether the constructor defers the names to the batch, which then refers
+    // to the prepared symbols until it is published.
+    const bool deferred = preparedSymbols && isBatchingDylibNames();
     file = make<DylibFile>(*interfaceFile, umbrella, isBundleLoader,
                            explicitlyLinked, preparedSymbols);
 
@@ -756,8 +794,7 @@ DylibFile *macho::loadDylib(MemoryBufferRef mbref, DylibFile *umbrella,
       newFile->parseReexports(*interfaceFile);
     // The batch refers to prepared->normalNames until the next run boundary, so
     // the interface outlives this scope when the names were deferred.
-    if (preparedSymbols && inAutolinkRound &&
-        llvm::parallel::strategy.ThreadsRequested != 1)
+    if (deferred)
       tapiGraveyard.push_back(
           {std::move(interfaceFile), std::move(preparedOwner)});
   } else {

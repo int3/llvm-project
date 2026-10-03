@@ -128,6 +128,13 @@ public:
   void endParallelInput();
   bool isFolding() const { return folding; }
 
+  // Set while held object files are parsed on workers behind the argument walk
+  // (see startParallelInput()). The main thread then makes no insert of its own:
+  // every dylib's names go to the batch (isBatchingDylibNames()), which is
+  // published after the parse is joined.
+  void setHeldParseLive(bool live) { heldParseLive = live; }
+  bool isHeldParseLive() const { return heldParseLive; }
+
   // While folding, records added through the serial bodies (an -l dylib's
   // exports, say) take their ordinals from here so that their slots land in the
   // right place in symVector.
@@ -228,6 +235,9 @@ private:
   bool sharded = false;
   // True only while workers may be folding records.
   bool folding = false;
+  // True only while held object parses may be folding concurrently with the
+  // main thread's serial inserts.
+  bool heldParseLive = false;
 
   // One deferred dylib publication: either a prepared file's whole name loop,
   // or a single $ld$previous name added to a synthetic dylib.
@@ -245,12 +255,26 @@ private:
     // exactly as the ordered constructor's insert order did.
     uint32_t base = 0;
     bool anyHidden = false;
+    // The exporting file's hidden count when the record was deferred.
+    uint32_t hiddenStamp = 0;
+    // Deferred during the input fold: the ordinal of the record's first name
+    // (top, walk, seq); name j takes seq + j, as the inline inserts would have.
+    uint32_t ordTop = 0, ordWalk = 0, ordSeq = 0;
+    // Pre-sized storage for the slots this record creates, slot j at index j.
+    char *slots = nullptr;
   };
   std::vector<DylibBatchRecord> dylibBatch;
   // True only while publishDylibBatch()'s per-shard walk runs.
   bool publishing = false;
   Symbol *addDylibImpl(llvm::CachedHashStringRef name, DylibFile *file,
                        bool isWeakDef, bool isTlv, bool *wasInsertedOut);
+  // addDylib()'s slot update, once the slot has been found or created.
+  void applyDylib(Symbol *s, bool wasInserted, llvm::StringRef name,
+                  DylibFile *file, bool isWeakDef, bool isTlv);
+  // publishDylibBatch() while the input fold runs.
+  void publishDylibBatchFolding();
+  // Slot storage for publishDylibBatchFolding(), one chunk per record.
+  llvm::BumpPtrAllocator batchSlotAlloc;
 };
 
 void reportPendingUndefinedSymbols();

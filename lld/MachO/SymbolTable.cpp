@@ -17,6 +17,7 @@
 #include "lld/Common/ErrorHandler.h"
 #include "lld/Common/Memory.h"
 #include "llvm/Demangle/Demangle.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/Parallel.h"
 
 using namespace llvm;
@@ -119,6 +120,13 @@ std::pair<Symbol *, bool> SymbolTable::insert(StringRef name,
 
 std::pair<Symbol *, bool> SymbolTable::insert(CachedHashStringRef cachedName,
                                               const InputFile *file) {
+  // Every serial adder comes through here. While held object parses fold on
+  // workers the main thread must not insert (its dylib names are batched until
+  // the join); an insert here would race the fold without a lock, so stop
+  // rather than corrupt the table. One bool test; never true at one thread.
+  if (LLVM_UNLIKELY(heldParseLive && !publishing))
+    llvm::report_fatal_error("lld-macho internal error: symbol table insert "
+                             "while the streamed held object parse is live");
   if (sharded) {
     Shard &shard = shards[shardOf(cachedName)];
     auto [it, wasInserted] = shard.map.try_emplace(cachedName, nullptr);
@@ -850,10 +858,19 @@ Symbol *SymbolTable::addDylibImpl(CachedHashStringRef cachedName,
                                   DylibFile *file, bool isWeakDef, bool isTlv,
                                   bool *wasInsertedOut) {
   StringRef name = cachedName.val();
+  // While held object files fold on workers the main thread inserts nothing:
+  // its dylibs are batched and published after the join.
+  assert((!heldParseLive || publishing) &&
+         "a serial insert must not meet the streamed held parse");
   auto [s, wasInserted] = insert(cachedName, file);
   if (wasInsertedOut)
     *wasInsertedOut = wasInserted;
+  applyDylib(s, wasInserted, name, file, isWeakDef, isTlv);
+  return s;
+}
 
+void SymbolTable::applyDylib(Symbol *s, bool wasInserted, StringRef name,
+                             DylibFile *file, bool isWeakDef, bool isTlv) {
   RefState refState = RefState::Unreferenced;
   if (!wasInserted) {
     if (auto *defined = dyn_cast<Defined>(s)) {
@@ -878,8 +895,6 @@ Symbol *SymbolTable::addDylibImpl(CachedHashStringRef cachedName,
     constructOrReplaceSymbol<DylibSymbol>(s, wasInserted, file, name,
                                            isWeakDef, refState, isTlv);
   }
-
-  return s;
 }
 
 void SymbolTable::deferDylibNames(DylibFile *file, DylibFile *exportingFile,
@@ -892,7 +907,15 @@ void SymbolTable::deferDylibNames(DylibFile *file, DylibFile *exportingFile,
   rec.file = file;
   rec.exportingFile = exportingFile;
   rec.prepared = prepared;
-  rec.anyHidden = anyHidden;
+  rec.hiddenStamp = exportingFile->hiddenCount();
+  rec.anyHidden = anyHidden && rec.hiddenStamp != 0;
+  if (folding && serialCtx) {
+    // Reserve the ordinals the inline inserts would have taken, in order.
+    rec.ordTop = serialCtx->top;
+    rec.ordWalk = serialCtx->walk;
+    rec.ordSeq = serialCtx->seq;
+    serialCtx->seq += prepared->normalNames.size();
+  }
   dylibBatch.push_back(rec);
 }
 
@@ -900,13 +923,98 @@ void SymbolTable::deferDylibSymbol(CachedHashStringRef name, DylibFile *owner) {
   DylibBatchRecord rec;
   rec.exportingFile = owner;
   rec.name = name;
+  if (folding && serialCtx) {
+    rec.ordTop = serialCtx->top;
+    rec.ordWalk = serialCtx->walk;
+    rec.ordSeq = serialCtx->seq++;
+  }
   dylibBatch.push_back(rec);
+}
+
+// The batch deferred while the held object parse streamed behind the walk,
+// published once the parse has been joined. The table is still folding, so a
+// slot this creates is stamped with the ordinal its inline insert would have
+// taken and goes into the shard's `created` list, from which
+// endParallelInput() places it in symVector; an existing slot lowers its
+// firstOrdinal as the inline insert would have. Each shard is still walked by
+// one thread in global record order, so the outcome per name is the inline
+// one: dylib against dylib is decided in command-line order, and every held
+// object has already folded, which is where the serial linker had them.
+void SymbolTable::publishDylibBatchFolding() {
+  constexpr size_t stride = sizeof(SlotMeta) + sizeof(SymbolUnion);
+  // One chunk per record, indexed like its names, so the slots a file creates
+  // stay together in its own order instead of scattering over 64 shards.
+  for (DylibBatchRecord &rec : dylibBatch)
+    if (rec.prepared)
+      rec.slots = static_cast<char *>(batchSlotAlloc.Allocate(
+          stride * rec.prepared->normalNames.size(), alignof(SymbolUnion)));
+
+  publishing = true;
+  parallelFor(0, numShards, [&](size_t si) {
+    Shard &shard = shards[si];
+    auto publish = [&](CachedHashStringRef name, DylibFile *owner,
+                       bool isWeakDef, bool isTlv, RecordOrdinal ord,
+                       char *storage) -> Symbol * {
+      auto [it, wasInserted] = shard.map.try_emplace(name, nullptr);
+      Symbol *slot;
+      if (wasInserted) {
+        auto *meta = storage ? new (storage) SlotMeta() : nullptr;
+        slot = meta ? reinterpret_cast<Symbol *>(meta + 1) : allocateSlot();
+        it->second = slot;
+        metaOf(slot).firstOrdinal = ord;
+        metaOf(slot).setWinner(ord);
+        shard.created.push_back(slot);
+      } else {
+        slot = it->second;
+        SlotMeta &meta = metaOf(slot);
+        if (ord < meta.firstOrdinal)
+          meta.firstOrdinal = ord;
+      }
+      applyDylib(slot, wasInserted, name.val(), owner, isWeakDef, isTlv);
+      return slot;
+    };
+    for (DylibBatchRecord &rec : dylibBatch) {
+      if (!rec.prepared) {
+        if (shardOf(rec.name) != si)
+          continue;
+        rec.result = publish(rec.name, rec.exportingFile, /*isWeakDef=*/false,
+                             /*isTlv=*/false,
+                             RecordOrdinal(rec.ordTop, rec.ordWalk, rec.ordSeq),
+                             nullptr);
+        continue;
+      }
+      const PreparedTapiSymbols &prep = *rec.prepared;
+      for (uint32_t k = prep.shardStart[si], e = prep.shardStart[si + 1];
+           k != e; ++k) {
+        uint32_t j = prep.shardOrder[k];
+        const PreparedTapiName &prepName = prep.normalNames[j];
+        if (rec.anyHidden &&
+            rec.exportingFile->isHiddenSymbol(prepName.name, rec.hiddenStamp))
+          continue;
+        rec.file->symbols[j] = publish(
+            prepName.name, rec.exportingFile, prepName.isWeakDef,
+            prepName.isTlv,
+            RecordOrdinal(rec.ordTop, rec.ordWalk, rec.ordSeq + j),
+            rec.slots + stride * j);
+      }
+    }
+  });
+  publishing = false;
+
+  // $ld$previous adds its symbol to the synthetic dylib's own vector, in the
+  // ordered constructor's position.
+  for (DylibBatchRecord &rec : dylibBatch)
+    if (!rec.prepared && rec.result)
+      rec.exportingFile->symbols.push_back(rec.result);
+  dylibBatch.clear();
 }
 
 void SymbolTable::publishDylibBatch() {
   if (dylibBatch.empty())
     return;
-  assert(!folding && !publishing);
+  assert(!publishing && !heldParseLive);
+  if (folding)
+    return publishDylibBatchFolding();
 
   uint32_t total = 0;
   for (DylibBatchRecord &rec : dylibBatch) {
@@ -938,7 +1046,8 @@ void SymbolTable::publishDylibBatch() {
            ++k) {
         uint32_t j = prep.shardOrder[k];
         const PreparedTapiName &prepName = prep.normalNames[j];
-        if (rec.anyHidden && rec.exportingFile->isHiddenSymbol(prepName.name))
+        if (rec.anyHidden &&
+            rec.exportingFile->isHiddenSymbol(prepName.name, rec.hiddenStamp))
           continue;
         bool wasInserted = false;
         Symbol *sym =

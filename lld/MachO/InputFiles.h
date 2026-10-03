@@ -385,6 +385,10 @@ struct PreparedLDSymbol;
 // to call off the ordered input walk.
 void prepareTapiSymbols(const llvm::MachO::InterfaceFile &interface,
                         PreparedTapiSymbols &prepared);
+// Fills prepared.shardStart/shardOrder from prepared.normalNames.
+void partitionPreparedNames(PreparedTapiSymbols &prepared);
+// Whether a dylib constructed now hands its names to the symbol table's batch.
+bool isBatchingDylibNames();
 
 class DylibFile final : public InputFile {
 public:
@@ -409,9 +413,20 @@ public:
     return numReferencedSymbols.load(std::memory_order_relaxed) > 0;
   }
   // Read by the batched publication from several shards at once; $ld$hide
-  // inserts only on the ordered thread, with any pending batch flushed first.
+  // inserts only on the ordered thread. A batch record carries the number of
+  // names hidden when it was deferred, and a name hides it only if it was
+  // hidden before that point, so a $ld$hide that comes later in the serial
+  // order does not reach back into a record that is published after it.
   bool isHiddenSymbol(llvm::CachedHashStringRef name) const {
     return hiddenSymbols.contains(name);
+  }
+  bool isHiddenSymbol(llvm::CachedHashStringRef name, uint32_t stamp) const {
+    auto it = hiddenSymbols.find(name);
+    return it != hiddenSymbols.end() && it->second < stamp;
+  }
+  uint32_t hiddenCount() const { return hiddenSymbols.size(); }
+  void hideSymbol(llvm::CachedHashStringRef name) {
+    hiddenSymbols.try_emplace(name, hiddenSymbols.size());
   }
   bool isExplicitlyLinked() const;
   void setExplicitlyLinked() { explicitlyLinked = true; }
@@ -464,7 +479,8 @@ private:
   void loadReexport(StringRef path, DylibFile *umbrella,
                     const llvm::MachO::InterfaceFile *currentTopLevelTapi);
 
-  llvm::DenseSet<llvm::CachedHashStringRef> hiddenSymbols;
+  // Each hidden name with its insertion index (see isHiddenSymbol()).
+  llvm::DenseMap<llvm::CachedHashStringRef, uint32_t> hiddenSymbols;
 
   // Holds the symbol names a worker materialized for this file, when it was
   // built from a prepared interface. The names outlive the InterfaceFile.

@@ -2265,8 +2265,10 @@ DylibFile::DylibFile(MemoryBufferRef mb, DylibFile *umbrella,
       explicitlyLinked(explicitlyLinked), isBundleLoader(isBundleLoader) {
   assert(!isBundleLoader || !umbrella);
   // A Mach-O dylib publishes its exports inline, so a pending batch has to
-  // become visible first.
-  symtab->publishDylibBatch();
+  // become visible first -- unless its names are batched too, which they are
+  // while the held object parse streams behind the walk.
+  if (!symtab->isHeldParseLive())
+    symtab->publishDylibBatch();
   if (umbrella == nullptr)
     umbrella = this;
   this->umbrella = umbrella;
@@ -2355,9 +2357,29 @@ void DylibFile::parseExportedSymbols(uint32_t offset, uint32_t size) {
               entries.push_back({savedName, flags});
             });
 
+  // While the held object parse streams behind the walk, hand the whole loop to
+  // the batch in the same shape as a prepared TBD's: the publication applies
+  // the same hidden test and the same addDylib() per name, in this order.
+  if (symtab->isHeldParseLive()) {
+    if (entries.empty())
+      return;
+    auto *prepared = make<PreparedTapiSymbols>();
+    prepared->normalNames.reserve(entries.size());
+    for (TrieEntry &entry : entries)
+      prepared->normalNames.emplace_back(
+          CachedHashStringRef(entry.name),
+          (entry.flags & EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION) != 0,
+          (entry.flags & EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL) != 0);
+    partitionPreparedNames(*prepared);
+    symbols.assign(entries.size(), nullptr);
+    symtab->deferDylibNames(this, exportingFile, prepared,
+                            exportingFile->hiddenCount() != 0);
+    return;
+  }
+
   // Process the "normal" symbols.
   for (TrieEntry &entry : entries) {
-    if (exportingFile->hiddenSymbols.contains(CachedHashStringRef(entry.name)))
+    if (exportingFile->isHiddenSymbol(CachedHashStringRef(entry.name)))
       continue;
 
     bool isWeakDef = entry.flags & EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION;
@@ -2653,8 +2675,12 @@ void macho::prepareTapiSymbols(const InterfaceFile &interface,
     }
   }
 
-  // Pre-partition by symbol-table shard, so that the batched publication walks
-  // one shard's names without re-hashing or scanning the other 63/64ths.
+  partitionPreparedNames(prepared);
+}
+
+// Pre-partition by symbol-table shard, so that the batched publication walks
+// one shard's names without re-hashing or scanning the other 63/64ths.
+void macho::partitionPreparedNames(PreparedTapiSymbols &prepared) {
   if (prepared.normalNames.empty())
     return;
   constexpr unsigned numShards = SymbolTable::numDylibShards;
@@ -2671,11 +2697,15 @@ void macho::prepareTapiSymbols(const InterfaceFile &interface,
         prepared.normalNames[i].name)]++] = i;
 }
 
-// Whether a prepared TAPI file's names go to the driver-owned batch instead of
-// being inserted here. At one thread there is no batch at all: the inline path
-// costs nothing extra and skips the sequence bookkeeping. While the input fold
-// runs, records carry ordinals instead.
-static bool isBatchingDylibNames() {
+// Whether a dylib's names go to the driver-owned batch instead of being
+// inserted here. At one thread there is no batch at all: the inline path costs
+// nothing extra and skips the sequence bookkeeping. Two windows batch: an
+// autolink round, and the input phase while the held object parse streams
+// behind the walk (the batch is then published right after the parse is
+// joined, so that the walk's inserts never meet a fold).
+bool macho::isBatchingDylibNames() {
+  if (symtab->isHeldParseLive())
+    return true;
   return inAutolinkRound && llvm::parallel::strategy.ThreadsRequested != 1 &&
          !symtab->isFolding();
 }
@@ -2726,7 +2756,7 @@ DylibFile::DylibFile(const InterfaceFile &interface, DylibFile *umbrella,
   auto addSymbol = [&](const llvm::MachO::Symbol &symbol,
                        const Twine &name) -> void {
     StringRef savedName = saver().save(name);
-    if (exportingFile->hiddenSymbols.contains(CachedHashStringRef(savedName)))
+    if (exportingFile->isHiddenSymbol(CachedHashStringRef(savedName)))
       return;
 
     symbols.push_back(symtab->addDylib(savedName, exportingFile,
@@ -2755,7 +2785,7 @@ DylibFile::DylibFile(const InterfaceFile &interface, DylibFile *umbrella,
     }
     symbols.reserve(preparedSymbols->normalNames.size());
     for (const PreparedTapiName &prepared : preparedSymbols->normalNames) {
-      if (anyHidden && exportingFile->hiddenSymbols.contains(prepared.name))
+      if (anyHidden && exportingFile->isHiddenSymbol(prepared.name))
         continue;
       symbols.push_back(symtab->addDylib(prepared.name, exportingFile,
                                          prepared.isWeakDef, prepared.isTlv));
@@ -2764,7 +2794,11 @@ DylibFile::DylibFile(const InterfaceFile &interface, DylibFile *umbrella,
   }
 
   // The rest of this constructor publishes inline, so a pending batch has to
-  // become visible first.
+  // become visible first. Inside the input phase that also means the streamed
+  // held parse has to finish: an inline insert must not meet a fold, and must
+  // not overtake a batched record that precedes it.
+  if (symtab->isHeldParseLive())
+    drainStreamedHeldParse();
   symtab->publishDylibBatch();
 
   std::vector<const llvm::MachO::Symbol *> ownedNormalSymbols;
@@ -2928,11 +2962,13 @@ void DylibFile::applyPreparedLDSymbol(const PreparedLDSymbol &record) {
     this->installName = saver().save(record.installName);
     return;
   case PreparedLDAction::Hide:
-    // Every pending record was produced before this hide, and the replay reads
-    // hiddenSymbols as it inserts, so the batch has to be published first for
-    // those names to see the set the serial linker showed them.
-    symtab->publishDylibBatch();
-    exportingFile->hiddenSymbols.insert(record.hiddenName);
+    // Every pending record was produced before this hide. Each carries the
+    // hidden count of its deferral, so the replay already sees the set the
+    // serial linker showed it; the flush is kept outside the input phase, where
+    // it is free, and skipped while the held parse streams, where it is not.
+    if (!symtab->isHeldParseLive())
+      symtab->publishDylibBatch();
+    exportingFile->hideSymbol(record.hiddenName);
     return;
   }
 }
@@ -3025,8 +3061,15 @@ void DylibFile::handleLDPreviousSymbol(StringRef name, StringRef originalName) {
     //    ]
     // Since the symbols are sorted, adding them to the symtab in the given
     // order means the $ld$previous version of _zzz will prevail, as desired.
+    StringRef savedName = saver().save(symbolName);
+    // Batched with the rest of this Mach-O dylib's names (see
+    // parseExportedSymbols()); a TBD read here was drained first.
+    if (symtab->isHeldParseLive()) {
+      symtab->deferDylibSymbol(CachedHashStringRef(savedName), dylib);
+      return;
+    }
     dylib->symbols.push_back(symtab->addDylib(
-        saver().save(symbolName), dylib, /*isWeakDef=*/false, /*isTlv=*/false));
+        savedName, dylib, /*isWeakDef=*/false, /*isTlv=*/false));
     return;
   }
 
@@ -3068,7 +3111,7 @@ void DylibFile::handleLDHideSymbol(StringRef name, StringRef originalName) {
   }
 
   if (shouldHide)
-    exportingFile->hiddenSymbols.insert(CachedHashStringRef(symbolName));
+    exportingFile->hideSymbol(CachedHashStringRef(symbolName));
 }
 
 void DylibFile::checkAppExtensionSafety(bool dylibIsAppExtensionSafe) const {
