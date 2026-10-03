@@ -100,6 +100,8 @@ public:
       : ConcatOutputSection(name, TextKind) {}
   void finalizeContents() override {}
   void finalize() override;
+  /// Also numbers \p inputs for the thunk walk: input i gets icfEqClass[0] =
+  /// i (ICF is done by now and nothing else reads icfEqClass).
   bool needsThunks() const;
   ArrayRef<ConcatInputSection *> getThunks() const { return thunks; }
   void writeTo(uint8_t *buf) const override;
@@ -118,6 +120,8 @@ private:
   /// thunk.
   Defined *getThunkInRange(const ConcatInputSection &isec, const Relocation &r,
                            const ThunkInfo &thunkInfo) const;
+  /// The same, for a branch at \p callVA.
+  Defined *getThunkInRange(uint64_t callVA, const ThunkInfo &thunkInfo) const;
   /// Update \p r to target \p thunk which is guaranteed to be in range.
   void updateBranchTargetToThunk(Relocation &r, Defined *thunk);
   /// Create a new thunk and update \p r to target the new thunk.
@@ -128,10 +132,11 @@ private:
   /// range.
   std::optional<uint64_t> estimateStubsEndVA(unsigned numPotentialThunks) const;
   /// \return true if the target in \p r is in __stubs or __objc_stubs and in
-  /// range from the location in \p isec. \p estimatedStubsEnd is the estimated
-  /// VA of the end of the last stubs section.
-  bool isTargetStubsAndInRange(const ConcatInputSection &isec,
-                               const Relocation &r,
+  /// range from \p callVA. \p estimatedStubsEnd is the estimated VA of the end
+  /// of the last stubs section. \p addendIsZero and \p inStubs are r's addend
+  /// test and its referent's isInStubs(), recorded when the branch was queued.
+  bool isTargetStubsAndInRange(uint64_t callVA, const Relocation &r,
+                               bool addendIsZero, bool inStubs,
                                std::optional<uint64_t> estimatedStubsEnd) const;
   /// The number of relocations updated to point to thunks.
   size_t thunkCallCount = 0;
