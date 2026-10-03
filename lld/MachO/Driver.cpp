@@ -2780,9 +2780,6 @@ static bool canPipelineTapiFiles() {
   // At one thread a spawned task runs inline, in a different order.
   if (parallel::strategy.ThreadsRequested == 1)
     return false;
-  // Read workers prepare their own deferred TAPI inputs.
-  if (config->readWorkers)
-    return false;
   // --reproduce records each tar member at the ordered readFile() call.
   if (tar)
     return false;
@@ -3675,6 +3672,14 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     parallel::strategy = hardware_concurrency(threads);
     config->thinLTOJobs = v;
   }
+  // The parallel input phase reads, parses and publishes inputs on its own
+  // workers; the read workers' separate read loop would only split the ordered
+  // walk in two and keep the TAPI pipeline from running. Accept the option and
+  // ignore it whenever more than one thread is requested: it never affected
+  // output or input order. No warning, since callers link with
+  // -fatal_warnings.
+  if (parallel::strategy.ThreadsRequested != 1)
+    config->readWorkers = 0;
   if (auto *arg = args.getLastArg(OPT_thinlto_jobs_eq))
     config->thinLTOJobs = arg->getValue();
   if (!get_threadpool_strategy(config->thinLTOJobs))

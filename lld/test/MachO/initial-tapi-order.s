@@ -29,11 +29,12 @@
 # RUN: not %lld -arch x86_64 -dylib -platform_version macos 11.0 11.0 -F%t \
 # RUN:   %t/libBad.tbd -framework Missing -o /dev/null 2>&1 | FileCheck %s --check-prefix=BAD-FRAMEWORK
 
-## Opt-in read workers retain their deferred path; missing lookups must not use
-## the default-reader drain helper.
-# RUN: not %lld -arch x86_64 -dylib -platform_version macos 11.0 11.0 --read-workers=1 -L%t \
+## At one thread, opt-in read workers retain their deferred path (at more than
+## one they are ignored); missing lookups must not use the default-reader drain
+## helper.
+# RUN: not %lld -arch x86_64 -dylib -platform_version macos 11.0 11.0 --threads=1 --read-workers=1 -L%t \
 # RUN:   %t/libBad.tbd -lmissing -o /dev/null 2>&1 | FileCheck %s --check-prefix=WORKER-LIBRARY
-# RUN: not %lld -arch x86_64 -dylib -platform_version macos 11.0 11.0 --read-workers=8 -F%t \
+# RUN: not %lld -arch x86_64 -dylib -platform_version macos 11.0 11.0 --threads=1 --read-workers=8 -F%t \
 # RUN:   %t/libBad.tbd -framework Missing -o /dev/null 2>&1 | FileCheck %s --check-prefix=WORKER-FRAMEWORK
 
 # EFFECT: /NewEffect

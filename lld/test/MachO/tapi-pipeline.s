@@ -17,6 +17,7 @@
 # RUN: llvm-ar rcs %t/Static.framework/Static %t/static.o
 # RUN: llvm-ar rcs %t/libarchive.a %t/static.o
 # RUN: ln -s %t/libLeaf.tbd %t/libLeafLink.tbd
+# RUN: mkdir -p %t/rw %t/norw %t/rw1
 
 ## A malformed TAPI input placed after objects is diagnosed at its own
 ## position, at every thread count.
@@ -29,6 +30,27 @@
 
 # ORDER:      error: could not load TAPI file at {{.*}}libBad.tbd
 # ORDER-NEXT: error: cannot open {{.*}}missing.tbd: No such file or directory
+
+## --read-workers is ignored whenever more than one thread is requested, so the
+## pipeline runs under it: the same diagnostics in the same order, and the same
+## output as without the option and as at one thread, where it still applies.
+## At one thread the read workers read every input before processing any, so a
+## file that cannot be opened is reported first, as before.
+# RUN: not %lld -arch x86_64 -dylib -platform_version macos 11.0 11.0 --threads=2 --read-workers=4 \
+# RUN:   %t/test.o %t/libBad.tbd %t/missing.tbd -o /dev/null 2>&1 | FileCheck %s --check-prefix=ORDER
+# RUN: not %lld -arch x86_64 -dylib -platform_version macos 11.0 11.0 --threads=1 --read-workers=4 \
+# RUN:   %t/test.o %t/libBad.tbd %t/missing.tbd -o /dev/null 2>&1 | FileCheck %s --check-prefix=RWORDER
+
+# RWORDER:      error: cannot open {{.*}}missing.tbd: No such file or directory
+# RWORDER-NEXT: error: could not load TAPI file at {{.*}}libBad.tbd
+# RUN: %lld -arch x86_64 -dylib -install_name /RW -no_uuid -platform_version macos 11.0 11.0 \
+# RUN:   -L%t --threads=2 --read-workers=4 %t/libFirst.tbd %t/libReexport.tbd %t/test3.o -o %t/rw/out 2>&1 | count 0
+# RUN: %lld -arch x86_64 -dylib -install_name /RW -no_uuid -platform_version macos 11.0 11.0 \
+# RUN:   -L%t --threads=2 %t/libFirst.tbd %t/libReexport.tbd %t/test3.o -o %t/norw/out 2>&1 | count 0
+# RUN: %lld -arch x86_64 -dylib -install_name /RW -no_uuid -platform_version macos 11.0 11.0 \
+# RUN:   -L%t --threads=1 --read-workers=4 %t/libFirst.tbd %t/libReexport.tbd %t/test3.o -o %t/rw1/out 2>&1 | count 0
+# RUN: cmp %t/norw/out %t/rw/out
+# RUN: cmp %t/norw/out %t/rw1/out
 
 ## The same TBD reached through a symlink and through its own path is one
 ## DylibFile, so its symbols are not duplicated.

@@ -5,11 +5,11 @@
 # RUN: mkdir -p %t/Obj.framework
 # RUN: llvm-mc -triple=x86_64-apple-macos -filetype=obj %t/obj.s -o %t/Obj.framework/Obj
 # RUN: %lld -no_uuid -lSystem -weak-lA -F%t -L%t %t/root.o -o %t/default
-# RUN: %lld -no_uuid --read-workers=4 -lSystem -weak-lA -F%t -L%t %t/root.o -o %t/parallel
+# RUN: %lld -no_uuid --threads=1 --read-workers=4 -lSystem -weak-lA -F%t -L%t %t/root.o -o %t/parallel
 # RUN: cmp %t/default %t/parallel
 # RUN: llvm-objdump --macho --all-headers %t/default | FileCheck --check-prefix=WEAK %s
 # RUN: not %lld -no_uuid -lSystem -L%t %t/malformed.o -o %t/malformed 2>&1 | FileCheck --check-prefix=MALFORMED %s
-# RUN: not %lld -no_uuid --read-workers=4 -lSystem -L%t %t/malformed.o -o %t/malformed 2>&1 | FileCheck --check-prefix=MALFORMED %s
+# RUN: not %lld -no_uuid --threads=1 --read-workers=4 -lSystem -L%t %t/malformed.o -o %t/malformed 2>&1 | FileCheck --check-prefix=MALFORMED %s
 
 # WEAK:      cmd LC_LOAD_WEAK_DYLIB
 # WEAK-NEXT: cmdsize
