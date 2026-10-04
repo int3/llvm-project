@@ -788,6 +788,28 @@ Defined *SymbolTable::aliasDefined(Defined *src, StringRef target,
                     src->weakDefCanBeHidden, src->cold);
 }
 
+// A lazy symbol's member can be loaded and still not define the name: an N_EXT
+// label in a section ld64 ignores labels in (__cfstring, __objc_classrefs,
+// __objc_selrefs) is parsed as a local, yet the archive index and a lazy
+// object's symbol table still list it. The fetch then leaves the lazy symbol in
+// the slot, nothing ever defines it, and the writer crashes binding to it. The
+// name is undefined, as it is to ld64 and to the parallel walker, which reserves
+// such a slot as an Undefined.
+static void replaceUnprovidedLazy(Symbol *s, StringRef name, InputFile *file,
+                                  RefState refState) {
+  if (s->isLazy()) {
+    replaceSymbol<Undefined>(s, name, file, refState,
+                             /*wasBitcodeSymbol=*/false);
+  } else if (auto *undefined = dyn_cast<Undefined>(s)) {
+    // Recursive extraction may already have replaced this lazy slot with an
+    // undefined symbol. Keep both references' strength and attribute the result
+    // to the outer reference, which was encountered first.
+    replaceSymbol<Undefined>(s, name, file,
+                             std::max(undefined->refState, refState),
+                             undefined->wasBitcodeSymbol);
+  }
+}
+
 Symbol *SymbolTable::addUndefined(StringRef name, InputFile *file,
                                   bool isWeakRef) {
   if (folding && file && file->parseCtx)
@@ -816,9 +838,12 @@ Symbol *SymbolTable::addUndefined(StringRef name, InputFile *file,
       archiveProviderHook(name, lazy->getFile()->id);
     if (auto *stillLazy = dyn_cast<LazyArchive>(s))
       stillLazy->fetchArchiveMember();
+    replaceUnprovidedLazy(s, name, file, refState);
   }
-  else if (isa<LazyObject>(s))
+  else if (isa<LazyObject>(s)) {
     extract(*s->getFile(), s->getName());
+    replaceUnprovidedLazy(s, name, file, refState);
+  }
   else if (auto *dynsym = dyn_cast<DylibSymbol>(s)) {
     dynsym->reference(refState);
     // A LazyArchive symbol registered before this dylib would have shadowed it.
