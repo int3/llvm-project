@@ -16,6 +16,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/PointerUnion.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 
 namespace lld::macho {
 
@@ -126,7 +127,8 @@ private:
   void updateBranchTargetToThunk(Relocation &r, Defined *thunk);
   /// Create a new thunk and update \p r to target the new thunk.
   void createThunk(const ConcatInputSection &isec, Relocation &r,
-                   ThunkInfo &thunkInfo);
+                   ThunkInfo &thunkInfo,
+                   llvm::function_ref<void()> beforeSymbolReplacement = nullptr);
   /// \return the largest possible stub section end VA or \p std::nullopt if we
   /// can't estimate this yet. Used to determine if stub symbol targets are in
   /// range.

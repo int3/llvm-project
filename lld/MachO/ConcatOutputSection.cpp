@@ -18,7 +18,9 @@
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/TimeProfiler.h"
 
+#include <chrono>
 #include <limits>
+#include <thread>
 
 using namespace llvm;
 using namespace llvm::MachO;
@@ -151,7 +153,8 @@ void TextOutputSection::updateBranchTargetToThunk(Relocation &r,
 }
 
 void TextOutputSection::createThunk(const ConcatInputSection &isec,
-                                    Relocation &r, ThunkInfo &thunkInfo) {
+                                    Relocation &r, ThunkInfo &thunkInfo,
+                                    function_ref<void()> beforeSymbolReplacement) {
   assert(getThunkInRange(isec, r, thunkInfo) == nullptr);
   assert(isec.isFinal);
   uint64_t highVA =
@@ -193,6 +196,8 @@ void TextOutputSection::createThunk(const ConcatInputSection &isec,
         // symbol of its own.
         inSymtab = false;
       } else {
+        if (beforeSymbolReplacement)
+          beforeSymbolReplacement();
         thunkReplacedSymbol = true;
       }
     }
@@ -435,6 +440,184 @@ bool isVAInBranchRange(uint64_t callVA, uint64_t va) {
   return lowVA <= va && va <= highVA;
 }
 
+// Immutable branch facts. A TEXT destination remains an index even when it
+// points backwards: only the consumer reads finality and final offsets.
+struct BranchRecord {
+  Relocation *r;
+  uint64_t dest;
+  uint32_t targetIdx;
+  uint32_t keyHash;
+  uint32_t flags;
+  uint32_t offset;
+  // Keep the normalized key, not just its hash: reconstructing it on the
+  // consumer would repeat the symbol -> canonical section chase.
+  ThunkKey key;
+};
+static_assert(sizeof(BranchRecord) == 56 || sizeof(void *) != 8);
+
+// Bounded, section-ordered producer/consumer stream. State is per chunk (not
+// per ring slot), so a late worker cannot claim a slot after its generation
+// has been consumed and reused. Slot ownership transfers with release/acquire.
+class BranchStream {
+public:
+  static constexpr size_t chunkSize = 4096, ringSize = 16;
+  struct Chunk {
+    std::vector<BranchRecord> records;
+    uint32_t first[chunkSize + 1];
+  };
+  using Clock = std::chrono::steady_clock;
+
+  BranchStream(TextOutputSection *osec, const InputSection *objcStubsIsec)
+      : osec(osec), objcStubsIsec(objcStubsIsec),
+        numChunks(divideCeil(osec->inputs.size(), chunkSize)),
+        states(new std::atomic<unsigned char>[numChunks]),
+        slots(new Chunk[std::min(numChunks, ringSize)]),
+        tracing(timeTraceProfilerEnabled()) {
+    for (size_t c = 0; c != numChunks; ++c)
+      states[c].store(unclaimed, std::memory_order_relaxed);
+    tasks = std::make_unique<parallel::TaskGroup>();
+    assert(tasks->isParallel());
+    size_t n = parallel::getThreadCount();
+    size_t producers = std::min(numChunks, n > 2 ? n - 2 : 1);
+    for (size_t i = 0; i != producers; ++i)
+      tasks->spawn([this] { run(); });
+  }
+  ~BranchStream() { stop(); }
+
+  Chunk &get(size_t c) {
+    unsigned char expected = unclaimed;
+    if (states[c].compare_exchange_strong(expected, producing,
+                                          std::memory_order_acq_rel)) {
+      fill(c);
+      ++chunksInline;
+      states[c].store(ready, std::memory_order_release);
+    } else if (expected != ready) {
+      auto start = tracing ? Clock::now() : Clock::time_point();
+      unsigned spins = 0;
+      while (states[c].load(std::memory_order_acquire) != ready)
+        pause(spins);
+      if (tracing)
+        consumerWaitNs += elapsed(start);
+    }
+    return slots[c % ringSize];
+  }
+  void release(size_t c) {
+    // Keep the terminal state so a worker holding an old ticket skips it.
+    states[c].store(consumed, std::memory_order_release);
+    released.store(c + 1, std::memory_order_release);
+  }
+  void stop() {
+    stopped.store(true, std::memory_order_release);
+    tasks.reset();
+  }
+  void report() const {
+    timeTraceAddInstantEvent("Thunk walk B", [&] {
+      return "chunksByWorkers=" + std::to_string(chunksByWorkers.load()) +
+             " chunksInline=" + std::to_string(chunksInline) +
+             " consumerWaitMs=" + std::to_string(consumerWaitNs / 1e6) +
+             " producerMs=" + std::to_string(producerNs.load() / 1e6);
+    });
+  }
+
+private:
+  enum : unsigned char { unclaimed, producing, ready, consumed };
+  static uint64_t elapsed(Clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() -
+                                                               start).count();
+  }
+  static void pause(unsigned &spins) {
+    if (++spins >= 1000)
+      std::this_thread::yield();
+    else
+      std::atomic_signal_fence(std::memory_order_seq_cst);
+  }
+  void run() {
+    while (!stopped.load(std::memory_order_acquire)) {
+      size_t c = nextChunk.fetch_add(1, std::memory_order_relaxed);
+      if (c >= numChunks)
+        return;
+      unsigned spins = 0;
+      while (c >= released.load(std::memory_order_acquire) + ringSize) {
+        if (stopped.load(std::memory_order_acquire))
+          return;
+        pause(spins);
+      }
+      if (stopped.load(std::memory_order_acquire))
+        return;
+      unsigned char expected = unclaimed;
+      if (!states[c].compare_exchange_strong(expected, producing,
+                                             std::memory_order_acq_rel))
+        continue;
+      auto start = tracing ? Clock::now() : Clock::time_point();
+      fill(c);
+      if (tracing)
+        producerNs.fetch_add(elapsed(start), std::memory_order_relaxed);
+      chunksByWorkers.fetch_add(1, std::memory_order_relaxed);
+      states[c].store(ready, std::memory_order_release);
+    }
+  }
+  void fill(size_t c) {
+    Chunk &chunk = slots[c % ringSize];
+    chunk.records.clear();
+    size_t begin = c * chunkSize;
+    size_t end = std::min(begin + chunkSize, osec->inputs.size());
+    for (size_t i = begin; i != end; ++i) {
+      chunk.first[i - begin] = chunk.records.size();
+      for (Relocation &r : reverse(osec->inputs[i]->relocs)) {
+        if (!target->hasAttr(r.getType(), RelocAttrBits::BRANCH))
+          continue;
+        auto *sym = cast<Symbol *>(r.getReferent());
+        int64_t addend = r.getAddend();
+        bool stub = sym->isInStubs();
+        ThunkKey key(r);
+        BranchRecord rec{&r, 0, fixedTarget,
+                         ThunkMapKeyInfo::getHashValue(key),
+                         (addend == 0 ? addendIsZero : 0u) |
+                             (stub ? inStubs : 0u), r.getOffset(), key};
+        if (auto *d = dyn_cast<Defined>(sym);
+            d && (addend != 0 || !stub) && !d->isAbsolute()) {
+          InputSection *isec = d->isec();
+          if (isec->parent == osec) {
+            auto *text = cast<ConcatInputSection>(isec);
+            rec.targetIdx = text->icfEqClass[0];
+            if (rec.targetIdx < osec->inputs.size() &&
+                osec->inputs[rec.targetIdx] == text) {
+              rec.dest = d->value + addend;
+              chunk.records.push_back(rec);
+              continue;
+            }
+            // A generated thunk can become a target after a lazy-symbol
+            // replacement. Its creation joined the producers first.
+            assert(stopped.load(std::memory_order_acquire));
+            rec.targetIdx = fixedTarget;
+          }
+          if (isec == objcStubsIsec)
+            rec.flags |= inObjCStubs;
+        }
+        // Other output sections cannot change while this walk is running.
+        rec.dest = resolveSymbolOffsetVA(sym, r.getType(), addend);
+        chunk.records.push_back(rec);
+      }
+    }
+    chunk.first[end - begin] = chunk.records.size();
+  }
+
+  TextOutputSection *osec;
+  const InputSection *objcStubsIsec;
+  size_t numChunks;
+  std::unique_ptr<std::atomic<unsigned char>[]> states;
+  std::unique_ptr<Chunk[]> slots;
+  bool tracing;
+  alignas(64) std::atomic<size_t> nextChunk{0};
+  alignas(64) std::atomic<size_t> released{0};
+  alignas(64) std::atomic<bool> stopped{false};
+  std::atomic<uint64_t> producerNs{0};
+  std::atomic<size_t> chunksByWorkers{0};
+  size_t chunksInline = 0;
+  uint64_t consumerWaitNs = 0;
+  std::unique_ptr<parallel::TaskGroup> tasks;
+};
+
 // Prefetch distances, in queue entries, for the relocation (and the final
 // offset of the target) and, closer to use, for the relocation's referent.
 constexpr size_t farAhead = 16;
@@ -465,6 +648,17 @@ void TextOutputSection::finalize() {
   FinalOffsets finalOff(numInputs);
   const InputSection *objcStubsIsec = in.objcStubs ? in.objcStubs->isec
                                                    : nullptr;
+
+  std::unique_ptr<BranchStream> stream;
+  if (parallel::strategy.ThreadsRequested != 1 &&
+      parallel::getThreadCount() > 1 && numInputs)
+    stream = std::make_unique<BranchStream>(this, objcStubsIsec);
+  // A lazy/undefined symbol can be overwritten by a generated thunk name.
+  // Join before that write; subsequent records are re-resolved on the consumer.
+  auto stopProducers = [&] {
+    if (stream)
+      stream->stop();
+  };
 
   // Whether the branch's target is within range, given that the first
   // `numFinal` inputs are final.
@@ -582,11 +776,15 @@ void TextOutputSection::finalize() {
     }
     ahead.counts[j % ScanAhead::numCounts] = n;
   };
-  for (size_t j = 0; j != relocsAhead; ++j)
-    prefetchRelocs(j);
+  if (!stream)
+    for (size_t j = 0; j != relocsAhead; ++j)
+      prefetchRelocs(j);
+  BranchStream::Chunk *chunk = nullptr;
   for (size_t idx = 0; idx != numInputs; ++idx) {
     ConcatInputSection *isec = inputs[idx];
-    while (collectNext != numInputs &&
+    if (stream && idx % BranchStream::chunkSize == 0)
+      chunk = &stream->get(idx / BranchStream::chunkSize);
+    while (!stream && collectNext != numInputs &&
            (collectNext <= idx ||
             (ahead.size() < referentAhead &&
              collectNext - idx < ScanAhead::numCounts))) {
@@ -660,7 +858,7 @@ void TextOutputSection::finalize() {
       auto &thunkInfo =
           thunkMap.insert_as({key, ThunkInfo()}, lookupKey(key, b.keyHash))
               .first->second;
-      createThunk(*inputs[b.callerIdx], *b.r, thunkInfo);
+      createThunk(*inputs[b.callerIdx], *b.r, thunkInfo, stopProducers);
       frontChecked = false;
       popFront();
     }
@@ -674,21 +872,44 @@ void TextOutputSection::finalize() {
       return a.getOffset() > b.getOffset();
     }));
     const uint64_t isecVA = addr + isec->outSecOff;
-    for (uint32_t n = ahead.counts[idx % ScanAhead::numCounts]; n; --n) {
-      if (ahead.size() > sectionAhead) {
+    uint32_t recordIdx = stream ? chunk->first[idx % BranchStream::chunkSize] : 0;
+    uint32_t numBranches = stream
+        ? chunk->first[idx % BranchStream::chunkSize + 1] - recordIdx
+        : ahead.counts[idx % ScanAhead::numCounts];
+    for (uint32_t n = numBranches; n; --n) {
+      if (!stream && ahead.size() > sectionAhead) {
         auto *sym = dyn_cast_if_present<Symbol *>(
             ahead[sectionAhead]->getReferent());
         if (auto *d = dyn_cast_if_present<Defined>(sym))
           prefetchLine(d->originalIsec);
       }
-      Relocation &r = *ahead.pop();
-      PendingBranch b = makePending(idx, r, isecVA + r.getOffset());
+      const BranchRecord *rec = stream ? &chunk->records[recordIdx++] : nullptr;
+      Relocation &r = rec ? *rec->r : *ahead.pop();
+      PendingBranch b;
+      if (rec && !thunkReplacedSymbol) {
+        b = {&r, isecVA + rec->offset, rec->dest, rec->targetIdx,
+             static_cast<uint32_t>(idx), rec->keyHash, rec->flags};
+        if (b.targetIdx != fixedTarget) {
+          if (b.targetIdx <= idx) {
+            // Match makePending: a finalized target stays a fixed VA in the
+            // FIFO, avoiding another finalOff lookup at the front/end.
+            b.dest += addr + finalOff[b.targetIdx];
+            b.targetIdx = fixedTarget;
+          } else if (isVAInBranchRange(
+                         b.callVA, TargetInfo::outOfRangeVA + rec->key.addend)) {
+            b.flags |= notFinalInRange;
+          }
+        }
+      } else {
+        b = makePending(idx, r, isecVA + r.getOffset());
+      }
       assert(isInRange(b.callVA, b.dest, b.targetIdx, b.flags, idx + 1) ==
              isTargetKnownInRange(*isec, r));
       if (isInRange(b.callVA, b.dest, b.targetIdx, b.flags, idx + 1))
         continue;
-      ThunkKey key(r);
-      b.keyHash = ThunkMapKeyInfo::getHashValue(key);
+      ThunkKey key = rec && !thunkReplacedSymbol ? rec->key : ThunkKey(r);
+      if (!rec || thunkReplacedSymbol)
+        b.keyHash = ThunkMapKeyInfo::getHashValue(key);
       auto it = findThunk(key, b.keyHash);
       if (it != thunkMap.end()) {
         if (auto *thunk = getThunkInRange(b.callVA, it->second)) {
@@ -699,7 +920,13 @@ void TextOutputSection::finalize() {
       }
       branchesToProcess.push_back(b);
     }
+    if (stream && (idx % BranchStream::chunkSize == BranchStream::chunkSize - 1 ||
+                   idx + 1 == numInputs))
+      stream->release(idx / BranchStream::chunkSize);
   }
+  stopProducers();
+  if (stream)
+    stream->report();
 
   // Drop the branches whose targets are now in range, keeping queue order.
   std::vector<PendingBranch> remaining;
