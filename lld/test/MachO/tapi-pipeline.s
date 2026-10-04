@@ -16,6 +16,7 @@
 # RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/objcframework.s -o %t/ObjcObject.framework/ObjcObject
 # RUN: llvm-ar rcs %t/Static.framework/Static %t/static.o
 # RUN: llvm-ar rcs %t/libarchive.a %t/static.o
+# RUN: llvm-ar rcs %t/libcrate.rlib %t/static.o
 # RUN: ln -s %t/libLeaf.tbd %t/libLeafLink.tbd
 # RUN: mkdir -p %t/rw %t/norw %t/rw1
 
@@ -69,6 +70,39 @@
 # RUN: %lld -arch x86_64 -dylib -install_name /Archive -no_uuid -platform_version macos 11.0 11.0 \
 # RUN:   -L%t --threads=1 -larchive %t/test2.o -o %t/archive1
 # RUN: cmp %t/archive1 %t/archive8
+
+## An archive with an extension that is not .tbd/.dylib is never a TBD, so the
+## pipeline must not open it; it still loads as an archive at its own position.
+# RUN: %lld -arch x86_64 -dylib -install_name /Rlib -no_uuid -platform_version macos 11.0 11.0 \
+# RUN:   --threads=8 %t/libcrate.rlib %t/test2.o -o %t/rlib8
+# RUN: %lld -arch x86_64 -dylib -install_name /Rlib -no_uuid -platform_version macos 11.0 11.0 \
+# RUN:   --threads=1 %t/libcrate.rlib %t/test2.o -o %t/rlib1
+# RUN: cmp %t/rlib1 %t/rlib8
+# RUN: llvm-nm %t/rlib8 | FileCheck %s --check-prefix=RLIB
+# RLIB: _static
+
+## A TBD whose extension is not .tbd/.dylib loses the pipeline, not its
+## contents: the ordered walk still identifies and loads it.
+# RUN: cp %t/libLeaf.tbd %t/libLeaf.stub
+# RUN: %lld -arch x86_64 -dylib -install_name /Stub -no_uuid -platform_version macos 11.0 11.0 \
+# RUN:   --threads=8 %t/libLeaf.stub %t/leafuse.o -o %t/stub8 2>&1 | count 0
+# RUN: %lld -arch x86_64 -dylib -install_name /Stub -no_uuid -platform_version macos 11.0 11.0 \
+# RUN:   --threads=1 %t/libLeaf.stub %t/leafuse.o -o %t/stub1 2>&1 | count 0
+# RUN: cmp %t/stub1 %t/stub8
+# RUN: llvm-otool -L %t/stub8 | FileCheck %s --check-prefix=STUB
+# STUB: /usr/lib/libLeaf.dylib
+
+## The speculative pass opens only inputs that can be TBDs: the time trace names
+## each one it opens, and the .rlib, .o and .stub inputs are not among them, so
+## the ordered walk is the only one to open them.
+# RUN: %lld -arch x86_64 -dylib -install_name /Trace -no_uuid -platform_version macos 11.0 11.0 \
+# RUN:   --threads=8 --time-trace=%t/trace.json --time-trace-granularity=0 \
+# RUN:   %t/libcrate.rlib %t/libFirst.tbd %t/libLeaf.stub %t/test2.o %t/leafuse.o -o %t/trace8
+# RUN: tr "{" "\n" < %t/trace.json | grep -A1 "Speculative TAPI read" | \
+# RUN:   FileCheck %s --check-prefix=TRACE --implicit-check-not=libcrate.rlib \
+# RUN:   --implicit-check-not=libLeaf.stub --implicit-check-not=test2.o \
+# RUN:   --implicit-check-not=leafuse.o
+# TRACE: libFirst.tbd
 
 ## A framework already loaded as an object file is not loaded again.
 # RUN: %lld -arch x86_64 -dylib -install_name /ObjcObject -no_uuid -platform_version macos 11.0 11.0 \

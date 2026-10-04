@@ -3188,15 +3188,28 @@ static bool canPipelineTapiFiles() {
 // Speculative: a read failure, a non-TBD file or an input which is never loaded
 // costs worker time only, and is still read, diagnosed and published by the
 // ordered walk.
+// A TBD is either named .tbd, or is a stub standing in for a dylib (.dylib), or
+// is a framework or dylib binary with no extension at all. Everything else --
+// .o, .a, .rlib, .bc, .swiftmodule -- cannot be one, and a negative list missed
+// them: a Rust link passes 207 .rlib archives, and each one was opened, mapped
+// and sniffed on the main thread here and then opened and mapped a second time
+// by the ordered walk, because only TBDs are entered into cachedReads.
+static bool mayBeTapiPath(StringRef path) {
+  StringRef ext = sys::path::extension(path);
+  return ext.empty() || ext == ".tbd" || ext == ".dylib";
+}
+
 static void pipelineTapiPath(StringRef path) {
-  // An object or archive input is never a TBD; do not fault it in twice.
-  if (path.ends_with(".o") || path.ends_with(".a"))
+  // Do not fault in an input that cannot be a TBD.
+  if (!mayBeTapiPath(path))
     return;
   if (cachedReads.contains(CachedHashStringRef(path)))
     return;
 
   // Not readFile(): that diagnoses a failure and records a --reproduce member
-  // at the ordered position.
+  // at the ordered position. The scope names every input this speculative pass
+  // opens, so a trace shows which inputs are opened twice.
+  TimeTraceScope timeScope("Speculative TAPI read", path);
   ErrorOr<std::unique_ptr<MemoryBuffer>> mbOrErr =
       MemoryBuffer::getFile(path, /*IsText=*/false,
                             /*RequiresNullTerminator=*/false);
