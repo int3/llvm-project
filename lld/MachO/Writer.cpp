@@ -1835,8 +1835,8 @@ void Writer::buildFixupChains() {
 }
 
 // Whether the input files can be unmapped during UUID generation and signing.
-// The map file thread (concurrent with the whole write) and -dependency_info
-// (after the commit) still read input-backed names. Conservatively retain the
+// The map file thread (concurrent with the whole write) still reads inputs.
+// Dependency names are snapshotted before release. Conservatively retain the
 // inputs for --reproduce too, although TarWriter consumes input synchronously.
 static bool canReleaseInputsEarly() {
 #if LLVM_ENABLE_THREADS
@@ -1844,7 +1844,7 @@ static bool canReleaseInputsEarly() {
   // performs anyway.
   if (parallel::strategy.ThreadsRequested == 1)
     return false;
-  return config->mapFile.empty() && !depTracker->isActive() && !tar;
+  return config->mapFile.empty() && !tar;
 #else
   return false;
 #endif
@@ -1876,7 +1876,10 @@ void Writer::writeOutputFile() {
   // _exit, which every caller waits for. The output mapping is a different
   // mapping, so its release does not depend on this one in either order.
   std::optional<llvm::thread> inputReleaser;
-  if (canReleaseInputsEarly())
+  if (canReleaseInputsEarly()) {
+    // getName() can borrow even the MemoryBuffer owner's identifier, not just
+    // mapped bytes. Copy on main before the helper destroys any input owner.
+    depTracker->snapshotInputs(inputFiles);
     inputReleaser.emplace([] {
       bool ownProfiler = config->timeTraceEnabled;
       if (ownProfiler)
@@ -1889,6 +1892,7 @@ void Writer::writeOutputFile() {
       if (ownProfiler)
         timeTraceProfilerFinishThread();
     });
+  }
 
   if (config->generateUuid)
     writeUuid();

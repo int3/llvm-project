@@ -245,7 +245,15 @@ DenseMap<CachedHashStringRef, MemoryBufferRef> macho::cachedReads;
 static std::vector<std::unique_ptr<MemoryBuffer> *> inputBufferOwners;
 
 void macho::ownInputBuffer(std::unique_ptr<MemoryBuffer> mb) {
-  inputBufferOwners.push_back(make<std::unique_ptr<MemoryBuffer>>(std::move(mb)));
+  auto *owner = make<std::unique_ptr<MemoryBuffer>>(std::move(mb));
+#if LLVM_ENABLE_THREADS
+  // The writer never releases inputs early at one thread. Keep arena ownership
+  // in that case, without growing a second list of the same owners.
+  if (parallel::strategy.ThreadsRequested != 1)
+    inputBufferOwners.push_back(owner);
+#else
+  (void)owner;
+#endif
 }
 
 void macho::releaseInputBuffers() {

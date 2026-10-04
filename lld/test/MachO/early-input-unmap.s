@@ -5,9 +5,9 @@
 ## chained fixups (buildFixupChains() reads input section names on its error
 ## path, so the release starts after it), with -sectcreate data (copied from an
 ## input buffer by writeSections()), and with a thin archive, whose members the
-## walker maps itself. The map file thread and -dependency_info read input-backed
-## names after the release point, so they turn the release off; --reproduce is
-## conservatively gated too. Their output must still be complete. The time trace shows whether the
+## walker maps itself. The map file thread reads inputs after the release point,
+## so it turns release off; --reproduce is conservatively gated too.
+## Dependency names are copied before release. Their output must still be complete. The time trace shows whether the
 ## release ran. The output basenames match so the ad-hoc signature does too.
 
 # RUN: rm -rf %t; split-file %s %t; mkdir -p %t/t1 %t/t4
@@ -47,7 +47,7 @@
 # RUN: FileCheck --check-prefix=MAP %s < %t/t4/map
 # RUN: %python %S/Inputs/DependencyDump.py %t/t4/deps | FileCheck --check-prefix=DEPS %s
 
-## Each consumer on its own also keeps the inputs mapped.
+## Map/reproduce keep inputs mapped; dependency info alone permits release.
 # RUN: %lld --threads=4 %t/main.o %t/bar.a %t/baz.a %t/libfoo.dylib -lSystem \
 # RUN:   -map %t/t4/map-only -o %t/t4/map-only.out \
 # RUN:   --time-trace-granularity=0 --time-trace=%t/t4/map-only.json
@@ -57,7 +57,7 @@
 # RUN:   -dependency_info %t/t4/deps-only -o %t/t4/deps-only.out \
 # RUN:   --time-trace-granularity=0 --time-trace=%t/t4/deps-only.json
 # RUN: %python %S/Inputs/DependencyDump.py %t/t4/deps-only | FileCheck --check-prefix=DEPS %s
-# RUN: FileCheck --check-prefix=KEPT %s < %t/t4/deps-only.json
+# RUN: FileCheck --check-prefix=RELEASED %s < %t/t4/deps-only.json
 # RUN: cd %t && %lld --threads=4 main.o bar.a baz.a libfoo.dylib -lSystem \
 # RUN:   --reproduce repro.tar -o %t/t4/repro.out \
 # RUN:   --time-trace-granularity=0 --time-trace=%t/t4/repro.json

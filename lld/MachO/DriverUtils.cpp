@@ -912,6 +912,16 @@ macho::DependencyTracker::DependencyTracker(StringRef path)
   }
 }
 
+void macho::DependencyTracker::snapshotInputs(
+    const SetVector<InputFile *> &inputs) {
+  if (!active)
+    return;
+  inputNamesSnapshot.emplace();
+  inputNamesSnapshot->reserve(inputs.size());
+  for (InputFile *f : inputs)
+    inputNamesSnapshot->push_back(f->getName().str());
+}
+
 void macho::DependencyTracker::write(StringRef version,
                                      const SetVector<InputFile *> &inputs,
                                      StringRef output) {
@@ -939,9 +949,16 @@ void macho::DependencyTracker::write(StringRef version,
 
   // Sort the input by its names.
   std::vector<StringRef> inputNames;
-  inputNames.reserve(inputs.size());
-  for (InputFile *f : inputs)
-    inputNames.push_back(f->getName());
+  if (inputNamesSnapshot) {
+    inputNames.reserve(inputNamesSnapshot->size());
+    for (const std::string &name : *inputNamesSnapshot)
+      inputNames.push_back(name);
+  } else {
+    // No early release (including a writer early return): inputs are live.
+    inputNames.reserve(inputs.size());
+    for (InputFile *f : inputs)
+      inputNames.push_back(f->getName());
+  }
   llvm::sort(inputNames);
 
   for (const StringRef &in : inputNames)

@@ -161,8 +161,9 @@ class DependencyTracker {
 public:
   explicit DependencyTracker(llvm::StringRef path);
 
-  // Whether write() will run, reading the input files' names.
-  bool isActive() const { return active; }
+  // On the main thread, preserve exact input names before their buffers are
+  // released. Does nothing when dependency tracking is disabled.
+  void snapshotInputs(const llvm::SetVector<InputFile *> &inputs);
 
   // Adds the given path to the set of not-found files.
   inline void logFileNotFound(const Twine &path) {
@@ -195,6 +196,10 @@ private:
   // We need to own the paths because some of them are temporarily
   // constructed.
   std::set<std::string> notFounds;
+
+  // A new tracker is constructed for each link. An engaged, possibly empty
+  // snapshot means write() must not inspect the released input files.
+  std::optional<std::vector<std::string>> inputNamesSnapshot;
 };
 
 extern std::unique_ptr<DependencyTracker> depTracker;
