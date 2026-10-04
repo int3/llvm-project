@@ -3407,14 +3407,17 @@ bool ArchiveFile::fillMemberUndefineds(uint64_t childOffset) {
   // whole link back to addLazySymbols() if it meets one.
   if (identify_magic(mb->getBuffer()) != file_magic::macho_object)
     return false;
-  llvm::SmallVector<StringRef, 0> &names =
+  llvm::SmallVector<CachedHashStringRef, 0> &names =
       undefinedNames.find(childOffset)->second;
   // An LC_LINKER_OPTION in a member adds inputs after the phase, and a name only
   // those inputs reference has no slot yet, because the walk creates none for an
   // index entry it does not extract. The member's load commands are being walked
   // here anyway, so the walk can find out before it commits to anything.
   bool sawLinkerOption = false;
-  forEachUndefinedName(*mb, [&](StringRef name) { names.push_back(name); },
+  forEachUndefinedName(*mb,
+                       [&](StringRef name) {
+                         names.push_back(CachedHashStringRef(name));
+                       },
                        &sawLinkerOption);
   if (sawLinkerOption)
     memberLinkerOptions.store(true, std::memory_order_relaxed);

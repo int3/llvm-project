@@ -150,9 +150,22 @@ public:
   // The serial linker created a slot for every archive index entry, so a symbol
   // an extracted member defines sits in symVector where the archive's index was
   // published, not where the member was parsed. The walker reserves those
-  // positions; the member's own records then fill them in.
-  void reserveArchiveSlot(StringRef name, InputFile *archive,
-                          RecordOrdinal ordinal);
+  // positions; the member's own records fill them in.
+  //
+  // The select loop collects the reservations into one list per shard (routed
+  // by shardOfName()) instead of inserting them itself, and they are applied
+  // once the member parses have been joined, one thread per shard and so
+  // without a lock. Each one does what the inline insert did: an existing slot
+  // lowers its firstOrdinal, a missing one is created as a placeholder at the
+  // reservation's ordinal. Both effects commute with the fold's, so applying
+  // them after it changes nothing (see applyArchiveReservations()).
+  struct ArchiveReservation {
+    llvm::CachedHashStringRef name;
+    InputFile *archive;
+    RecordOrdinal ordinal;
+  };
+  void applyArchiveReservations(
+      llvm::MutableArrayRef<std::vector<ArchiveReservation>> perShard);
 
 private:
   // Per-slot bookkeeping for the fold. Allocated immediately in front of the

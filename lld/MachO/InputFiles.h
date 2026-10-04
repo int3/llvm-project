@@ -561,7 +561,10 @@ public:
   void reserveMemberUndefineds(
       std::vector<std::pair<ArchiveFile *, uint64_t>> &work);
   bool fillMemberUndefineds(uint64_t childOffset);
-  ArrayRef<StringRef> memberUndefineds(uint64_t childOffset) const {
+  // The names carry their hashes, computed here on the worker, because the
+  // serial select loop's provider lookup needs nothing else from them.
+  ArrayRef<llvm::CachedHashStringRef>
+  memberUndefineds(uint64_t childOffset) const {
     auto it = undefinedNames.find(childOffset);
     assert(it != undefinedNames.end());
     return it->second;
@@ -606,7 +609,8 @@ public:
 private:
   // Keyed by child offset. Every value is created before any worker runs, so the
   // workers only write into their own value and never rehash the map.
-  llvm::DenseMap<uint64_t, llvm::SmallVector<StringRef, 0>> undefinedNames;
+  llvm::DenseMap<uint64_t, llvm::SmallVector<llvm::CachedHashStringRef, 0>>
+      undefinedNames;
   // Same shape and the same rule: every key exists before any worker runs.
   llvm::DenseMap<uint64_t, bool> memberObjC;
   // Same shape and the same rule, and only for a thin archive: the buffer a

@@ -768,9 +768,90 @@ struct ArchiveProvider {
   }
 };
 
+// One slot of a provider shard's open-addressing table. The name's hash and
+// length sit next to its pointer, so that a probe rejects a non-matching slot
+// without touching the name's bytes, and only a hash-and-length match reads
+// them. An empty slot has providerIndex == emptyProvider.
+struct ProviderSlot {
+  uint32_t hash;
+  uint32_t len;
+  const char *name;
+  uint32_t providerIndex;
+};
+static constexpr uint32_t emptyProvider = UINT32_MAX;
+
+// The select loop's lookups are its largest cost, and each one used to be a
+// chain of two or three dependent cache misses (the DenseMap bucket, then the
+// key's bytes), one name at a time. The shard is a flat table instead, sized
+// before the filter pass and kept at or under half full, with
+// linear probing, so that a lookup can be split into stages and the misses of a
+// whole block of names overlapped (see resolveArchiveProviders()). It is written
+// only in the filter pass, under `mu`; afterwards the slots are read-only and
+// only the providers' `extracted` flags change, on the main thread.
 struct ProviderShard {
-  llvm::DenseMap<llvm::CachedHashStringRef, ArchiveProvider> map;
+  std::vector<ProviderSlot> slots;
+  uint32_t mask = 0;
+  uint32_t used = 0;
+  std::vector<ArchiveProvider> providers;
   std::mutex mu;
+
+  void init(size_t entries) {
+    // `entries` bounds the shard's distinct names, but on the corpora they are
+    // 30-100% of it (Chromium's 2.68 M index entries name 1.07 M names), so a
+    // table sized for load 0.5 on the entries was at load 0.13 there and cost
+    // 190 MiB of slots. Size it for the entries at load 1 instead and grow past
+    // load 0.5: one growth at most on a link whose names are all distinct.
+    size_t capacity = llvm::PowerOf2Ceil(std::max<size_t>(16, entries));
+    slots.assign(capacity, ProviderSlot{0, 0, nullptr, emptyProvider});
+    mask = capacity - 1;
+    used = 0;
+  }
+
+  // The slot holding `name`, or the empty slot where it would go.
+  ProviderSlot *probe(llvm::CachedHashStringRef name) {
+    StringRef str = name.val();
+    for (uint32_t pos = name.hash() & mask;; pos = (pos + 1) & mask) {
+      ProviderSlot &slot = slots[pos];
+      if (slot.providerIndex == emptyProvider ||
+          (slot.hash == name.hash() && slot.len == str.size() &&
+           memcmp(slot.name, str.data(), str.size()) == 0))
+        return &slot;
+    }
+  }
+
+  void grow() {
+    std::vector<ProviderSlot> old = std::move(slots);
+    slots.assign(old.size() * 2, ProviderSlot{0, 0, nullptr, emptyProvider});
+    mask = slots.size() - 1;
+    for (const ProviderSlot &slot : old) {
+      if (slot.providerIndex == emptyProvider)
+        continue;
+      uint32_t pos = slot.hash & mask;
+      while (slots[pos].providerIndex != emptyProvider)
+        pos = (pos + 1) & mask;
+      slots[pos] = slot;
+    }
+  }
+
+  // The provider for `name`, inserting `provider` if there is none. The caller
+  // holds `mu`.
+  std::pair<ArchiveProvider *, bool>
+  findOrInsert(llvm::CachedHashStringRef name, const ArchiveProvider &provider) {
+    ProviderSlot *slot = probe(name);
+    if (slot->providerIndex != emptyProvider)
+      return {&providers[slot->providerIndex], false};
+    // Keep the load at or under one half (see init()).
+    if (2 * (used + 1) > slots.size()) {
+      grow();
+      slot = probe(name);
+    }
+    ++used;
+    *slot = ProviderSlot{name.hash(), static_cast<uint32_t>(name.size()),
+                         name.val().data(),
+                         static_cast<uint32_t>(providers.size())};
+    providers.push_back(provider);
+    return {&providers.back(), true};
+  }
 };
 } // namespace
 
@@ -797,9 +878,76 @@ static unsigned providerShardOf(llvm::CachedHashStringRef name) {
 static ArchiveProvider *lookupArchiveProvider(llvm::CachedHashStringRef name) {
   if (!providerShards)
     return nullptr;
-  auto &map = providerShards[providerShardOf(name)].map;
-  auto it = map.find(name);
-  return it == map.end() ? nullptr : &it->second;
+  ProviderShard &shard = providerShards[providerShardOf(name)];
+  ProviderSlot *slot = shard.probe(name);
+  return slot->providerIndex == emptyProvider
+             ? nullptr
+             : &shard.providers[slot->providerIndex];
+}
+
+static inline void prefetchRead(const void *p) {
+#if defined(__GNUC__) || defined(__clang__)
+  __builtin_prefetch(p, /*rw=*/0, /*locality=*/3);
+#else
+  (void)p;
+#endif
+}
+
+// lookupArchiveProvider() for `n` names at once: out[i] is the provider of
+// nameAt(i), or null. The same answer as n separate lookups, but staged over
+// blocks of names so that the cache misses of a block overlap instead of
+// forming one dependent chain per name: first the home slot of every name is
+// prefetched; then each name's probe runs, stopping at the first slot whose hash
+// and length match (whose name bytes are prefetched in turn) or at an empty
+// slot; then the matches' bytes are compared, the provider records prefetched,
+// and the rare hash-and-length collision finishes its probe the slow way.
+// Linear probing keeps a chain's later slots next to the prefetched one.
+static constexpr size_t providerLookupBlock = 64;
+template <typename NameAt>
+static void resolveArchiveProviders(size_t n, NameAt nameAt,
+                                    ArchiveProvider **out) {
+  ProviderShard *shards = providerShards.get();
+  ProviderSlot *hit[providerLookupBlock];
+  for (size_t begin = 0; begin < n; begin += providerLookupBlock) {
+    size_t count = std::min(providerLookupBlock, n - begin);
+    for (size_t i = 0; i != count; ++i) {
+      llvm::CachedHashStringRef name = nameAt(begin + i);
+      ProviderShard &shard = shards[providerShardOf(name)];
+      prefetchRead(&shard.slots[name.hash() & shard.mask]);
+    }
+    for (size_t i = 0; i != count; ++i) {
+      llvm::CachedHashStringRef name = nameAt(begin + i);
+      ProviderShard &shard = shards[providerShardOf(name)];
+      hit[i] = nullptr;
+      for (uint32_t pos = name.hash() & shard.mask;; pos = (pos + 1) & shard.mask) {
+        ProviderSlot &slot = shard.slots[pos];
+        if (slot.providerIndex == emptyProvider)
+          break;
+        if (slot.hash == name.hash() && slot.len == name.size()) {
+          prefetchRead(slot.name);
+          hit[i] = &slot;
+          break;
+        }
+      }
+    }
+    for (size_t i = 0; i != count; ++i) {
+      ArchiveProvider *&result = out[begin + i];
+      ProviderSlot *slot = hit[i];
+      if (!slot) {
+        result = nullptr;
+        continue;
+      }
+      llvm::CachedHashStringRef name = nameAt(begin + i);
+      ProviderShard &shard = shards[providerShardOf(name)];
+      if (memcmp(slot->name, name.val().data(), name.size()) != 0) {
+        // A different name with the same hash and length: finish the probe.
+        result = lookupArchiveProvider(name);
+        continue;
+      }
+      result = &shard.providers[slot->providerIndex];
+      prefetchRead(result);
+    }
+  }
 }
 
 static bool reverseHeldParseOrder();
@@ -1189,6 +1337,15 @@ static bool walkArchives() {
   // half a million lookups moved from here into the serial part.
   ts.reset(new TimeTraceScope("Filter and fold archive indexes"));
   providerShards = std::make_unique<ProviderShard[]>(numProviderShards);
+  {
+    // Each shard's share of the index entries bounds its distinct names.
+    size_t totalEntries = 0;
+    for (ArchiveFile *archive : archives)
+      totalEntries += archive->indexEntries.size();
+    size_t share = llvm::divideCeil(totalEntries, numProviderShards);
+    parallelFor(0, numProviderShards,
+                [&](size_t i) { providerShards[i].init(share); });
+  }
   std::vector<llvm::SmallVector<uint32_t, 0>> chunkCandidates(chunks.size());
   parallelFor(0, chunks.size(), [&](size_t chunkIndex) {
     const EntryChunk &chunk = chunks[chunkIndex];
@@ -1244,9 +1401,9 @@ static bool walkArchives() {
       // it.
       ProviderShard &shard = providerShards[providerShardOf(entry.name)];
       std::lock_guard<std::mutex> lock(shard.mu);
-      auto [it, inserted] = shard.map.try_emplace(entry.name, provider);
-      if (!inserted && provider.precedes(it->second))
-        it->second = provider;
+      auto [existing, inserted] = shard.findOrInsert(entry.name, provider);
+      if (!inserted && provider.precedes(*existing))
+        *existing = provider;
     }
   });
   // The walk visits an archive's candidates in index order. The chunks are built
@@ -1274,15 +1431,31 @@ static bool walkArchives() {
   // the state at the archive's own position -- and suppress the override on both
   // paths. The candidate test above drops such an entry for the same reason, so
   // the walk itself never extracts at it.
-  for (unsigned i = 0; i != numProviderShards; ++i)
-    for (const auto &entry : providerShards[i].map) {
-      Symbol *sym = symtab->find(entry.first);
-      auto *dysym = dyn_cast_or_null<DylibSymbol>(sym);
-      if (!dysym || !dysym->isWeakDef() || dysym->isReferenced())
-        continue;
-      if (dysym->getFile()->id < archives[entry.second.archiveIndex]->id)
-        weakOverrideSuppressed.insert(sym);
-    }
+  //
+  // Nothing mutates the symbol table or the provider table between the filter
+  // pass and the walk, so the lookups run one provider shard per task and only
+  // the set's inserts are serial; the set's contents do not depend on the order
+  // they are inserted in.
+  {
+    std::vector<std::vector<Symbol *>> suppressed(numProviderShards);
+    parallelFor(0, numProviderShards, [&](size_t i) {
+      const ProviderShard &shard = providerShards[i];
+      for (const ProviderSlot &slot : shard.slots) {
+        if (slot.providerIndex == emptyProvider)
+          continue;
+        Symbol *sym = symtab->find(llvm::CachedHashStringRef(
+            StringRef(slot.name, slot.len), slot.hash));
+        auto *dysym = dyn_cast_or_null<DylibSymbol>(sym);
+        if (!dysym || !dysym->isWeakDef() || dysym->isReferenced())
+          continue;
+        const ArchiveProvider &provider = shard.providers[slot.providerIndex];
+        if (dysym->getFile()->id < archives[provider.archiveIndex]->id)
+          suppressed[i].push_back(sym);
+      }
+    });
+    for (const std::vector<Symbol *> &syms : suppressed)
+      weakOverrideSuppressed.insert(syms.begin(), syms.end());
+  }
   weakOverrideSuppressedHook = suppressesWeakOverride;
 
   ts.reset();
@@ -1320,8 +1493,8 @@ static bool walkArchives() {
   // counter. Nothing here draws from the command-line counter, which is already
   // past every input.
   //
-  // An index entry the walk never visits still needs a position, because
-  // reserveArchiveSlot() puts a name at the earliest entry that names it, and
+  // An index entry the walk never visits still needs a position, because a slot
+  // reservation puts a name at the earliest entry that names it, and
   // that entry may be one the walk passed over. The counter therefore leaves a
   // gap of one value per skipped entry, jumped arithmetically rather than by
   // touching those entries: the walk only visits candidates, which is where its
@@ -1387,10 +1560,9 @@ static bool walkArchives() {
   //    only can a lock-free find() rehash under it, but a slot's contents can
   //    change between the lookup and the predicate. It no longer reads the table
   //    at all -- the answer is the provider's pre-walk snapshot, which is the
-  //    value find() returned before any member parse started. During the loop the
-  //    only serial mutation of the table is reserveArchiveSlot(), which leaves an
-  //    Undefined placeholder that definedAlready() reads as "not defined", so the
-  //    snapshot stays exact. The extraction decisions are therefore both
+  //    value find() returned before any member parse started. The loop itself
+  //    makes no mutation of the table at all (the slot reservations are
+  //    collected and applied after the join), so the snapshot stays exact. The extraction decisions are therefore both
   //    unchanged and independent of worker timing.
   //
   //    This also settles the reviewer's named concern about `definedAlready`
@@ -1407,14 +1579,16 @@ static bool walkArchives() {
   //    set on the main thread before the member is queued, and never consults a
   //    slot the member's fold will write.
   //
-  //  * reserveArchiveSlot() inserts into a shard while workers fold into it, so
-  //    it takes the shard lock now; see SymbolTable.cpp for why its effects are
-  //    order-independent.
+  //  * The slot reservations, which used to insert into a shard under its lock
+  //    while workers folded into it, are collected per shard and applied once
+  //    the parses are joined; see SymbolTable::applyArchiveReservations() for
+  //    why their effects commute with the folds'.
   //
   //  * Everything else the loop touches while workers run is either main-thread
   //    only (the `seen` set, the provider map's `extracted` flags, inputFiles,
-  //    the walk counters) or read-only for the whole loop (memberUndefineds, the
-  //    provider map's keys, weakOverrideSuppressed).
+  //    the walk counters, the reservation lists) or read-only for the whole
+  //    loop (memberUndefineds, the provider table's slots,
+  //    weakOverrideSuppressed).
   //
   // LLD_REVERSE_HELD_PARSE keeps its old meaning by turning streaming off: it
   // exists to force one deterministic out-of-order fold order, and streaming
@@ -1426,8 +1600,13 @@ static bool walkArchives() {
   // worker count. This bounds how far the select loop may run ahead of them, so a
   // link extracting tens of thousands of members does not queue them all at once,
   // and it is the knob to turn down if a screen shows system time rising.
+  //
+  // LLD_INLINE_MEMBER_PARSE is a test hook that sets the cap to zero, so that
+  // every member is parsed inline on the main thread (see streamParse).
   const int inFlightCap =
-      std::max<int>(1, static_cast<int>(llvm::parallel::getThreadCount()));
+      ::getenv("LLD_INLINE_MEMBER_PARSE")
+          ? 0
+          : std::max<int>(1, static_cast<int>(llvm::parallel::getThreadCount()));
   if (stream) {
     parallelInput.memberParses =
         std::make_unique<llvm::parallel::TaskGroup>();
@@ -1437,8 +1616,21 @@ static bool walkArchives() {
   }
   auto streamParse = [&](ObjFile *obj) {
     std::atomic<int> &inFlight = parallelInput.memberParsesInFlight;
-    while (inFlight.load(std::memory_order_acquire) >= inFlightCap)
-      std::this_thread::yield();
+    // At the cap the loop is ahead of the parses, so rather than wait for a
+    // worker, the main thread parses this member itself: exactly what the task
+    // would have run, on a thread that parallelParseActive already covers. Its
+    // diagnostics go to the member's own deferred list, as on a worker. It runs
+    // no other task: a fatal() in a task popped from the executor would leave
+    // through the crash-recovery context past the task's latch decrement, and
+    // the cleanup's joinStreamedMemberParses() would then wait forever. A
+    // fatal() here leaves no task behind.
+    if (inFlight.load(std::memory_order_acquire) >= inFlightCap) {
+      DeferredDiagnostics *saved = deferredDiagnostics;
+      deferredDiagnostics = &obj->parseCtx->diags;
+      obj->parseFile();
+      deferredDiagnostics = saved;
+      return;
+    }
     inFlight.fetch_add(1, std::memory_order_acq_rel);
     parallelInput.memberParseGroup->spawn([obj]() {
       deferredDiagnostics = &obj->parseCtx->diags;
@@ -1448,6 +1640,22 @@ static bool walkArchives() {
                                                    std::memory_order_acq_rel);
     });
   };
+
+  // The slot reservations of every extracted member, one list per symbol table
+  // shard, applied once the member parses are joined (see
+  // SymbolTable::applyArchiveReservations()). The select loop used to insert
+  // each one itself under the shard lock, against the folds.
+  std::vector<std::vector<SymbolTable::ArchiveReservation>> reservations(
+      SymbolTable::numDylibShards);
+
+  // The providers of the names extract() is walking, resolved in one batch per
+  // member before its loops run (resolveArchiveProviders()). A stack, because
+  // extract() recurses: each frame owns the range from its own base, and
+  // indexes it rather than holding a pointer, since a nested frame's push can
+  // reallocate. Only the provider pointers are resolved ahead; the `extracted`
+  // flags they lead to are still read at the point the loops reach them, after
+  // whatever the nested extractions have set.
+  std::vector<ArchiveProvider *> resolved;
 
   // Extract one member, then walk its own undefined symbols depth first, in
   // nlist order: that is where the serial linker applied them, and it applied
@@ -1460,14 +1668,27 @@ static bool walkArchives() {
         ObjFile *obj = archive->createIndexedMember(childOffset, reason);
         if (!obj)
           return;
-        for (uint32_t entryIndex : archive->memberEntries[childOffset]) {
+        ArrayRef<uint32_t> ownEntries = archive->memberEntries[childOffset];
+        ArrayRef<llvm::CachedHashStringRef> undefNames =
+            archive->memberUndefineds(childOffset);
+        const size_t base = resolved.size();
+        const size_t numOwn = ownEntries.size();
+        resolved.resize(base + numOwn + undefNames.size());
+        resolveArchiveProviders(
+            numOwn + undefNames.size(),
+            [&](size_t i) {
+              return i < numOwn ? archive->indexEntries[ownEntries[i]].name
+                                : undefNames[i - numOwn];
+            },
+            resolved.data() + base);
+        for (size_t k = 0; k != numOwn; ++k) {
           const ArchiveFile::IndexEntry &entry =
-              archive->indexEntries[entryIndex];
+              archive->indexEntries[ownEntries[k]];
           // If the walk has already passed an index entry for this name, the
           // serial linker created its slot there, and a definition arriving
           // later did not move it. A name with no provider entry is one no
           // index entry can ever ask for, so it needs no slot and no flag.
-          ArchiveProvider *first = lookupArchiveProvider(entry.name);
+          ArchiveProvider *first = resolved[base + k];
           if (!first)
             continue;
           // If a member extracted earlier already provides this name, the serial
@@ -1484,11 +1705,14 @@ static bool walkArchives() {
                          first->entryIndex <= frontierEntry);
           if (!passed)
             continue;
-          symtab->reserveArchiveSlot(
-              entry.name.val(), archive,
-              RecordOrdinal{parallelInput.archiveOrdinals[first->archiveIndex],
-                            walkOfEntry(first->archiveIndex, first->entryIndex),
-                            0});
+          // The position is final here (walkOfEntry() only ever reads blocks
+          // the walk has closed, and this entry's own walkStart), so it is
+          // computed now; only the insert waits for the join.
+          reservations[SymbolTable::shardOfName(entry.name)].push_back(
+              {entry.name, archive,
+               RecordOrdinal{parallelInput.archiveOrdinals[first->archiveIndex],
+                             walkOfEntry(first->archiveIndex, first->entryIndex),
+                             0}});
         }
         // The member's records apply before those of anything it extracts, so
         // it takes its ordinal here...
@@ -1496,18 +1720,18 @@ static bool walkArchives() {
 
         // The member's undefined names were enumerated on a worker before the
         // walk started; the serial walk only reads the list.
-        for (StringRef undefName : archive->memberUndefineds(childOffset)) {
+        for (size_t k = 0, e = undefNames.size(); k != e; ++k) {
+          StringRef undefName = undefNames[k].val();
           // The serial linker applies this undefined record here, so it takes
           // this sub-position and anything it extracts takes the ones after it.
           obj->parseCtx->undefinedWalks.push_back(walkCounter++);
-          llvm::CachedHashStringRef name(undefName);
           // The provider lookup comes first because it is the only one of these
           // tests that most undefined names fail: a name no archive provides can
           // never extract anything, whatever the symbol table says about it, and
           // one whose provider is already extracted was resolved inside that
           // member's parse. Both are pure tests, so hoisting them above the
           // table lookup does not change which members are extracted.
-          ArchiveProvider *provider = lookupArchiveProvider(name);
+          ArchiveProvider *provider = resolved[base + numOwn + k];
           if (!provider || provider->extracted)
             continue;
           // Against the provider's archive, not the one being walked: the serial
@@ -1529,6 +1753,7 @@ static bool walkArchives() {
           }
           extract(provider->archiveIndex, provider->childOffset, undefName);
         }
+        resolved.resize(base);
         obj->parseCtx->completion =
             RecordOrdinal{registrationTop, walkCounter, 0};
 
@@ -1593,16 +1818,25 @@ static bool walkArchives() {
 
     size_t next = 0;
     auto &pending = scheduled[archiveIndex];
-    while (next != archive->candidateEntries.size() || !pending.empty()) {
+    // The candidates' providers, resolved a block at a time ahead of the walk
+    // (resolveArchiveProviders()); a scheduled entry that is not also a
+    // candidate is looked up on its own. As in extract(), only the pointers are
+    // resolved ahead, never the `extracted` flags.
+    ArrayRef<uint32_t> candidates = archive->candidateEntries;
+    ArchiveProvider *candidateProviders[providerLookupBlock];
+    size_t blockBegin = 0, blockEnd = 0;
+    while (next != candidates.size() || !pending.empty()) {
       uint32_t entryIndex;
-      if (next == archive->candidateEntries.size())
+      if (next == candidates.size())
         entryIndex = pending.top();
       else if (pending.empty())
-        entryIndex = archive->candidateEntries[next];
+        entryIndex = candidates[next];
       else
-        entryIndex = std::min(archive->candidateEntries[next], pending.top());
-      while (next != archive->candidateEntries.size() &&
-             archive->candidateEntries[next] == entryIndex)
+        entryIndex = std::min(candidates[next], pending.top());
+      const bool isCandidate =
+          next != candidates.size() && candidates[next] == entryIndex;
+      size_t candidatePos = next;
+      while (next != candidates.size() && candidates[next] == entryIndex)
         ++next;
       while (!pending.empty() && pending.top() == entryIndex)
         pending.pop();
@@ -1616,7 +1850,23 @@ static bool walkArchives() {
       // linker, and every candidate entry has a provider by construction (the
       // merged pass gives an entry a provider unless its name is already
       // defined, which is also the first thing that disqualifies a candidate).
-      ArchiveProvider *entryProvider = lookupArchiveProvider(entry.name);
+      ArchiveProvider *entryProvider;
+      if (isCandidate) {
+        if (candidatePos >= blockEnd) {
+          blockBegin = candidatePos;
+          blockEnd = std::min(candidates.size(),
+                              blockBegin + providerLookupBlock);
+          resolveArchiveProviders(
+              blockEnd - blockBegin,
+              [&](size_t i) {
+                return archive->indexEntries[candidates[blockBegin + i]].name;
+              },
+              candidateProviders);
+        }
+        entryProvider = candidateProviders[candidatePos - blockBegin];
+      } else {
+        entryProvider = lookupArchiveProvider(entry.name);
+      }
       // A candidate entry with no provider at all is one the fold found already
       // Defined or Common, which is what definedAlready()'s first test used to
       // answer from the table: nothing to extract here either way.
@@ -1636,7 +1886,7 @@ static bool walkArchives() {
       walkCounter += entryIndex - lastVisitedEntry - 1;
       uint32_t walkStart = walkCounter++;
       lastVisitedEntry = entryIndex;
-      // The block goes in before the extraction, not after: reserveArchiveSlot()
+      // The block goes in before the extraction, not after: a slot reservation
       // may ask for this very entry's position while the extraction is running
       // (the frontier rule admits first->entryIndex == frontierEntry), and for
       // its own entry the answer is walkStart, which is already final. walkEnd is
@@ -1655,6 +1905,10 @@ static bool walkArchives() {
   } else {
     TimeTraceScope parseScope("Parse archive members");
     parseHeldFiles(firstMember);
+  }
+  {
+    TimeTraceScope applyScope("Apply archive slot reservations");
+    symtab->applyArchiveReservations(reservations);
   }
   return true;
 }

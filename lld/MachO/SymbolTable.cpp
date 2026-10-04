@@ -601,36 +601,46 @@ void SymbolTable::applyPendingCoalesces(
   }
 }
 
-void SymbolTable::reserveArchiveSlot(StringRef name, InputFile *archive,
-                                     RecordOrdinal ordinal) {
+void SymbolTable::applyArchiveReservations(
+    MutableArrayRef<std::vector<ArchiveReservation>> perShard) {
   assert(folding);
-  CachedHashStringRef cachedName(name);
-  Shard &shard = shards[shardOf(cachedName)];
+  assert(perShard.size() == numShards);
   // The walker streams each extracted member's parse to a worker as soon as the
-  // member has its position, so the select loop's reservations now run while
-  // workers fold into the same shards. Both of this function's effects commute
-  // with a fold's: firstOrdinal is a minimum, and the winner it sets on a fresh
-  // slot is overwritten unconditionally by the providing member's definition
-  // (foldDefined's UndefinedKind case), which always arrives. Only the map
-  // mutation and the header writes need the lock.
-  std::lock_guard<std::mutex> lock(shard.mu);
-  auto [it, wasInserted] = shard.map.try_emplace(cachedName, nullptr);
-  if (!wasInserted) {
-    SlotMeta &meta = metaOf(it->second);
-    if (ordinal < meta.firstOrdinal)
-      meta.firstOrdinal = ordinal;
-    return;
-  }
-  Symbol *slot = allocateSlot();
-  it->second = slot;
-  shard.created.push_back(slot);
-  SlotMeta &meta = metaOf(slot);
-  meta.firstOrdinal = ordinal;
-  meta.setWinner(ordinal);
-  // A placeholder: the member that provides this name always defines it, so
-  // this is replaced before anything reads it.
-  new (slot) Undefined(name, archive, RefState::Strong,
-                       /*wasBitcodeSymbol=*/false);
+  // member has its position, and used to reserve the member's slots on the main
+  // thread under the shard lock while those parses folded into the same shards.
+  // Both of a reservation's effects commute with a fold's, so they can as well
+  // run after every fold has landed: firstOrdinal is a minimum, and the
+  // providing member's definition, which always arrives, either finds no slot
+  // and creates it fresh (the same Defined the placeholder would have been
+  // rebuilt into by foldDefined's UndefinedKind case; isUsedInRegularObj and
+  // `used` come out the same) or finds a slot that a reservation then only
+  // lowers. Called after the member parses are joined and before
+  // endParallelInput(), so the slots still carry their headers and the
+  // compaction sorts the same set by the same keys.
+  parallelFor(0, numShards, [&](size_t si) {
+    Shard &shard = shards[si];
+    for (const ArchiveReservation &r : perShard[si]) {
+      assert(shardOf(r.name) == si);
+      auto [it, wasInserted] = shard.map.try_emplace(r.name, nullptr);
+      if (!wasInserted) {
+        SlotMeta &meta = metaOf(it->second);
+        if (r.ordinal < meta.firstOrdinal)
+          meta.firstOrdinal = r.ordinal;
+        continue;
+      }
+      // The providing member did not define the name externally after all (an
+      // N_EXT label that the parse turns into a local), which the walk assumes
+      // away; leave the same placeholder the inline reservation left.
+      Symbol *slot = allocateSlot();
+      it->second = slot;
+      shard.created.push_back(slot);
+      SlotMeta &meta = metaOf(slot);
+      meta.firstOrdinal = r.ordinal;
+      meta.setWinner(r.ordinal);
+      new (slot) Undefined(r.name.val(), r.archive, RefState::Strong,
+                           /*wasBitcodeSymbol=*/false);
+    }
+  });
 }
 
 Symbol *SymbolTable::addDefinedRecord(const DeferredDefinedRecord &record) {
