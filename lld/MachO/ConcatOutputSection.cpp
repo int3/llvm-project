@@ -22,6 +22,11 @@
 #include <limits>
 #include <thread>
 
+#ifdef __APPLE__
+#include <condition_variable>
+#include <mutex>
+#endif
+
 using namespace llvm;
 using namespace llvm::MachO;
 using namespace lld;
@@ -490,12 +495,12 @@ public:
                                           std::memory_order_acq_rel)) {
       fill(c);
       ++chunksInline;
-      states[c].store(ready, std::memory_order_release);
+      publish(states[c], ready);
     } else if (expected != ready) {
       auto start = tracing ? Clock::now() : Clock::time_point();
-      unsigned spins = 0;
-      while (states[c].load(std::memory_order_acquire) != ready)
-        pause(spins);
+      waitUntil([&] {
+        return states[c].load(std::memory_order_acquire) == ready;
+      });
       if (tracing)
         consumerWaitNs += elapsed(start);
     }
@@ -504,10 +509,10 @@ public:
   void release(size_t c) {
     // Keep the terminal state so a worker holding an old ticket skips it.
     states[c].store(consumed, std::memory_order_release);
-    released.store(c + 1, std::memory_order_release);
+    publish(released, c + 1);
   }
   void stop() {
-    stopped.store(true, std::memory_order_release);
+    publish(stopped, true);
     tasks.reset();
   }
   void report() const {
@@ -525,23 +530,52 @@ private:
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() -
                                                                start).count();
   }
-  static void pause(unsigned &spins) {
-    if (++spins >= 1000)
-      std::this_thread::yield();
-    else
+  // On Darwin sched_yield enters swtch_pri. Producers can spend the whole
+  // serial thunk walk waiting for ring space, so repeating that syscall burns
+  // kernel CPU. Spin briefly, then park. Publishing under the same mutex as
+  // the predicate check prevents a notification from racing with wait entry.
+  template <class Predicate> void waitUntil(Predicate done) {
+    unsigned spins = 0;
+#ifdef __APPLE__
+    while (!done()) {
+      if (++spins == 1000) {
+        std::unique_lock<std::mutex> lock(waitMutex);
+        changed.wait(lock, done);
+        return;
+      }
       std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
+#else
+    while (!done()) {
+      if (++spins >= 1000)
+        std::this_thread::yield();
+      else
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
+#endif
+  }
+  template <class T, class U> void publish(std::atomic<T> &state, U value) {
+#ifdef __APPLE__
+    {
+      std::lock_guard<std::mutex> lock(waitMutex);
+      state.store(value, std::memory_order_release);
+    }
+    // Waiters have different predicates (chunk readiness, ring space, stop).
+    // Waking just one could leave the next eligible ticket asleep forever.
+    changed.notify_all();
+#else
+    state.store(value, std::memory_order_release);
+#endif
   }
   void run() {
     while (!stopped.load(std::memory_order_acquire)) {
       size_t c = nextChunk.fetch_add(1, std::memory_order_relaxed);
       if (c >= numChunks)
         return;
-      unsigned spins = 0;
-      while (c >= released.load(std::memory_order_acquire) + ringSize) {
-        if (stopped.load(std::memory_order_acquire))
-          return;
-        pause(spins);
-      }
+      waitUntil([&] {
+        return c < released.load(std::memory_order_acquire) + ringSize ||
+               stopped.load(std::memory_order_acquire);
+      });
       if (stopped.load(std::memory_order_acquire))
         return;
       unsigned char expected = unclaimed;
@@ -553,7 +587,7 @@ private:
       if (tracing)
         producerNs.fetch_add(elapsed(start), std::memory_order_relaxed);
       chunksByWorkers.fetch_add(1, std::memory_order_relaxed);
-      states[c].store(ready, std::memory_order_release);
+      publish(states[c], ready);
     }
   }
   void fill(size_t c) {
@@ -616,6 +650,10 @@ private:
   size_t chunksInline = 0;
   uint64_t consumerWaitNs = 0;
   std::unique_ptr<parallel::TaskGroup> tasks;
+#ifdef __APPLE__
+  std::mutex waitMutex;
+  std::condition_variable changed;
+#endif
 };
 
 // Prefetch distances, in queue entries, for the relocation (and the final

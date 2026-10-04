@@ -11,6 +11,16 @@
 # RUN: cmp %t/1/linked-output %t/8/linked-output
 # RUN: cmp %t/1/linked-output %t/16/linked-output
 
+## Replacing an unused undefined thunk name stops the producers before the
+## walk finishes. A producer parked on a full ring must wake and exit even
+## though the consumer will never release its ticket's slot.
+# RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin %t/undef.s -o %t/undef.o
+# RUN: %lld -arch arm64 --threads=1 -no_uuid -o %t/1/linked-output %t.o %t/undef.o
+# RUN: %lld -arch arm64 --threads=8 -no_uuid -o %t/8/linked-output %t.o %t/undef.o
+# RUN: %lld -arch arm64 --threads=16 -no_uuid -o %t/16/linked-output %t.o %t/undef.o
+# RUN: cmp %t/1/linked-output %t/8/linked-output
+# RUN: cmp %t/1/linked-output %t/16/linked-output
+
 ## More than sixteen 4096-input chunks exercise slot reuse, empty ranges,
 ## forward and backward targets across chunks and multiple forced fronts.
 ## Two threads leave only one producer beside the prepare tasks, exercising
@@ -25,3 +35,6 @@ for i in range(70000):
         print('bl _end\nbl _main')
     print('ret')
 print('.globl _end\n_end:\nret')
+
+#--- undef.s
+.globl _end.thunk.0
