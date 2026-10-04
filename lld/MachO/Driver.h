@@ -161,6 +161,9 @@ class DependencyTracker {
 public:
   explicit DependencyTracker(llvm::StringRef path);
 
+  // Whether write() will run, reading the input files' names.
+  bool isActive() const { return active; }
+
   // Adds the given path to the set of not-found files.
   inline void logFileNotFound(const Twine &path) {
     if (active)

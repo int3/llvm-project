@@ -240,6 +240,33 @@ static bool compatWithTargetArch(const InputFile *file, const Header *hdr) {
 // Theoretically this caching could be more efficient by hoisting it, but that
 // would require altering many callers to track the state.
 DenseMap<CachedHashStringRef, MemoryBufferRef> macho::cachedReads;
+
+// The arena-held owners of the input buffers, in the order they were read.
+static std::vector<std::unique_ptr<MemoryBuffer> *> inputBufferOwners;
+
+void macho::ownInputBuffer(std::unique_ptr<MemoryBuffer> mb) {
+  inputBufferOwners.push_back(make<std::unique_ptr<MemoryBuffer>>(std::move(mb)));
+}
+
+void macho::releaseInputBuffers() {
+  // cachedReads points into the buffers released below. All its readers must
+  // have finished before release starts: clearing it is not synchronization
+  // for a concurrent readFile(), whose path may also borrow input storage.
+  // The speculative TAPI pipeline owns its buffers separately and does not
+  // access this cache.
+  cachedReads.clear();
+  for (InputFile *file : inputFiles)
+    if (auto *archive = dyn_cast<ArchiveFile>(file))
+      archive->releaseMemberBuffers();
+  // The owners themselves stay in the arena, empty, so that a library-mode
+  // arena teardown does not free a buffer twice.
+  for (std::unique_ptr<MemoryBuffer> *owner : inputBufferOwners)
+    owner->reset();
+  inputBufferOwners.clear();
+}
+
+void macho::forgetInputBuffers() { inputBufferOwners.clear(); }
+
 // Open a given file path and return it as a memory-mapped file.
 std::optional<MemoryBufferRef> macho::readFile(StringRef path) {
   CachedHashStringRef key(path);
@@ -256,7 +283,7 @@ std::optional<MemoryBufferRef> macho::readFile(StringRef path) {
 
   std::unique_ptr<MemoryBuffer> &mb = *mbOrErr;
   MemoryBufferRef mbref = mb->getMemBufferRef();
-  make<std::unique_ptr<MemoryBuffer>>(std::move(mb)); // take mb ownership
+  ownInputBuffer(std::move(mb));
 
   // If this is a regular non-fat file, return it.
   const char *buf = mbref.getBufferStart();

@@ -9,6 +9,7 @@
 #include "Writer.h"
 #include "ConcatOutputSection.h"
 #include "Config.h"
+#include "Driver.h"
 #include "InputFiles.h"
 #include "InputSection.h"
 #include "LinkerOptimizationHints.h"
@@ -1823,6 +1824,22 @@ void Writer::buildFixupChains() {
   }
 }
 
+// Whether the input files can be unmapped during UUID generation and signing.
+// The map file thread (concurrent with the whole write) and -dependency_info
+// (after the commit) still read input-backed names. Conservatively retain the
+// inputs for --reproduce too, although TarWriter consumes input synchronously.
+static bool canReleaseInputsEarly() {
+#if LLVM_ENABLE_THREADS
+  // At one thread nothing would overlap the unmapping, which process teardown
+  // performs anyway.
+  if (parallel::strategy.ThreadsRequested == 1)
+    return false;
+  return config->mapFile.empty() && !depTracker->isActive() && !tar;
+#else
+  return false;
+#endif
+}
+
 void Writer::writeCodeSignature() {
   if (codeSignatureSection) {
     TimeTraceScope timeScope("Write code signature");
@@ -1839,6 +1856,30 @@ void Writer::writeOutputFile() {
   writeSections();
   applyOptimizationHints();
   buildFixupChains();
+
+  // The last reads of input bytes are behind us: writeSections() copies the
+  // input sections and the input-backed strings (symbol table, STABS, export
+  // trie), the optimization hints read their payloads from the inputs, and
+  // buildFixupChains()' diagnostics print input section names. Unmap the inputs
+  // on a helper thread while the UUID, the signature, the output mapping's
+  // release run, rather than in the kernel's exit teardown after
+  // _exit, which every caller waits for. The output mapping is a different
+  // mapping, so its release does not depend on this one in either order.
+  std::optional<llvm::thread> inputReleaser;
+  if (canReleaseInputsEarly())
+    inputReleaser.emplace([] {
+      bool ownProfiler = config->timeTraceEnabled;
+      if (ownProfiler)
+        timeTraceProfilerInitialize(config->timeTraceGranularity,
+                                    "releaseInputBuffers");
+      {
+        TimeTraceScope timeScope("Release input buffers");
+        releaseInputBuffers();
+      }
+      if (ownProfiler)
+        timeTraceProfilerFinishThread();
+    });
+
   if (config->generateUuid)
     writeUuid();
   writeCodeSignature();
@@ -1847,6 +1888,12 @@ void Writer::writeOutputFile() {
     TimeTraceScope timeScope("Release output mapping");
     buffer->releaseMappingInParallel();
   }
+  // InMemoryBuffer::commit() can exit on a stream write/close error without
+  // unwinding this frame. Join before entering commit(), so global teardown
+  // cannot race the releaser, including when an ordinary file falls back to
+  // an in-memory buffer. A scope-exit guard would not protect that path.
+  if (inputReleaser)
+    inputReleaser->join();
   if (auto e = buffer->commit())
     fatal("failed to write output '" + buffer->getPath() +
           "': " + toString(std::move(e)));

@@ -3237,6 +3237,8 @@ static void pipelineTapiPath(StringRef path) {
   // buffer unchanged.
   StringRef savedPath = saver().save(path);
   MemoryBufferRef saved(mbref.getBuffer(), savedPath);
+  // Not ownInputBuffer(): the TAPI pipeline that reads this buffer lives until
+  // link() returns, so it stays mapped until exit.
   make<std::unique_ptr<MemoryBuffer>>(std::move(*mbOrErr));
   cachedReads[CachedHashStringRef(savedPath)] = saved;
   pipelineTapiFile(saved);
@@ -3932,6 +3934,10 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     resolvedFrameworks.clear();
     resolvedLibraries.clear();
     cachedReads.clear();
+    // Arena teardown has already destroyed the owners. Drop the recorded
+    // pointers without dereferencing them, including on links that never
+    // reached the writer and retained their buffers until arena teardown.
+    forgetInputBuffers();
     concatOutputSections.clear();
     resetMapFile();
     inputFiles.clear();

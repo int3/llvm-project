@@ -604,6 +604,9 @@ public:
   // Archive library does, so this is the cleanest way to wrap it.
   Error fetch(const llvm::object::Archive::Child &, StringRef reason);
   const llvm::object::Archive &getArchive() const { return *file; };
+  // Unmaps the thin-archive members mapWalkedMember() mapped; see
+  // releaseInputBuffers().
+  void releaseMemberBuffers() { memberBuffers.clear(); }
   static bool classof(const InputFile *f) { return f->kind() == ArchiveKind; }
 
 private:
@@ -650,6 +653,21 @@ private:
 
 extern llvm::SetVector<InputFile *> inputFiles;
 extern llvm::DenseMap<llvm::CachedHashStringRef, MemoryBufferRef> cachedReads;
+// Takes ownership of an input file's buffer for the rest of the link, and
+// records it so that releaseInputBuffers() can unmap it before process
+// teardown. Main thread only, like cachedReads.
+void ownInputBuffer(std::unique_ptr<llvm::MemoryBuffer> mb);
+// Unmaps every input buffer taken by ownInputBuffer() and every thin-archive
+// member the archive walker mapped, and clears cachedReads. (The TBDs the TAPI
+// pipeline read, its PreparedTapiFile buffers and the Archive's own
+// thin-member buffers stay mapped until exit.) Nothing may read an input file's bytes
+// afterwards: section contents, symbol and section names, file names and DWARF
+// all point into them. The Mach-O writer calls it once the output's contents
+// are final (see Writer::writeOutputFile()).
+void releaseInputBuffers();
+// Drops the records ownInputBuffer() kept, without touching the buffers: for
+// the library-mode reset, after the arena that holds their owners is freed.
+void forgetInputBuffers();
 extern llvm::SmallVector<StringRef> unprocessedLCLinkerOptions;
 
 // While set, a direct (non-lazy, non-archive-member) ObjFile does not parse
