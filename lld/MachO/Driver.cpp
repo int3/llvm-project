@@ -794,7 +794,11 @@ struct ProviderShard {
   uint32_t mask = 0;
   uint32_t used = 0;
   std::vector<ArchiveProvider> providers;
-  std::mutex mu;
+  // Not std::mutex: see ShardMutex.h. The provider fold contends exactly as the
+  // symbol table's shards do -- 1,478 (release) / 4,938 (debug) collisions per
+  // rust-analyzer link in the mini's System Trace -- and its critical section is
+  // one findOrInsert.
+  ShardMutex mu;
 
   void init(size_t entries) {
     // `entries` bounds the shard's distinct names, but on the corpora they are
@@ -1401,7 +1405,7 @@ static bool walkArchives() {
       // provider: a member the walk extracts later can be the first to reference
       // it.
       ProviderShard &shard = providerShards[providerShardOf(entry.name)];
-      std::lock_guard<std::mutex> lock(shard.mu);
+      std::lock_guard<ShardMutex> lock(shard.mu);
       auto [existing, inserted] = shard.findOrInsert(entry.name, provider);
       if (!inserted && provider.precedes(*existing))
         *existing = provider;

@@ -9,6 +9,7 @@
 #ifndef LLD_MACHO_SYMBOL_TABLE_H
 #define LLD_MACHO_SYMBOL_TABLE_H
 
+#include "ShardMutex.h"
 #include "Symbols.h"
 
 #include "lld/Common/LLVM.h"
@@ -215,7 +216,10 @@ private:
   struct Shard {
     llvm::DenseMap<llvm::CachedHashStringRef, Symbol *> map;
     std::vector<Symbol *> created;
-    std::mutex mu;
+    // Usually short critical sections, but map/vector growth, allocator
+    // refill and page faults can lengthen them. Try before blocking to reduce
+    // kernel waits on macOS; see ShardMutex.h for the waiting guarantees.
+    ShardMutex mu;
     // Slots created while a dylib batch is published. One thread owns a shard
     // for the duration, so the arena needs no lock, and a shard's slots stay
     // contiguous in the order that shard created them.

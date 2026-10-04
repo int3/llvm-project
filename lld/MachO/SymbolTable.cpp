@@ -286,7 +286,7 @@ Symbol *SymbolTable::foldDefined(const DeferredDefinedRecord &rec) {
                              config->interposable) &&
                             !rec.isPrivateExtern;
 
-  std::lock_guard<std::mutex> lock(shard.mu);
+  std::lock_guard<ShardMutex> lock(shard.mu);
   auto [it, wasInserted] = shard.map.try_emplace(cachedName, nullptr);
 
   auto build = [&](Symbol *slot, bool fresh, bool overridesWeakDef) -> Defined * {
@@ -500,7 +500,7 @@ Symbol *SymbolTable::foldUndefined(StringRef name, InputFile *file,
   Shard &shard = shards[shardOf(cachedName)];
   const RefState refState = isWeakRef ? RefState::Weak : RefState::Strong;
 
-  std::lock_guard<std::mutex> lock(shard.mu);
+  std::lock_guard<ShardMutex> lock(shard.mu);
   auto [it, wasInserted] = shard.map.try_emplace(cachedName, nullptr);
   if (wasInserted) {
     Symbol *slot = allocateSlot();
@@ -547,7 +547,7 @@ Symbol *SymbolTable::foldCommon(StringRef name, InputFile *file, uint64_t size,
   CachedHashStringRef cachedName(name);
   Shard &shard = shards[shardOf(cachedName)];
 
-  std::lock_guard<std::mutex> lock(shard.mu);
+  std::lock_guard<ShardMutex> lock(shard.mu);
   auto [it, wasInserted] = shard.map.try_emplace(cachedName, nullptr);
   if (wasInserted) {
     Symbol *slot = allocateSlot();
