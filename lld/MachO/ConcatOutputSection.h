@@ -134,12 +134,18 @@ private:
   /// \return true if the target in \p r is in __stubs or __objc_stubs and in
   /// range from \p callVA. \p estimatedStubsEnd is the estimated VA of the end
   /// of the last stubs section. \p addendIsZero and \p inStubs are r's addend
-  /// test and its referent's isInStubs(), recorded when the branch was queued.
+  /// test and its referent's isInStubs(), recorded when the branch was queued;
+  /// \p inObjCStubs is set when the referent is known to be defined in
+  /// __objc_stubs (and so is an Objective-C stub symbol).
   bool isTargetStubsAndInRange(uint64_t callVA, const Relocation &r,
                                bool addendIsZero, bool inStubs,
+                               bool inObjCStubs,
                                std::optional<uint64_t> estimatedStubsEnd) const;
   /// The number of relocations updated to point to thunks.
   size_t thunkCallCount = 0;
+  /// Set when createThunk() replaced an existing symbol of the thunk's name
+  /// in place, which can change a queued branch's key.
+  bool thunkReplacedSymbol = false;
 };
 
 NamePair maybeRenameSection(NamePair key);
@@ -179,12 +185,23 @@ struct ThunkKey {
   }
 };
 
+// A thunkMap lookup key whose hash was computed earlier (the thunk walk hashes
+// each queued branch's key once, when it first probes the map).
+struct HashedThunkKey {
+  const ThunkKey &key;
+  unsigned hash;
+};
+
 struct ThunkMapKeyInfo {
   static unsigned getHashValue(const ThunkKey &k) {
     return llvm::hash_combine(k.referent.getOpaqueValue(), k.value, k.addend);
   }
   static bool isEqual(const ThunkKey &lhs, const ThunkKey &rhs) {
     return lhs == rhs;
+  }
+  static unsigned getHashValue(const HashedThunkKey &k) { return k.hash; }
+  static bool isEqual(const HashedThunkKey &lhs, const ThunkKey &rhs) {
+    return lhs.key == rhs;
   }
 };
 

@@ -18,7 +18,6 @@
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/TimeProfiler.h"
 
-#include <deque>
 #include <limits>
 
 using namespace llvm;
@@ -182,11 +181,13 @@ void TextOutputSection::createThunk(const ConcatInputSection &isec,
     // addDefined() would replace an input symbol of the same name in place and
     // silently redirect every branch to it. Lazy symbols are not definitions
     // yet and are replaced harmlessly.
-    if (Symbol *clash = symtab->find(thunkName);
-        clash && (isa<Defined>(clash) || isa<DylibSymbol>(clash)))
-      error("linker-generated thunk name '" + thunkName +
-            "' collides with " + toString(*clash) + " from " +
-            toString(clash->getFile()));
+    if (Symbol *clash = symtab->find(thunkName)) {
+      thunkReplacedSymbol = true;
+      if (isa<Defined>(clash) || isa<DylibSymbol>(clash))
+        error("linker-generated thunk name '" + thunkName +
+              "' collides with " + toString(*clash) + " from " +
+              toString(clash->getFile()));
+    }
     thunkInfo.sym = symtab->addDefined(
         thunkName, /*file=*/nullptr, thunkInfo.isec, /*value=*/0, thunkSize,
         /*isWeakDef=*/false, /*isPrivateExtern=*/true,
@@ -244,19 +245,21 @@ TextOutputSection::estimateStubsEndVA(unsigned numPotentialThunks) const {
 
 bool TextOutputSection::isTargetStubsAndInRange(
     uint64_t callVA, const Relocation &r, bool addendIsZero, bool inStubs,
-    std::optional<uint64_t> estimatedStubsEnd) const {
+    bool inObjCStubs, std::optional<uint64_t> estimatedStubsEnd) const {
   if (!estimatedStubsEnd.has_value())
     return false;
-  // Every test here is a pure function of r and its referent; test the
-  // recorded bits first so most branches never touch the symbol again.
+  // Every test here is a pure function of r, its referent and callVA. Test the
+  // recorded bits and the range first, so that most branches never touch the
+  // symbol or its name again.
   if (!addendIsZero)
     return false;
-  if (!inStubs && !(in.objcStubs && in.objcStubs->isNeeded() &&
-                    ObjCStubsSection::isObjCStubSymbol(
-                        cast<Symbol *>(r.getReferent()))))
-    return false;
   uint64_t highVA = callVA + target->forwardBranchRange;
-  return *estimatedStubsEnd <= highVA;
+  if (*estimatedStubsEnd > highVA)
+    return false;
+  if (inStubs || inObjCStubs)
+    return true;
+  return in.objcStubs && in.objcStubs->isNeeded() &&
+         ObjCStubsSection::isObjCStubSymbol(cast<Symbol *>(r.getReferent()));
 }
 
 namespace {
@@ -277,16 +280,23 @@ enum : uint32_t {
   notFinalInRange = 1,
   addendIsZero = 2,
   inStubs = 4,
+  // The referent is defined in __objc_stubs, so it is an Objective-C stub
+  // symbol (ObjCStubsSection::addEntry() makes exactly those).
+  inObjCStubs = 8,
 };
 
 struct PendingBranch {
   Relocation *r;
-  ConcatInputSection *caller;
   uint64_t callVA;
   uint64_t dest;
   uint32_t targetIdx;
+  uint32_t callerIdx;
+  // ThunkMapKeyInfo::getHashValue(ThunkKey(*r)), computed when the branch was
+  // first looked up in thunkMap.
+  uint32_t keyHash;
   uint32_t flags;
 };
+static_assert(sizeof(PendingBranch) == 40 || sizeof(void *) != 8);
 
 struct DeferredRedirect {
   Relocation *r;
@@ -297,12 +307,132 @@ struct DeferredRedirect {
   uint32_t flags;
 };
 
+inline void prefetchLine(const void *p) {
+#if defined(__GNUC__) || defined(__clang__)
+  __builtin_prefetch(p);
+#else
+  (void)p;
+#endif
+}
+
+// The FIFO of branches that may still need a thunk: a power-of-two ring that
+// supports looking ahead of the front (to prefetch what the front will read).
+class PendingQueue {
+public:
+  bool empty() const { return count == 0; }
+  size_t size() const { return count; }
+  PendingBranch &front() { return buf[head]; }
+  const PendingBranch &operator[](size_t i) const {
+    return buf[(head + i) & mask];
+  }
+  void pop_front() {
+    head = (head + 1) & mask;
+    --count;
+  }
+  void push_back(const PendingBranch &b) {
+    if (count == cap)
+      grow();
+    buf[(head + count) & mask] = b;
+    ++count;
+  }
+
+private:
+  void grow() {
+    size_t newCap = cap ? cap * 2 : 4096;
+    // Not value-initialized: pages are touched only as entries are written.
+    std::unique_ptr<PendingBranch[]> n(new PendingBranch[newCap]);
+    for (size_t i = 0; i != count; ++i)
+      n[i] = buf[(head + i) & mask];
+    buf = std::move(n);
+    cap = newCap;
+    mask = newCap - 1;
+    head = 0;
+  }
+  std::unique_ptr<PendingBranch[]> buf;
+  size_t cap = 0, mask = 0, head = 0, count = 0;
+};
+
+// finalOff[i] is inputs[i]->outSecOff once the walk has passed input i. The
+// front and the end loops read it at random, so it is kept 32 bits wide (half
+// the cache footprint) unless an offset ever exceeds that.
+class FinalOffsets {
+public:
+  explicit FinalOffsets(size_t n) : narrow(n) {}
+  void set(size_t i, uint64_t off) {
+    if (LLVM_LIKELY(!isWide && off <= UINT32_MAX))
+      narrow[i] = off;
+    else
+      setWide(i, off);
+  }
+  uint64_t operator[](size_t i) const { return isWide ? wide[i] : narrow[i]; }
+  void prefetch(size_t i) const {
+    prefetchLine(isWide ? static_cast<const void *>(&wide[i]) : &narrow[i]);
+  }
+
+private:
+  void setWide(size_t i, uint64_t off) {
+    if (!isWide) {
+      wide.assign(narrow.begin(), narrow.end());
+      narrow = std::vector<uint32_t>();
+      isWide = true;
+    }
+    wide[i] = off;
+  }
+  std::vector<uint32_t> narrow;
+  std::vector<uint64_t> wide;
+  bool isWide = false;
+};
+
+// The branch relocations of the next few inputs, in scan order, and how many
+// each input has.
+class ScanAhead {
+public:
+  static constexpr size_t numCounts = 64;
+  uint32_t counts[numCounts] = {};
+  size_t size() const { return count; }
+  Relocation *operator[](size_t i) const { return buf[(head + i) & mask]; }
+  Relocation *pop() {
+    Relocation *r = buf[head];
+    head = (head + 1) & mask;
+    --count;
+    return r;
+  }
+  void push(Relocation *r) {
+    if (count == buf.size())
+      grow();
+    buf[(head + count) & mask] = r;
+    ++count;
+  }
+
+private:
+  void grow() {
+    std::vector<Relocation *> n(buf.empty() ? 1024 : buf.size() * 2);
+    for (size_t i = 0; i != count; ++i)
+      n[i] = buf[(head + i) & mask];
+    buf = std::move(n);
+    mask = buf.size() - 1;
+    head = 0;
+  }
+  std::vector<Relocation *> buf;
+  size_t mask = 0, head = 0, count = 0;
+};
+
 bool isVAInBranchRange(uint64_t callVA, uint64_t va) {
   uint64_t lowVA = target->backwardBranchRange < callVA
                        ? callVA - target->backwardBranchRange
                        : 0;
   uint64_t highVA = callVA + target->forwardBranchRange;
   return lowVA <= va && va <= highVA;
+}
+
+// Prefetch distances, in queue entries, for the relocation (and the final
+// offset of the target) and, closer to use, for the relocation's referent.
+constexpr size_t farAhead = 16;
+constexpr size_t nearAhead = 8;
+
+void prefetchReferent(const Relocation *r) {
+  if (auto *sym = dyn_cast_if_present<Symbol *>(r->getReferent()))
+    prefetchLine(sym);
 }
 } // namespace
 
@@ -319,10 +449,12 @@ void TextOutputSection::finalize() {
   // record instead of chasing relocation -> symbol -> section again. Every
   // decision below is taken at the same point, in the same order and from the
   // same values as the pointer-chasing formulation (isTargetKnownInRange()),
-  // so the output is unchanged.
+  // so the output is unchanged. What remains is memory latency, so the loops
+  // prefetch what the records a few entries ahead will read.
   const size_t numInputs = inputs.size();
-  // finalOff[i] is inputs[i]->outSecOff once the walk has passed input i.
-  std::vector<uint64_t> finalOff(numInputs);
+  FinalOffsets finalOff(numInputs);
+  const InputSection *objcStubsIsec = in.objcStubs ? in.objcStubs->isec
+                                                   : nullptr;
 
   // Whether the branch's target is within range, given that the first
   // `numFinal` inputs are final.
@@ -334,12 +466,16 @@ void TextOutputSection::finalize() {
       return isVAInBranchRange(callVA, addr + finalOff[targetIdx] + tgt);
     return (flags & notFinalInRange) != 0;
   };
-  auto makePending = [&](ConcatInputSection *caller, Relocation &r,
-                         uint64_t callVA) {
+  auto makePending = [&](uint32_t callerIdx, Relocation &r, uint64_t callVA) {
     auto *funcSym = cast<Symbol *>(r.getReferent());
     int64_t addend = r.getAddend();
     bool symInStubs = funcSym->isInStubs();
-    PendingBranch b{&r, caller, callVA, 0, fixedTarget,
+    PendingBranch b{&r,
+                    callVA,
+                    0,
+                    fixedTarget,
+                    callerIdx,
+                    0,
                     (addend == 0 ? addendIsZero : 0u) |
                         (symInStubs ? inStubs : 0u)};
     // Mirrors resolveSymbolOffsetVA(): a branch with an addend, or to a symbol
@@ -358,22 +494,33 @@ void TextOutputSection::finalize() {
           b.flags |= notFinalInRange;
         return b;
       }
+      if (tisec == objcStubsIsec)
+        b.flags |= inObjCStubs;
     }
     b.dest = resolveSymbolOffsetVA(funcSym, r.getType(), addend);
     return b;
   };
-  auto defer = [](const PendingBranch &b, Defined *thunk) {
-    return DeferredRedirect{b.r, thunk, b.callVA, b.dest, b.targetIdx,
-                            b.flags};
+  // A queued branch's key hash is computed once, at its first lookup. Its key
+  // can change only if createThunk() replaced its referent in place (a lazy or
+  // undefined symbol with a thunk's name); then hash afresh.
+  auto lookupKey = [&](const ThunkKey &key, uint32_t hash) {
+    return HashedThunkKey{key, LLVM_UNLIKELY(thunkReplacedSymbol)
+                                   ? ThunkMapKeyInfo::getHashValue(key)
+                                   : hash};
+  };
+  auto findThunk = [&](const ThunkKey &key, uint32_t hash) {
+    return thunkMap.find_as(lookupKey(key, hash));
   };
 
   // Branches whose target sections are out of range or have not yet been
   // finalized. We may need to emit thunks for them.
-  std::deque<PendingBranch> branchesToProcess;
+  PendingQueue branchesToProcess;
   // Branches whose targets have not yet be finalized, but a thunk for that
   // target exists. We defer processing these branches because it's possible we
   // can still direct call to their targets after they have all been finalized.
-  std::vector<DeferredRedirect> deferredBranchRedirects;
+  // Kept as two lists, each in ascending call address order: those found by
+  // the scan, and those found when they reached the front of the queue.
+  std::vector<DeferredRedirect> deferredAtScan, deferredAtFront;
 
   const uint64_t slop = config->slopScale * target->thunkSize;
   // The front of the queue waits until it is forced or its target becomes
@@ -384,22 +531,100 @@ void TextOutputSection::finalize() {
   // at its wake index `frontWake`, the first input after its target.
   bool frontChecked = false;
   size_t frontWake = 0;
+  // Pops come in bursts once a blocking front resolves. `popped` counts pops;
+  // entries up to (absolute position) farNext and nearNext have been
+  // prefetched. After a wait the window is reissued, since a long wait has
+  // evicted it.
+  size_t popped = 0, farNext = 0, nearNext = 0;
+  bool windowStale = true;
+  // The scan below visits each input's branch relocations and reads each
+  // one's referent and, for a definition, its section: dependent misses on
+  // scattered memory (one relocation vector per input). A look-ahead pass
+  // collects the branch relocations in scan order about `referentAhead`
+  // branches early and prefetches their referents; the scan then reads that
+  // list instead of all relocations, prefetching the referent's section
+  // `sectionAhead` branches early. Relocations are prefetched `relocsAhead`
+  // inputs before they are collected. Nothing the look-ahead reads changes
+  // before the scan reaches it: the walk only rewrites relocations of inputs
+  // it has passed.
+  constexpr size_t relocsAhead = 8, referentAhead = 48, sectionAhead = 16;
+  ScanAhead ahead;
+  size_t collectNext = 0;
+  auto prefetchRelocs = [&](size_t j) {
+    if (j >= numInputs)
+      return;
+    const auto &relocs = inputs[j]->relocs;
+    const char *p = reinterpret_cast<const char *>(relocs.data());
+    const char *e =
+        reinterpret_cast<const char *>(relocs.data() + relocs.size());
+    for (; p < e; p += 64)
+      prefetchLine(p);
+  };
+  auto collectBranches = [&](size_t j) {
+    uint32_t n = 0;
+    for (Relocation &r : reverse(inputs[j]->relocs)) {
+      if (!target->hasAttr(r.getType(), RelocAttrBits::BRANCH))
+        continue;
+      if (auto *sym = dyn_cast_if_present<Symbol *>(r.getReferent()))
+        prefetchLine(sym);
+      ahead.push(&r);
+      ++n;
+    }
+    ahead.counts[j % ScanAhead::numCounts] = n;
+  };
+  for (size_t j = 0; j != relocsAhead; ++j)
+    prefetchRelocs(j);
   for (size_t idx = 0; idx != numInputs; ++idx) {
     ConcatInputSection *isec = inputs[idx];
+    while (collectNext != numInputs &&
+           (collectNext <= idx ||
+            (ahead.size() < referentAhead &&
+             collectNext - idx < ScanAhead::numCounts))) {
+      prefetchRelocs(collectNext + relocsAhead);
+      collectBranches(collectNext++);
+    }
+    auto popFront = [&] {
+      branchesToProcess.pop_front();
+      ++popped;
+      if (windowStale) {
+        farNext = popped + 1;
+        nearNext = popped + 1 + nearAhead;
+        windowStale = false;
+      }
+      farNext = std::max(farNext, popped + 1);
+      nearNext = std::max(nearNext, popped + 1);
+      size_t avail = branchesToProcess.size();
+      for (size_t end = popped + std::min(avail, farAhead + 1);
+           farNext < end; ++farNext) {
+        const PendingBranch &e = branchesToProcess[farNext - popped];
+        if (e.targetIdx == fixedTarget)
+          prefetchLine(e.r);
+        else if (e.targetIdx < idx)
+          finalOff.prefetch(e.targetIdx);
+      }
+      for (size_t end = popped + std::min(avail, nearAhead + 1);
+           nearNext < end; ++nearNext) {
+        const PendingBranch &e = branchesToProcess[nearNext - popped];
+        if (e.targetIdx == fixedTarget)
+          prefetchReferent(e.r);
+      }
+    };
     while (!branchesToProcess.empty()) {
       PendingBranch &b = branchesToProcess.front();
       if (!frontChecked || idx >= frontWake) {
         if (isInRange(b.callVA, b.dest, b.targetIdx, b.flags, idx)) {
-          branchesToProcess.pop_front();
+          popFront();
           frontChecked = false;
           continue;
         }
         if (!frontChecked) {
-          auto it = thunkMap.find(*b.r);
+          ThunkKey key(*b.r);
+          auto it = findThunk(key, b.keyHash);
           if (it != thunkMap.end()) {
             if (auto *thunk = getThunkInRange(b.callVA, it->second)) {
-              deferredBranchRedirects.push_back(defer(b, thunk));
-              branchesToProcess.pop_front();
+              deferredAtFront.push_back({b.r, thunk, b.callVA, b.dest,
+                                         b.targetIdx, b.flags});
+              popFront();
               continue;
             }
           }
@@ -416,16 +641,21 @@ void TextOutputSection::finalize() {
       // thunks? If we do, then we can delay processing this thunk so we may
       // finalize more potencial target sections. Otherwise we must emit thunks
       // until we have enough space.
-      if (nextEnd + slop <= highVA)
+      if (nextEnd + slop <= highVA) {
+        windowStale = true;
         break;
+      }
 
-      auto &thunkInfo = thunkMap[*b.r];
-      createThunk(*b.caller, *b.r, thunkInfo);
+      ThunkKey key(*b.r);
+      auto &thunkInfo =
+          thunkMap.insert_as({key, ThunkInfo()}, lookupKey(key, b.keyHash))
+              .first->second;
+      createThunk(*inputs[b.callerIdx], *b.r, thunkInfo);
       frontChecked = false;
-      branchesToProcess.pop_front();
+      popFront();
     }
     finalizeOne(isec);
-    finalOff[idx] = isec->outSecOff;
+    finalOff.set(idx, isec->outSecOff);
 
     // Process relocs by ascending address, i.e., ascending offset within isec
     // FIXME: This property does not hold for object files produced by ld64's
@@ -434,18 +664,26 @@ void TextOutputSection::finalize() {
       return a.getOffset() > b.getOffset();
     }));
     const uint64_t isecVA = addr + isec->outSecOff;
-    for (Relocation &r : reverse(isec->relocs)) {
-      if (!target->hasAttr(r.getType(), RelocAttrBits::BRANCH))
-        continue;
-      PendingBranch b = makePending(isec, r, isecVA + r.getOffset());
+    for (uint32_t n = ahead.counts[idx % ScanAhead::numCounts]; n; --n) {
+      if (ahead.size() > sectionAhead) {
+        auto *sym = dyn_cast_if_present<Symbol *>(
+            ahead[sectionAhead]->getReferent());
+        if (auto *d = dyn_cast_if_present<Defined>(sym))
+          prefetchLine(d->originalIsec);
+      }
+      Relocation &r = *ahead.pop();
+      PendingBranch b = makePending(idx, r, isecVA + r.getOffset());
       assert(isInRange(b.callVA, b.dest, b.targetIdx, b.flags, idx + 1) ==
              isTargetKnownInRange(*isec, r));
       if (isInRange(b.callVA, b.dest, b.targetIdx, b.flags, idx + 1))
         continue;
-      auto it = thunkMap.find(r);
+      ThunkKey key(r);
+      b.keyHash = ThunkMapKeyInfo::getHashValue(key);
+      auto it = findThunk(key, b.keyHash);
       if (it != thunkMap.end()) {
         if (auto *thunk = getThunkInRange(b.callVA, it->second)) {
-          deferredBranchRedirects.push_back(defer(b, thunk));
+          deferredAtScan.push_back(
+              {b.r, thunk, b.callVA, b.dest, b.targetIdx, b.flags});
           continue;
         }
       }
@@ -453,40 +691,110 @@ void TextOutputSection::finalize() {
     }
   }
 
-  llvm::erase_if(branchesToProcess, [&](const PendingBranch &b) {
-    return isInRange(b.callVA, b.dest, b.targetIdx, b.flags, numInputs);
-  });
+  // Drop the branches whose targets are now in range, keeping queue order.
+  std::vector<PendingBranch> remaining;
+  {
+    size_t n = branchesToProcess.size();
+    for (size_t i = 0; i != n; ++i) {
+      if (i + farAhead < n) {
+        const PendingBranch &e = branchesToProcess[i + farAhead];
+        if (e.targetIdx != fixedTarget)
+          finalOff.prefetch(e.targetIdx);
+      }
+      const PendingBranch &b = branchesToProcess[i];
+      if (!isInRange(b.callVA, b.dest, b.targetIdx, b.flags, numInputs))
+        remaining.push_back(b);
+    }
+    branchesToProcess = PendingQueue();
+  }
+  // Whatever each remaining branch's key lookup reads: the relocation, then
+  // its referent.
+  auto prefetchKeyAhead = [&](size_t i) {
+    size_t n = remaining.size();
+    if (i + farAhead < n)
+      prefetchLine(remaining[i + farAhead].r);
+    if (i + nearAhead < n)
+      prefetchReferent(remaining[i + nearAhead].r);
+  };
+
   // Count distinct unresolved branch targets that still lack an in-range thunk.
   // We use this as an upper bound on the number of thunks we may still create
   // when estimating where __stubs / __objc_stubs could end up.
   DenseSet<ThunkKey, ThunkMapKeyInfo> branchTargets;
-  for (const PendingBranch &b : branchesToProcess) {
+  for (size_t i = 0, n = remaining.size(); i != n; ++i) {
+    prefetchKeyAhead(i);
+    const PendingBranch &b = remaining[i];
     ThunkKey thunkKey(*b.r);
-    auto it = thunkMap.find(thunkKey);
+    auto it = findThunk(thunkKey, b.keyHash);
     if (it == thunkMap.end() || !getThunkInRange(b.callVA, it->second))
-      branchTargets.insert(thunkKey);
+      branchTargets.insert_as(thunkKey, lookupKey(thunkKey, b.keyHash));
   }
 
   auto estimatedStubsEnd = estimateStubsEndVA(branchTargets.size());
-  for (const DeferredRedirect &d : deferredBranchRedirects) {
-    if (isInRange(d.callVA, d.dest, d.targetIdx, d.flags, numInputs))
-      continue;
-    if (isTargetStubsAndInRange(d.callVA, *d.r, d.flags & addendIsZero,
-                                d.flags & inStubs, estimatedStubsEnd))
-      continue;
-    updateBranchTargetToThunk(*d.r, d.thunk);
+  // Whether isTargetStubsAndInRange() will have to read the referent's name.
+  auto needsNameCheck = [&](uint64_t callVA, uint32_t flags) {
+    return estimatedStubsEnd && (flags & addendIsZero) &&
+           !(flags & (inStubs | inObjCStubs)) &&
+           *estimatedStubsEnd <= callVA + target->forwardBranchRange;
+  };
+
+  // Resolve the deferred redirects. Each is independent of the others
+  // (distinct relocations; thunkCallCount is a count), so the two lists are
+  // merged into one ascending call address stream for the relocation writes.
+  {
+    auto prefetchDeferred = [&](const std::vector<DeferredRedirect> &v,
+                                size_t i) {
+      if (i + farAhead < v.size()) {
+        const DeferredRedirect &e = v[i + farAhead];
+        if (e.targetIdx != fixedTarget)
+          finalOff.prefetch(e.targetIdx);
+        prefetchLine(e.r);
+      }
+      if (i + nearAhead < v.size()) {
+        const DeferredRedirect &e = v[i + nearAhead];
+        if (needsNameCheck(e.callVA, e.flags))
+          prefetchReferent(e.r);
+      }
+    };
+    auto resolve = [&](const DeferredRedirect &d) {
+      if (isInRange(d.callVA, d.dest, d.targetIdx, d.flags, numInputs))
+        return;
+      if (isTargetStubsAndInRange(d.callVA, *d.r, d.flags & addendIsZero,
+                                  d.flags & inStubs, d.flags & inObjCStubs,
+                                  estimatedStubsEnd))
+        return;
+      updateBranchTargetToThunk(*d.r, d.thunk);
+    };
+    size_t i = 0, j = 0;
+    const size_t ni = deferredAtScan.size(), nj = deferredAtFront.size();
+    while (i != ni || j != nj) {
+      if (j == nj ||
+          (i != ni && deferredAtScan[i].callVA <= deferredAtFront[j].callVA)) {
+        prefetchDeferred(deferredAtScan, i);
+        resolve(deferredAtScan[i++]);
+      } else {
+        prefetchDeferred(deferredAtFront, j);
+        resolve(deferredAtFront[j++]);
+      }
+    }
   }
 
-  for (const PendingBranch &b : branchesToProcess) {
+  for (size_t i = 0, n = remaining.size(); i != n; ++i) {
+    prefetchKeyAhead(i);
+    const PendingBranch &b = remaining[i];
     if (isTargetStubsAndInRange(b.callVA, *b.r, b.flags & addendIsZero,
-                                b.flags & inStubs, estimatedStubsEnd))
+                                b.flags & inStubs, b.flags & inObjCStubs,
+                                estimatedStubsEnd))
       continue;
-    auto &thunkInfo = thunkMap[*b.r];
+    ThunkKey key(*b.r);
+    auto &thunkInfo =
+        thunkMap.insert_as({key, ThunkInfo()}, lookupKey(key, b.keyHash))
+            .first->second;
     if (auto *thunk = getThunkInRange(b.callVA, thunkInfo)) {
       updateBranchTargetToThunk(*b.r, thunk);
       continue;
     }
-    createThunk(*b.caller, *b.r, thunkInfo);
+    createThunk(*inputs[b.callerIdx], *b.r, thunkInfo);
   }
 
   if (!thunks.empty())
