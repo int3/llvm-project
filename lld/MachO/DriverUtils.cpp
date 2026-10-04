@@ -19,6 +19,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/BinaryFormat/Magic.h"
 #include "llvm/LTO/LTO.h"
 #include "llvm/Option/Arg.h"
@@ -343,6 +344,12 @@ struct TapiPipelineState {
   // side frees the entry while the unstarted task may still be queued.
   llvm::DenseSet<uint64_t> started;
   uint64_t nextSeq = 0;
+  // Paths the ordered walk has already taken from `files`. A probe for one of
+  // them needs no read either: loadDylib() finds the DylibFile it loaded. Without
+  // this, whether an LC_LINKER_OPTION probe re-read and re-parsed a framework
+  // that is also on the command line depended on whether it ran before or after
+  // the walk consumed the entry. Copies, since a taken entry may own its path.
+  llvm::StringSet<> consumed;
   // Declared last so that it is destroyed first: the group joins its workers
   // while the state they use is still alive.
   llvm::parallel::TaskGroup group;
@@ -554,7 +561,7 @@ static bool isPipelinedTapiPath(CachedHashStringRef path) {
   if (!state)
     return false;
   std::lock_guard<std::mutex> lock(state->mutex);
-  return state->files.contains(path);
+  return state->files.contains(path) || state->consumed.contains(path.val());
 }
 
 // Silent mirrors of findPathCombination(), findLibrary() and findFramework()
@@ -694,6 +701,7 @@ takePreparedTapiFile(CachedHashStringRef path,
       // than erasing through an iterator from before the wait.
       it = state->files.find(path);
       assert(it != state->files.end());
+      state->consumed.insert(path.val());
       owner = std::move(it->second);
       state->files.erase(it);
       return file;

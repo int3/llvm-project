@@ -119,10 +119,10 @@
 # BIND-DAG: libH1{{ +}}_h1
 # BIND-DAG: {{libOuter|libInner}}{{ +}}_inner
 
-## A TBD the pipeline did not prepare (--reproduce turns the pipeline off)
-## cannot defer its names, so it drains the streamed parse first: joins it,
-## publishes the batch (here, the Mach-O dylib before it), and leaves the held
-## object after it to the end of the phase.
+## A TBD the pipeline did not prepare (--reproduce turns the pipeline off) is
+## prepared on the main thread and defers its names like a prepared one, so the
+## streamed parse is not drained: the held object after it keeps streaming, and
+## the batch (the Mach-O dylib before it and the TBD) is published at the join.
 # RUN: %lld -dylib -install_name /Drain -undefined dynamic_lookup -o %t/out --threads=1 -map %t/map -why_load \
 # RUN:   %t/refs.o %t/strong.o %t/weak.o %t/common.o %t/undef.o %t/libMach.dylib %t/libTbd.tbd %t/more.o %t/libArch.a > %t/why
 # RUN: mv %t/out %t/d.ref && mv %t/map %t/dmap.ref && mv %t/why %t/dwhy.ref
@@ -131,7 +131,27 @@
 # RUN:   --time-trace --time-trace-granularity=0 --time-trace=%t/drain.json --reproduce %t/drain.tar %t/refs.o %t/strong.o %t/weak.o %t/common.o %t/undef.o %t/libMach.dylib %t/libTbd.tbd %t/more.o %t/libArch.a > %t/why
 # RUN: cmp %t/d.ref %t/out && cmp %t/dmap.ref %t/map && cmp %t/dwhy.ref %t/why
 # RUN: FileCheck %s --check-prefix=DRAIN < %t/drain.json
-# DRAIN: Drain streamed held parse
+# DRAIN-NOT: Drain streamed held parse
+# DRAIN: Prepare TBD symbols on the walk
+# DRAIN-NOT: Drain streamed held parse
+
+## The same for TBDs carrying $ld$hide (in a re-exported child, and of a name a
+## Mach-O dylib also exports) and $ld$previous: unprepared under --reproduce,
+## they go through the batch with the same hidden-name stamps and the same
+## synthetic dylib as the pipeline-prepared files above.
+# RUN: rm -f %t/batch.tar
+# RUN: env LLD_HELD_PARSE_CHUNK=1 LLD_HELD_PARSE_DELAY_US=20000 %lld -dylib -install_name /Batch -o %t/out --threads=8 -map %t/map -why_load -L%t \
+# RUN:   --time-trace --time-trace-granularity=0 --time-trace=%t/batch.json \
+# RUN:   --reproduce %t/batch.tar %t/refs2.o %t/strong.o %t/weak.o %t/common.o %t/more.o %t/libHidU.tbd %t/libPrev.tbd %t/libHideH1.tbd %t/libH1.dylib %t/libOuter.dylib %t/libTbd.tbd %t/libMach.dylib %t/libArch.a > %t/why
+# RUN: cmp %t/b.ref %t/out && cmp %t/bmap.ref %t/map && cmp %t/bwhy.ref %t/why
+# RUN: FileCheck %s --check-prefix=LIVE < %t/batch.json
+# LIVE-NOT: Drain streamed held parse
+# LIVE: Prepare TBD symbols on the walk
+# LIVE-NOT: Drain streamed held parse
+# RUN: rm -f %t/batch.tar
+# RUN: env LLD_HELD_PARSE_CHUNK=1 LLD_HELD_PARSE_DELAY_US=20000 %lld -dylib -install_name /Batch -o %t/out --threads=8 -L%t \
+# RUN:   --reproduce %t/batch.tar %t/refs2.o %t/strong.o %t/weak.o %t/common.o %t/more.o %t/libHidU.tbd %t/libPrev.tbd %t/libH1.dylib %t/libHideH1.tbd %t/libOuter.dylib %t/libTbd.tbd %t/libMach.dylib %t/libArch.a
+# RUN: cmp %t/c.ref %t/out
 
 ## An object with an LC_LINKER_OPTION among the held objects: the walker
 ## declines and the archive publishes its index the ordinary way, after the

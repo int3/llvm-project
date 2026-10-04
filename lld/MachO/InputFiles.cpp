@@ -2764,6 +2764,18 @@ DylibFile::DylibFile(const InterfaceFile &interface, DylibFile *umbrella,
                                        symbol.isThreadLocalValue()));
   };
 
+  // A TBD the pipeline did not prepare (an umbrella's re-export that
+  // pipelineReexports() did not reach, or every TBD under --reproduce) is
+  // prepared here, on the main thread, while the held object parse streams.
+  // Its names then go to the batch like a prepared file's, instead of draining
+  // the parse so that they can be inserted inline. prepareTapiSymbols() is the
+  // same function the pipeline runs and touches no ordered state.
+  if (!preparedSymbols && symtab->isHeldParseLive()) {
+    TimeTraceScope timeScope("Prepare TBD symbols on the walk");
+    preparedSymbols = make<PreparedTapiSymbols>();
+    prepareTapiSymbols(interface, *preparedSymbols);
+  }
+
   if (preparedSymbols) {
     // The arch filter, the kind classification, the name sort, the final names
     // and their hashes, and the "$ld$" parsing were all done off the ordered
@@ -2794,9 +2806,11 @@ DylibFile::DylibFile(const InterfaceFile &interface, DylibFile *umbrella,
   }
 
   // The rest of this constructor publishes inline, so a pending batch has to
-  // become visible first. Inside the input phase that also means the streamed
-  // held parse has to finish: an inline insert must not meet a fold, and must
-  // not overtake a batched record that precedes it.
+  // become visible first. Inside the input phase that would also mean the
+  // streamed held parse has to finish (an inline insert must not meet a fold,
+  // and must not overtake a batched record that precedes it); the preparation
+  // above keeps every TBD off this path while the parse is live, so the drain
+  // is only a safety net.
   if (symtab->isHeldParseLive())
     drainStreamedHeldParse();
   symtab->publishDylibBatch();
