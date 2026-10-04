@@ -1862,6 +1862,15 @@ template <class LP> void Writer::run() {
   // InputSections, we should have `isec->canonical() == isec`.
   scanSymbols();
 
+  // ObjCStubsSection::setUp() marks _objc_msgSend used. When the link itself
+  // defines _objc_msgSend and -dead_strip found nothing else referencing it,
+  // that turns a dead definition live, which puts it in the export trie, so it
+  // must run before the export symbols are selected below.
+  if (in.objcStubs->isNeeded())
+    in.objcStubs->setUp();
+  if (in.objcMethList->isNeeded())
+    in.objcMethList->setUp();
+
   // The export trie's shape depends only on the exported symbols' names, kinds
   // and flags, all of which are final once scanSymbols() has run, so it can be
   // built while the rest of the link assigns addresses. The two values it
@@ -1872,12 +1881,13 @@ template <class LP> void Writer::run() {
   // The symbol selection itself stays on this thread. Recovering an undefined
   // symbol (section$start$/segment$start$ names, -U, -undefined
   // dynamic_lookup) replaces it in place during scanRelocations(), and the
-  // stub helper's and ObjC stubs' setUp() can do the same, so a worker must
-  // not read the kind of a symbol this selection rejects. Symbols created
-  // after the selection are never exported: boundary symbols, __dyld_private
-  // and branch-range extension thunks are private extern, and dyld_stub_binder
-  // and _objc_msgSend become dylib symbols that -exported_symbols_list was
-  // matched against long before this point.
+  // stub helper's setUp() can do the same, so a worker must not read the kind
+  // of a symbol this selection rejects. Symbols created after the selection
+  // are never exported: boundary symbols and branch-range extension thunks are
+  // private extern, __dyld_private is not in the symbol table, and
+  // dyld_stub_binder becomes a dylib symbol that -exported_symbols_list was
+  // matched against long before this point. An assertions build re-runs the
+  // selection in ExportSection::finalizeContents() and checks it is unchanged.
 #if LLVM_ENABLE_THREADS
   if (parallel::strategy.ThreadsRequested != 1) {
     in.exports->collectSymbols();
@@ -1897,10 +1907,6 @@ template <class LP> void Writer::run() {
   }
 #endif
 
-  if (in.objcStubs->isNeeded())
-    in.objcStubs->setUp();
-  if (in.objcMethList->isNeeded())
-    in.objcMethList->setUp();
   scanRelocations();
   if (in.initOffsets->isNeeded())
     in.initOffsets->setUp();

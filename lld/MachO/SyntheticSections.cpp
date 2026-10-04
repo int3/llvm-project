@@ -1057,18 +1057,25 @@ uint32_t LazyBindingSection::encode(const Symbol &sym) {
 ExportSection::ExportSection()
     : LinkEditSection(segment_names::linkEdit, section_names::export_) {}
 
-void ExportSection::collectSymbols() {
+template <class Fn> void ExportSection::forEachExport(Fn fn) const {
   for (const Symbol *sym : symtab->getSymbols()) {
     if (const auto *defined = dyn_cast<Defined>(sym)) {
       if (defined->privateExtern || !defined->isLive())
         continue;
-      trieBuilder.addSymbol(*defined);
-      hasWeakSymbol = hasWeakSymbol || sym->isWeakDef();
+      fn(*sym);
     } else if (auto *dysym = dyn_cast<DylibSymbol>(sym)) {
       if (dysym->shouldReexport)
-        trieBuilder.addSymbol(*dysym);
+        fn(*sym);
     }
   }
+}
+
+void ExportSection::collectSymbols() {
+  forEachExport([&](const Symbol &sym) {
+    trieBuilder.addSymbol(sym);
+    if (isa<Defined>(sym))
+      hasWeakSymbol = hasWeakSymbol || sym.isWeakDef();
+  });
   collected = true;
 }
 
@@ -1083,6 +1090,27 @@ void ExportSection::finalizeContents() {
     collectSymbols();
     trieBuilder.buildNodes();
   }
+#ifndef NDEBUG
+  else {
+    // The selection ran early, at the top of Writer::run(). Anything that
+    // changed a symbol's liveness, privateExtern or shouldReexport since then
+    // would make this trie differ from the one a single-threaded link builds
+    // here.
+    std::vector<const Symbol *> late;
+    bool lateWeak = false;
+    forEachExport([&](const Symbol &sym) {
+      late.push_back(&sym);
+      if (isa<Defined>(sym))
+        lateWeak = lateWeak || sym.isWeakDef();
+    });
+    std::vector<const Symbol *> early(trieBuilder.exportedSymbols().begin(),
+                                      trieBuilder.exportedSymbols().end());
+    llvm::sort(early);
+    llvm::sort(late);
+    assert(early == late && lateWeak == hasWeakSymbol &&
+           "export symbol selection changed after it was collected early");
+  }
+#endif
   size = trieBuilder.assignOffsets();
 }
 

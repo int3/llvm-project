@@ -406,6 +406,9 @@ public:
   bool hasWeakSymbol = false;
 
 private:
+  // Calls fn(sym) for each symbol the export trie contains.
+  template <class Fn> void forEachExport(Fn fn) const;
+
   TrieBuilder trieBuilder;
   size_t size = 0;
   bool collected = false;

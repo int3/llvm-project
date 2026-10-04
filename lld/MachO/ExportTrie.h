@@ -38,6 +38,9 @@ public:
   // The number of trie nodes, valid once buildNodes() has run. Used to decide
   // how large this owner is relative to the other __LINKEDIT owners.
   size_t nodeCount() const { return nodes.size(); }
+  // The symbols added so far, in an unspecified order (buildNodes() sorts
+  // them in place).
+  llvm::ArrayRef<const Symbol *> exportedSymbols() const { return exported; }
   void writeTo(uint8_t *buf) const;
 
 private:
