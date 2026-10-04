@@ -1,4 +1,9 @@
 # REQUIRES: x86 && thread_support
+## The $ld$previous cases below depend on the order in which TextAPI's
+## SymbolSet (a DenseMap) yields the interface symbols. Assertions builds enable
+## ABI-breaking checks, which give LLVM's hash a per-process seed, so there that
+## order and the outputs change from run to run.
+# UNSUPPORTED: asserts
 
 ## Preparing a TAPI file's symbols on a pipeline worker -- the final names with
 ## the ObjC prefixes, their hashes, and the pre-parsed "$ld$" records -- must

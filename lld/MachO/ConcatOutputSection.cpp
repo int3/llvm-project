@@ -177,17 +177,27 @@ void TextOutputSection::createThunk(const ConcatInputSection &isec,
   StringRef thunkName =
       saver().save(funcSym->getName() + addendSuffix + ".thunk." +
                    std::to_string(thunkInfo.sequence++));
-  if (!isa<Defined>(funcSym) || cast<Defined>(funcSym)->isExternal()) {
+  bool inSymtab =
+      !isa<Defined>(funcSym) || cast<Defined>(funcSym)->isExternal();
+  if (inSymtab) {
     // addDefined() would replace an input symbol of the same name in place and
     // silently redirect every branch to it. Lazy symbols are not definitions
     // yet and are replaced harmlessly.
     if (Symbol *clash = symtab->find(thunkName)) {
-      thunkReplacedSymbol = true;
-      if (isa<Defined>(clash) || isa<DylibSymbol>(clash))
+      if (isa<Defined>(clash) || isa<DylibSymbol>(clash)) {
         error("linker-generated thunk name '" + thunkName +
               "' collides with " + toString(*clash) + " from " +
               toString(clash->getFile()));
+        // The link fails; keep the input symbol, so that the branches the walk
+        // has already classified against it stay valid, and give the thunk a
+        // symbol of its own.
+        inSymtab = false;
+      } else {
+        thunkReplacedSymbol = true;
+      }
     }
+  }
+  if (inSymtab) {
     thunkInfo.sym = symtab->addDefined(
         thunkName, /*file=*/nullptr, thunkInfo.isec, /*value=*/0, thunkSize,
         /*isWeakDef=*/false, /*isPrivateExtern=*/true,
