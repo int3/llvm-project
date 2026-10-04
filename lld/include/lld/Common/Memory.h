@@ -70,9 +70,10 @@ template <class T> int SpecificAlloc<T>::tag = 0;
 // context where the previous one was -- and it is not needed either, since
 // every context construction and destruction bumps the generation. Dropping
 // it also keeps the fast path off commonContext(). The cache is thread-local
-// rather than static because getOrCreate() is not thread-safe and two
-// contexts can in principle be live on different threads; caching per thread
-// does not make it any less safe, it only calls it far less often.
+// rather than static because two contexts can in principle be live on
+// different threads. getOrCreate() takes a lock, since workers and the main
+// thread can reach it at the same time; the cache keeps that lock off the
+// fast path.
 template <typename T>
 inline llvm::SpecificBumpPtrAllocator<T> &getSpecificAllocSingleton() {
   static thread_local uint64_t cachedGeneration = 0;
