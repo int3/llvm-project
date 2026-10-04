@@ -11,6 +11,7 @@
 #include "ICF.h"
 #include "InputFiles.h"
 #include "LTO.h"
+#include "MapFile.h"
 #include "MarkLive.h"
 #include "ObjC.h"
 #include "OutputSection.h"
@@ -1771,6 +1772,7 @@ static bool walkArchives() {
   for (uint32_t archiveIndex = 0; archiveIndex != archives.size();
        ++archiveIndex) {
     ArchiveFile *archive = archives[archiveIndex];
+    size_t firstMapMember = inputFiles.size();
     frontierArchive = archiveIndex;
     registrationTop = parallelInput.archiveOrdinals[archiveIndex];
     walkCounter = 0;
@@ -1896,6 +1898,8 @@ static bool walkArchives() {
       extract(archiveIndex, entry.childOffset, entry.name.val());
       visited[archiveIndex].back().walkEnd = walkCounter;
     }
+    if (!config->mapFile.empty())
+      recordMapArchiveMembers(archive, firstMapMember);
   }
 
   ts.reset();
@@ -2043,6 +2047,7 @@ static void finishParallelInput(bool moreInputsFollow = false) {
       TimeTraceScope timeScope("Publish archive indexes");
       ParseContext archiveCtx;
       for (uint32_t i = 0; i != parallelInput.archives.size(); ++i) {
+        size_t firstMapMember = inputFiles.size();
         archiveCtx.top = parallelInput.archiveOrdinals[i];
         archiveCtx.walk = 0;
         archiveCtx.seq = 0;
@@ -2054,6 +2059,8 @@ static void finishParallelInput(bool moreInputsFollow = false) {
                                     /*archiveContents=*/nullptr,
                                     /*isLazy=*/false, /*contentsOnly=*/false);
         parallelInput.archives[i]->publishHeldIndex();
+        if (!config->mapFile.empty())
+          recordMapArchiveMembers(parallelInput.archives[i], firstMapMember);
       }
       symtab->serialCtx = nullptr;
       publishedSerially = true;
@@ -2162,10 +2169,13 @@ static void finishParallelInput(bool moreInputsFollow = false) {
     // follows every object, so this is the serial order.
     providerShards.reset();
     for (ArchiveFile *archive : parallelInput.archives) {
+      size_t firstMapMember = inputFiles.size();
       loadMandatoryArchiveMembers(archive, archive->getName(),
                                   /*archiveContents=*/nullptr,
                                   /*isLazy=*/false, /*contentsOnly=*/false);
       archive->addLazySymbols();
+      if (!config->mapFile.empty())
+        recordMapArchiveMembers(archive, firstMapMember);
     }
     parallelInput.archives.clear();
   }
@@ -3919,6 +3929,7 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     resolvedLibraries.clear();
     cachedReads.clear();
     concatOutputSections.clear();
+    resetMapFile();
     inputFiles.clear();
     inputSections.clear();
     deadStripSectionRoots.clear();

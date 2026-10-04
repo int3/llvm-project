@@ -1,10 +1,4 @@
 # REQUIRES: x86 && thread_support
-## The $ld$previous cases below depend on the order in which TextAPI's
-## SymbolSet (a DenseMap) yields the interface symbols. Assertions builds enable
-## ABI-breaking checks, which give LLVM's hash a per-process seed, so there that
-## order and the outputs change from run to run.
-# UNSUPPORTED: asserts
-
 ## Preparing a TAPI file's symbols on a pipeline worker -- the final names with
 ## the ObjC prefixes, their hashes, and the pre-parsed "$ld$" records -- must
 ## publish the same names in the same order and keep every "$ld$" side effect
@@ -45,12 +39,12 @@
 # RUN: FileCheck %s --check-prefix=PREV < %t/prev8.libs
 # RUN: not grep libIos %t/prev8.libs
 # RUN: not grep libWindow %t/prev8.libs
-# PREV: /usr/lib/libOld.dylib
+# PREV: /usr/lib/libOld.dylib (compatibility version 1.0.0
 
-## A nameless $ld$previous applies before a named one -- the interface symbol
-## order decides which, and the named record must see what the nameless one
-## wrote -- so the compatibility version the named record falls back to is the
-## 5.0 just written, not the interface's compatibility version of 1.
+## A nameless $ld$previous changes the install name and compatibility version.
+## Keep it in a separate interface from the named record above: its version
+## update must not race the named record's fallback to the interface version
+## through TextAPI SymbolSet iteration order (randomized in assertions builds).
 # RUN: %lld -arch x86_64 -dylib -install_name /Live -no_uuid -platform_version macos 11.0 11.0 \
 # RUN:   --threads=8 %t/libPrevLive.tbd %t/use.o -o %t/live8 2>%t/live8.err
 # RUN: %lld -arch x86_64 -dylib -install_name /Live -no_uuid -platform_version macos 11.0 11.0 \
@@ -59,7 +53,7 @@
 # RUN: diff %t/live1.err %t/live8.err
 # RUN: llvm-otool -L %t/live8 > %t/live8.libs
 # RUN: FileCheck %s --check-prefix=LIVE < %t/live8.libs
-# LIVE: /usr/lib/libOldLive.dylib (compatibility version 5.0.0
+# LIVE: /usr/lib/libNameless.dylib (compatibility version 5.0.0
 
 ## An applying $ld$install_name renames the dylib; one whose os version does not
 ## match the deployment target does not.
@@ -216,8 +210,7 @@ compatibility-version: 1
 exports:
   - targets: [ x86_64-macos ]
     symbols: [ _normal,
-               '$ld$previous$/usr/lib/libNameless.dylib$5.0$1$11.0$12.0$$',
-               '$ld$previous$/usr/lib/libOldLive.dylib$$1$11.0$12.0$_normal$' ]
+               '$ld$previous$/usr/lib/libNameless.dylib$5.0$1$11.0$12.0$$' ]
 ...
 
 #--- libName.tbd

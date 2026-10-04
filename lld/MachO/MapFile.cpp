@@ -39,6 +39,7 @@
 #include "Target.h"
 #include "lld/Common/ErrorHandler.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/TimeProfiler.h"
 
@@ -46,6 +47,38 @@ using namespace llvm;
 using namespace llvm::sys;
 using namespace lld;
 using namespace lld::macho;
+
+// Deferred registration preserves serial member completion order, but appends
+// those members after the command-line dylibs. Retain that order at each
+// archive's original inputFiles position for map generation only. In particular,
+// sorting by InputFile::id would put a parent before its nested extractions.
+static DenseMap<InputFile *, SmallVector<InputFile *, 0>> mapArchiveMembers;
+
+void macho::recordMapArchiveMembers(ArchiveFile *archive, size_t first) {
+  ArrayRef<InputFile *> members = inputFiles.getArrayRef().drop_front(first);
+  if (!members.empty())
+    mapArchiveMembers[archive].append(members.begin(), members.end());
+}
+
+void macho::resetMapFile() { mapArchiveMembers.clear(); }
+
+static ArrayRef<InputFile *>
+getMapFileOrder(SmallVectorImpl<InputFile *> &ordered) {
+  if (mapArchiveMembers.empty())
+    return inputFiles.getArrayRef();
+  DenseSet<InputFile *> deferred;
+  for (const auto &entry : mapArchiveMembers)
+    deferred.insert(entry.second.begin(), entry.second.end());
+  ordered.reserve(inputFiles.size());
+  for (InputFile *file : inputFiles) {
+    auto it = mapArchiveMembers.find(file);
+    if (it != mapArchiveMembers.end())
+      ordered.append(it->second.begin(), it->second.end());
+    if (!deferred.contains(file))
+      ordered.push_back(file);
+  }
+  return ordered;
+}
 
 struct CStringInfo {
   uint32_t fileIndex;
@@ -63,7 +96,8 @@ struct MapInfo {
 
 static MapInfo gatherMapInfo() {
   MapInfo info;
-  for (InputFile *file : inputFiles) {
+  SmallVector<InputFile *> ordered;
+  for (InputFile *file : getMapFileOrder(ordered)) {
     bool isReferencedFile = false;
 
     if (isa<ObjFile>(file) || isa<BitcodeFile>(file)) {
