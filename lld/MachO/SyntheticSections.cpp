@@ -32,6 +32,7 @@
 #include <limits>
 
 #if defined(__APPLE__)
+#include "llvm/Support/Process.h"
 #include <sys/mman.h>
 
 #define COMMON_DIGEST_FOR_OPENSSL
@@ -2335,7 +2336,40 @@ void CodeSignatureSection::writeHashes(uint8_t *buf) const {
   // sign or the signature header+hashes.  The fix is to invalidate
   // all cached data associated with the output file, thus discarding
   // the bogus prematurely-cached signature.
-  msync(buf, fileOff + getSize(), MS_INVALIDATE);
+  //
+  // One msync of the whole output is a synchronous write-back on the main
+  // thread with every worker idle, and it is the last thing the link does. On
+  // an M4 mini it costs 13-17 ms for rust-analyzer release's 49 MB output and
+  // 44-65 ms for the debug link's 206 MB -- 10-13% of each link's wall. The
+  // same pages flushed as eight disjoint page-aligned ranges from eight
+  // threads take 8-11 ms and 33 ms; MS_ASYNC is not cheaper (XNU pushes the
+  // pages either way) and writing the file through write(2) instead is not
+  // clearly better.
+  //
+  // Splitting the call changes nothing the work-around depends on: the same
+  // pages get the same flag, and MS_INVALIDATE acts per page, so the cached
+  // signature is discarded exactly as it is by one whole-file call.
+  const size_t total = fileOff + getSize();
+  const uint64_t pageSize = sys::Process::getPageSizeEstimate();
+  // Eight ranges is what was measured; below a megabyte per range (an 8 MiB
+  // output) the spawn is worth more than the parallelism, so stay with one
+  // call, and a one-thread link keeps the single call exactly as before.
+  constexpr size_t numRanges = 8;
+  constexpr size_t minRangeSize = 1024 * 1024;
+  if (parallel::strategy.ThreadsRequested == 1 || pageSize == 0 ||
+      total < numRanges * minRangeSize) {
+    msync(buf, total, MS_INVALIDATE);
+  } else {
+    // Ranges must start on a page boundary; buf is an mmap base, so aligning
+    // the stride is enough.
+    const size_t stride = codeSignatureFlushStride(total, numRanges, pageSize);
+    parallelFor(0, numRanges, [&](size_t i) {
+      size_t begin = i * stride;
+      if (begin >= total)
+        return;
+      msync(buf + begin, std::min(stride, total - begin), MS_INVALIDATE);
+    });
+  }
 #endif
 }
 

@@ -632,6 +632,17 @@ public:
   void writeTo(uint8_t *buf) const override;
 };
 
+// The stride for flushing the code-signature cache invalidation of an output
+// of `total` bytes as `numRanges` disjoint ranges: range i is
+// [i * stride, min((i + 1) * stride, total)). Each range starts on a page
+// boundary, and the ranges tile [0, total): the share rounds up before it is
+// aligned, so a last partial page is never left unflushed. Trailing ranges may
+// be short or empty.
+inline uint64_t codeSignatureFlushStride(uint64_t total, uint64_t numRanges,
+                                         uint64_t pageSize) {
+  return llvm::alignTo(llvm::divideCeil(total, numRanges), pageSize);
+}
+
 // The code signature comes at the very end of the linked output file.
 class CodeSignatureSection final : public LinkEditSection {
 public:

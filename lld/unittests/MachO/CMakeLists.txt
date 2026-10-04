@@ -1,4 +1,5 @@
 add_lld_unittests(LLDMachOTests
+  CodeSignatureFlushTest.cpp
   RelocationsTest.cpp
 )
 
