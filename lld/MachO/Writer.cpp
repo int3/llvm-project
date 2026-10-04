@@ -86,6 +86,7 @@ public:
   // Holds the export-trie construction task spawned after scanSymbols();
   // destroying or resetting it joins the task.
   std::optional<llvm::parallel::TaskGroup> exportTrieGroup;
+  bool canPrepareSymbols = true;
   SymtabSection *symtabSection = nullptr;
   IndirectSymtabSection *indirectSymtabSection = nullptr;
   CodeSignatureSection *codeSignatureSection = nullptr;
@@ -770,6 +771,7 @@ enum SymbolScanAction : uint8_t {
   dylibReference = 1 << 2,
   objcStub = 1 << 3,
   unwindHasEntry = 1 << 4,
+  mutableThunkName = 1 << 5,
 };
 
 struct SymbolScanCandidate {
@@ -1022,10 +1024,16 @@ void Writer::scanSymbols() {
         // This branch intentionally doesn't check isLive().
         if (!dysym->isDynamicLookup())
           actions |= dylibReference;
-      } else if (isa<Undefined>(sym) &&
-                 ObjCStubsSection::isObjCStubSymbol(sym) &&
-                 (!config->deadStrip || sym->isLive())) {
-        actions |= objcStub;
+      } else {
+        if (isa<Undefined>(sym) && ObjCStubsSection::isObjCStubSymbol(sym) &&
+            (!config->deadStrip || sym->isLive()))
+          actions |= objcStub;
+        // createThunk() may replace an undefined or lazy symbol in place.
+        // The symtab snapshot and the object-file function-start walk would
+        // then race with that replacement. Detect possible names during this
+        // existing scan, including dead/unused symbols, and defer both walks.
+        if (target->usesThunks() && sym->getName().contains(".thunk."))
+          actions |= mutableThunkName;
       }
       if (actions != 0)
         candidates.push_back({sym, unwindIsec, actions});
@@ -1040,6 +1048,8 @@ void Writer::scanSymbols() {
   in.unwindInfo->reserveSymbols(candidateCount);
   for (const auto &candidates : globalCandidates) {
     for (const SymbolScanCandidate &candidate : candidates) {
+      if (candidate.actions & mutableThunkName)
+        canPrepareSymbols = false;
       if (candidate.actions & nonWeakDefinition)
         addNonWeakDefinition(cast<Defined>(candidate.sym));
       if (candidate.actions & globalUnwind)
@@ -1998,14 +2008,14 @@ template <class LP> void Writer::run() {
   sortSegmentsAndSections(isecPriorities, hasPositivePriority);
   createLoadCommands<LP>();
 
-  // The prefixes of the symbol-table and function-starts computations read
-  // only names, symbol flags and section kinds, all of which are final here,
-  // so they can overlap address assignment. The only symbols created in
-  // between are branch-range extension thunks, which are appended: the
-  // prepared pass works from a snapshot taken now and finalizeContents()
-  // walks the symbols appended afterwards.
+  // Unless scanSymbols() found an unresolved thunk-shaped name, address
+  // assignment only appends symbols: existing names, flags and section kinds
+  // stay final. The prepared passes can then overlap address assignment, and
+  // finalizeContents() walks the appended thunk symbols. Otherwise run both
+  // complete walks after layout, preserving symbol and string-table order as
+  // well as function starts when a thunk replaces an existing symbol.
 #if LLVM_ENABLE_THREADS
-  if (parallel::strategy.ThreadsRequested != 1) {
+  if (parallel::strategy.ThreadsRequested != 1 && canPrepareSymbols) {
     symtabSection->snapshotSymbols();
     prepareGroup.emplace();
     // A scope on a thread-pool worker is dropped unless that thread has its
