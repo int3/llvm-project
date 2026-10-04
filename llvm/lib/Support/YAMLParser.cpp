@@ -1420,6 +1420,17 @@ bool Scanner::scanFlowScalar(bool IsDoubleQuoted) {
   } else {
     skip(1);
     while (Current != End) {
+      // Most single-quoted scalars (notably TBD symbol names) are printable
+      // ASCII. Scan that run with a local pointer, then update the scanner
+      // once, instead of checking UTF-8 and storing Current/Column per byte.
+      // Leave quotes, non-ASCII, control characters and the final input byte
+      // to the existing scanner below, preserving its boundary behavior.
+      StringRef::iterator I = Current;
+      while (I + 1 < End && static_cast<unsigned char>(*I) >= 0x20 &&
+             static_cast<unsigned char>(*I) < 0x7f && *I != '\'')
+        ++I;
+      Column += I - Current;
+      Current = I;
       // Skip a ' followed by another '.
       if (Current + 1 < End && *Current == '\'' && *(Current + 1) == '\'') {
         skip(2);

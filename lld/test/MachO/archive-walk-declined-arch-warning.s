@@ -1,16 +1,9 @@
 # REQUIRES: x86, aarch64
 ## The index prepass runs on workers before the walk decides whether it can walk
 ## at all, and buildIndex() makes the same first-member architecture check that
-## addLazySymbols() makes. On a command line where the walk declines after the
-## prepass has already run -- here because an extracted member carries an
-## LC_LINKER_OPTION, which loads a library after the phase -- the archive is
-## published the ordinary way and addLazySymbols() reports the mismatch. The
-## prepass's own copy of that warning must not be replayed on top of it.
-##
-## mixed.a supplies the mismatch and nothing else: an archive whose first member
-## is the wrong architecture is rejected whole by addLazySymbols(), so no symbol
-## may be needed from it. opt.a supplies the extracted LC_LINKER_OPTION member
-## that makes the walk decline.
+## addLazySymbols() makes. The incompatible mixed.a makes the prepass decline;
+## its warning must not be replayed on top of the serial fallback's warning.
+## opt.a also exercises that fallback with an LC_LINKER_OPTION member.
 
 # RUN: rm -rf %t; split-file %s %t
 ## The two links write the same basename in separate directories: the output

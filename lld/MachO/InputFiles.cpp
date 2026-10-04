@@ -3273,7 +3273,7 @@ void macho::reportOrdinalOverflow(uint32_t top, uint32_t walk, uint32_t seq) {
 }
 
 template <class LP>
-static void forEachUndefinedNameImpl(MemoryBufferRef mb,
+static bool forEachUndefinedNameImpl(MemoryBufferRef mb,
                                      llvm::function_ref<void(StringRef)> fn,
                                      bool *sawLinkerOption) {
   using Header = typename LP::mach_header;
@@ -3288,6 +3288,7 @@ static void forEachUndefinedNameImpl(MemoryBufferRef mb,
   // extracted member.
   const symtab_command *st = nullptr;
   const dysymtab_command *dst = nullptr;
+  const typename LP::segment_command *segment = nullptr;
   const uint8_t *p = buf + target->headerSize;
   for (uint32_t i = 0, n = hdr->ncmds; i != n; ++i) {
     auto *cmd = reinterpret_cast<const load_command *>(p);
@@ -3295,12 +3296,14 @@ static void forEachUndefinedNameImpl(MemoryBufferRef mb,
       st = reinterpret_cast<const symtab_command *>(cmd);
     else if (cmd->cmd == LC_DYSYMTAB)
       dst = reinterpret_cast<const dysymtab_command *>(cmd);
+    else if (cmd->cmd == LP::segmentLCType && !segment)
+      segment = reinterpret_cast<const typename LP::segment_command *>(cmd);
     else if (cmd->cmd == LC_LINKER_OPTION && sawLinkerOption)
       *sawLinkerOption = true;
     p += cmd->cmdsize;
   }
   if (!st)
-    return;
+    return true;
   ArrayRef<NList> nList(reinterpret_cast<const NList *>(buf + st->symoff),
                         st->nsyms);
   const char *strtab = reinterpret_cast<const char *>(buf) + st->stroff;
@@ -3315,11 +3318,61 @@ static void forEachUndefinedNameImpl(MemoryBufferRef mb,
   // order, which makes the undefined range the suffix of the nlist and puts
   // every symbol the producer classified as undefined inside it. Otherwise fall
   // back to the full scan.
-  uint32_t begin = 0, end = st->nsyms;
-  if (dst && dst->ilocalsym == 0 && dst->iextdefsym == dst->nlocalsym &&
+  bool orderedRanges =
+      dst && dst->ilocalsym == 0 && dst->iextdefsym == dst->nlocalsym &&
       dst->iundefsym == dst->nlocalsym + dst->nextdefsym &&
-      dst->iundefsym + dst->nundefsym == st->nsyms)
-    begin = dst->iundefsym;
+      dst->iundefsym + dst->nundefsym == st->nsyms;
+
+  // The index may advertise N_EXT labels that shouldIgnoreLabel() turns into
+  // locals. Extracting their member does not define those names, and an index
+  // reservation is not a reference. The walker cannot model the resulting lazy
+  // -> undefined transitions (including alternate providers and weak refs).
+  // Decline the archive set in this read-only prepass, before any reservations,
+  // provider state or member extractions, and let serial publication handle it.
+  // Only scan definitions if the object contains a section that ignores labels;
+  // ordinary locals in those sections do not prevent walking real archives.
+  SmallVector<uint8_t, 32> ignoredLabels;
+  bool hasIgnoredLabels = false;
+  if (segment) {
+    ArrayRef<typename LP::section> sections(
+        reinterpret_cast<const typename LP::section *>(segment + 1),
+        segment->nsects);
+    for (const auto &sec : sections) {
+      StringRef name(sec.sectname, strnlen(sec.sectname, sizeof(sec.sectname)));
+      StringRef segname(sec.segname, strnlen(sec.segname, sizeof(sec.segname)));
+      // Keep these categories in sync with shouldIgnoreLabel(): 1 ignores all
+      // labels, 2 only linker-private labels in literal sections.
+      uint8_t kind = 0;
+      if (segname == segment_names::data &&
+          (name == section_names::cfString ||
+           name == section_names::objcClassRefs ||
+           name == section_names::objcSelrefs))
+        kind = 1;
+      else if (isWordLiteralSection(sec.flags) ||
+               sectionType(sec.flags) == S_CSTRING_LITERALS)
+        kind = 2;
+      ignoredLabels.push_back(kind);
+      hasIgnoredLabels |= kind != 0;
+    }
+  }
+  if (hasIgnoredLabels) {
+    uint32_t begin = orderedRanges ? uint32_t(dst->iextdefsym) : 0;
+    uint32_t end = orderedRanges ? uint32_t(dst->iundefsym) : uint32_t(st->nsyms);
+    for (uint32_t i = begin; i != end; ++i) {
+      const NList &sym = nList[i];
+      if ((sym.n_type & (N_STAB | N_TYPE | N_EXT)) != (N_SECT | N_EXT))
+        continue;
+      // Let the serial parser diagnose an invalid section index if extracted.
+      if (sym.n_sect == 0 || sym.n_sect > ignoredLabels.size())
+        return false;
+      uint8_t kind = ignoredLabels[sym.n_sect - 1];
+      if (kind == 1 || (kind == 2 && isPrivateLabel(strtab + sym.n_strx)))
+        return false;
+    }
+  }
+
+  uint32_t begin = orderedRanges ? uint32_t(dst->iundefsym) : 0;
+  uint32_t end = st->nsyms;
   for (uint32_t i = begin; i != end; ++i) {
     const NList &sym = nList[i];
     if (sym.n_type & N_STAB)
@@ -3330,6 +3383,7 @@ static void forEachUndefinedNameImpl(MemoryBufferRef mb,
       continue;
     fn(StringRef(strtab + sym.n_strx));
   }
+  return true;
 }
 
 bool macho::hasLinkerOptions(MemoryBufferRef mb) {
@@ -3357,13 +3411,12 @@ bool macho::hasLinkerOptions(MemoryBufferRef mb) {
   return false;
 }
 
-void macho::forEachUndefinedName(MemoryBufferRef mb,
+bool macho::forEachUndefinedName(MemoryBufferRef mb,
                                  llvm::function_ref<void(StringRef)> fn,
                                  bool *sawLinkerOption) {
   if (target->wordSize == 8)
-    forEachUndefinedNameImpl<LP64>(mb, fn, sawLinkerOption);
-  else
-    forEachUndefinedNameImpl<ILP32>(mb, fn, sawLinkerOption);
+    return forEachUndefinedNameImpl<LP64>(mb, fn, sawLinkerOption);
+  return forEachUndefinedNameImpl<ILP32>(mb, fn, sawLinkerOption);
 }
 
 bool ArchiveFile::canWalk() {
@@ -3459,15 +3512,15 @@ bool ArchiveFile::fillMemberUndefineds(uint64_t childOffset) {
   llvm::SmallVector<CachedHashStringRef, 0> &names =
       undefinedNames.find(childOffset)->second;
   // An LC_LINKER_OPTION in a member adds inputs after the phase, and a name only
-  // those inputs reference has no slot yet, because the walk creates none for an
-  // index entry it does not extract. The member's load commands are being walked
-  // here anyway, so the walk can find out before it commits to anything.
+  // those inputs reference needs its residual lazy slot published after the
+  // walk. The member's load commands are being walked here anyway.
   bool sawLinkerOption = false;
-  forEachUndefinedName(*mb,
-                       [&](StringRef name) {
-                         names.push_back(CachedHashStringRef(name));
-                       },
-                       &sawLinkerOption);
+  if (!forEachUndefinedName(*mb,
+                            [&](StringRef name) {
+                              names.push_back(CachedHashStringRef(name));
+                            },
+                            &sawLinkerOption))
+    return false;
   if (sawLinkerOption)
     memberLinkerOptions.store(true, std::memory_order_relaxed);
   // The -ObjC prelude's second pass. This reads the header, the load commands
@@ -3578,7 +3631,8 @@ bool ArchiveFile::buildMemberMaps() {
     }
     entries.push_back(i);
   }
-  indexSymbols = decltype(indexSymbols)();
+  // Keep the symbols until the prepass has discovered member linker options:
+  // the walker may need them to publish residual lazy entries after its join.
   return true;
 }
 

@@ -691,12 +691,11 @@ struct ParallelInputPhase {
   std::vector<ArchiveFile *> archives;
   std::vector<uint32_t> archiveOrdinals;
   uint32_t nextOrdinal = 0;
-  // Set when a held object carries an LC_LINKER_OPTION, which means a library
-  // loads after the phase and the walk cannot run. Learned at hold time, from
-  // the object's load commands, so the decision is available before the first
-  // archive is held instead of only at finishParallelInput(). Monotone: an
-  // object that follows a held archive is not held at all.
+  // Autolink inputs arrive after the phase and need the unextracted entries'
+  // lazy slots at their original index positions.
   bool heldLinkerOptions = false;
+  bool residualIndexesPublished = false;
+  uint64_t residualProviderFetches = 0;
   // One prepass state per held archive, in the same order as `archives`. A deque
   // because the running tasks hold references into it while the argument walk
   // appends more.
@@ -1257,7 +1256,7 @@ static void parseHeldFiles(size_t begin) {
 // decisions stay serial and in order while the parses they trigger go to
 // workers. Returns false if the archives cannot be walked, in which case the
 // caller falls back to addLazySymbols().
-static bool walkArchives() {
+static bool walkArchives(bool publishResidual) {
   std::vector<ArchiveFile *> &archives = parallelInput.archives;
 
   // The prepass -- each archive's index, its entries' member offsets, its member
@@ -1290,15 +1289,13 @@ static bool walkArchives() {
   }
 
   {
-    // An extracted member that brings in its own libraries would have those
-    // inputs reference names after the phase has ended. The walk creates no slot
-    // for an index entry it does not extract, so such a name would be created
-    // where it was referenced rather than at its index entry, and symVector's
-    // order -- and with it the symbol table and the stubs -- would differ from
-    // the serial link. Give the whole archive set back to addLazySymbols().
     for (ArchiveFile *archive : archives)
-      if (archive->memberLinkerOptions.load(std::memory_order_relaxed))
-        return false;
+      publishResidual |=
+          archive->memberLinkerOptions.load(std::memory_order_relaxed);
+    // The member-option flag is only final after the prepass has joined.
+    if (!publishResidual)
+      for (ArchiveFile *archive : archives)
+        archive->indexSymbols = decltype(archive->indexSymbols)();
     // The walk counter's ceiling for one archive: one value per index entry,
     // visited or not, plus one per member and one per member undefined record.
     // A member of an earlier archive can be extracted inside this archive's
@@ -1918,6 +1915,19 @@ static bool walkArchives() {
     TimeTraceScope applyScope("Apply archive slot reservations");
     symtab->applyArchiveReservations(reservations);
   }
+  if (publishResidual) {
+    TimeTraceScope publishScope("Publish residual archive indexes");
+    parallelFor(0, chunks.size(), [&](size_t i) {
+      const EntryChunk &chunk = chunks[i];
+      ArchiveFile *archive = archives[chunk.archiveIndex];
+      for (uint32_t k = chunk.begin; k != chunk.end; ++k)
+        symtab->publishResidualEntry(
+            archive->indexEntries[k].name, archive, archive->indexSymbols[k],
+            {parallelInput.archiveOrdinals[chunk.archiveIndex],
+             walkOfEntry(chunk.archiveIndex, k), 0});
+    });
+    parallelInput.residualIndexesPublished = true;
+  }
   return true;
 }
 
@@ -1933,6 +1943,8 @@ static void resetParallelInputPhase() {
   parallelInput.archiveOrdinals.clear();
   parallelInput.nextOrdinal = 0;
   parallelInput.heldLinkerOptions = false;
+  parallelInput.residualIndexesPublished = false;
+  parallelInput.residualProviderFetches = 0;
   // Already joined at the end of the phase; this is for the link that never
   // reached one.
   joinHeldParse();
@@ -1974,6 +1986,10 @@ static void fetchFromArchiveProvider(StringRef name, uint32_t belowArchiveId) {
                                   dysym->getFile()->id < archive->id))
         return;
   }
+  ++parallelInput.residualProviderFetches;
+  assert((!parallelInput.residualIndexesPublished ||
+          parallelInput.residualProviderFetches == 0) &&
+         "published residual indexes must satisfy post-phase archive fetches");
   ObjFile *obj = archive->createIndexedMember(provider->childOffset, name);
   if (!obj)
     return;
@@ -2004,7 +2020,7 @@ static void finishParallelInput(bool moreInputsFollow = false) {
   // not, the phases run in the order they ran before the prepass existed.
   {
     TimeTraceScope timeScope("Join archive index prepass");
-    joinArchivePrepass(/*willWalk=*/!moreInputsFollow);
+    joinArchivePrepass(/*willWalk=*/true);
   }
   {
     TimeTraceScope timeScope("Parse held object files");
@@ -2025,29 +2041,21 @@ static void finishParallelInput(bool moreInputsFollow = false) {
     flushAutolinkBatch();
   }
 
-  // The same rule as for extracted members, for the direct objects: an
-  // LC_LINKER_OPTION loads a library after the phase, and a name only that
-  // library references has no slot if the walk skipped its index entry. The held
-  // objects' options have not been merged into unprocessedLCLinkerOptions yet --
-  // that happens below -- so ask their contexts directly. This is what made the
-  // check on unprocessedLCLinkerOptions alone read as empty.
-  if (!moreInputsFollow)
-    for (ParseContext &ctx : parallelInput.contexts)
-      if (!ctx.lcLinkerOptions.empty()) {
-        moreInputsFollow = true;
-        break;
-      }
+  bool publishResidual = moreInputsFollow || parallelInput.heldLinkerOptions ||
+                         !unprocessedLCLinkerOptions.empty();
+  for (ParseContext &ctx : parallelInput.contexts)
+    publishResidual |= !ctx.lcLinkerOptions.empty();
 
-  // The walker decides extraction from the index instead of from a lazy symbol
-  // per index entry, so it leaves nothing behind for the entries it does not
-  // extract from. That is invisible at the end of the input but not to an input
-  // that follows, so when one does, the held archives publish their indexes the
-  // ordinary way instead -- with one correction, because the dylibs between and
-  // after them have already been registered.
   bool walked = false;
   bool publishedSerially = false;
   if (!parallelInput.archives.empty()) {
-    if (moreInputsFollow) {
+    {
+      TimeTraceScope timeScope("Walk archives");
+      walked = walkArchives(publishResidual);
+    }
+    // An unreadable/bitcode member, an ignored external label, or an ordinal
+    // overflow declines before mutation. Preserve the fallback's dylib rules.
+    if (!walked && publishResidual) {
       TimeTraceScope timeScope("Publish archive indexes");
       ParseContext archiveCtx;
       for (uint32_t i = 0; i != parallelInput.archives.size(); ++i) {
@@ -2056,8 +2064,6 @@ static void finishParallelInput(bool moreInputsFollow = false) {
         archiveCtx.walk = 0;
         archiveCtx.seq = 0;
         symtab->serialCtx = &archiveCtx;
-        // The mandatory members load at this archive's own position, before its
-        // index, exactly as they do on the serial path.
         loadMandatoryArchiveMembers(parallelInput.archives[i],
                                     parallelInput.archives[i]->getName(),
                                     /*archiveContents=*/nullptr,
@@ -2068,10 +2074,9 @@ static void finishParallelInput(bool moreInputsFollow = false) {
       }
       symtab->serialCtx = nullptr;
       publishedSerially = true;
-    } else {
-      TimeTraceScope timeScope("Walk archives");
-      walked = walkArchives();
     }
+    for (ArchiveFile *archive : parallelInput.archives)
+      archive->indexSymbols = decltype(archive->indexSymbols)();
   }
 
   {
@@ -2205,11 +2210,7 @@ static bool beginHeldInput(MemoryBufferRef mbref, bool isLazy,
         finishParallelInput(/*moreInputsFollow=*/true);
       } else {
         holdParse = true;
-        // An autolinked library loads after the phase, so no archive held after
-        // this object can be walked. Reading it here instead of waiting for the
-        // held parse keeps the whole archive path on the serial position it had
-        // before the phase existed, including its overlap with the TAPI
-        // pipeline, rather than deferring it to the end of the phase.
+        // Learn at hold time whether residual index slots will be needed.
         if (!parallelInput.heldLinkerOptions && hasLinkerOptions(mbref))
           parallelInput.heldLinkerOptions = true;
       }
@@ -2220,14 +2221,8 @@ static bool beginHeldInput(MemoryBufferRef mbref, bool isLazy,
       // per-archive prelude, so the index can still be held back. An archive
       // loaded from an LC_LINKER_OPTION arrives after the phase.
       //
-      // An input that follows the phase -- an autolinked library named by a held
-      // or an already-parsed object -- means the walk would decline later anyway,
-      // and declining now is strictly better: the archive publishes its index at
-      // its own command-line position on the ordinary serial path.
-      holdArchiveIndex = (loadType == LoadType::CommandLine ||
-                          loadType == LoadType::CommandLineForce) &&
-                         !parallelInput.heldLinkerOptions &&
-                         unprocessedLCLinkerOptions.empty();
+      holdArchiveIndex = loadType == LoadType::CommandLine ||
+                         loadType == LoadType::CommandLineForce;
       if (!holdArchiveIndex)
         finishParallelInput(/*moreInputsFollow=*/true);
       break;
@@ -2271,6 +2266,13 @@ static void endHeldInput(InputFile *file, bool holdParse, bool holdArchiveIndex,
   if (archive->canWalk()) {
     parallelInput.archives.push_back(archive);
     parallelInput.archiveOrdinals.push_back(ctx->top);
+    // Holding the first archive closes the direct-object prefix: a later
+    // object ends the phase rather than joining this batch. Dispatch its final
+    // partial chunk now, so it does not wait behind the archive prepass and the
+    // rest of the command-line dylibs in finishParallelInput(). This matters
+    // especially when residual publication lets a tiny autolink archive walk.
+    if (parallelInput.heldParse)
+      spawnHeldParseChunk();
     // Everything the walk needs from the archive's bytes starts now, on workers,
     // so that it overlaps the rest of the argument walk instead of running in
     // front of the walk's first serial decision.

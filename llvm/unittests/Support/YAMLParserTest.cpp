@@ -617,6 +617,19 @@ static void expectCanParseScalar(StringRef Input, StringRef Expected) {
   EXPECT_EQ(Result, Expected);
 }
 
+TEST(YAMLParser, SingleQuotedAsciiRuns) {
+  std::string Run(256, 'a');
+  expectCanParseScalar("'" + Run + "'", Run);
+  expectCanParseScalar("'" + Run + "''tail'", Run + "'tail");
+  expectCanParseScalar("'" + Run + "\ttail'", Run + "\ttail");
+  expectCanParseScalar("'" + Run + "\n  tail'", Run + " tail");
+  expectCanParseScalar("'" + Run + "\xc3\xa9tail'", Run + "\xc3\xa9tail");
+  expectCanParseScalar("'" + Run + "\\tail'", Run + "\\tail");
+  ExpectParseError("Unterminated ASCII run in a sequence", "['" + Run);
+  ExpectParseSuccess("ASCII keys preserve following token columns",
+                     "'" + Run + "': 'value'\n'next': 'value'\n");
+}
+
 TEST(YAMLParser, UnfoldsScalarValue) {
   // Double-quoted values
   expectCanParseScalar("\"\"", "");

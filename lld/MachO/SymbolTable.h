@@ -167,6 +167,10 @@ public:
   };
   void applyArchiveReservations(
       llvm::MutableArrayRef<std::vector<ArchiveReservation>> perShard);
+  void publishResidualEntry(llvm::CachedHashStringRef name, ArchiveFile *file,
+                            const llvm::object::Archive::Symbol &sym,
+                            RecordOrdinal ordinal);
+
 
 private:
   // Per-slot bookkeeping for the fold. Allocated immediately in front of the

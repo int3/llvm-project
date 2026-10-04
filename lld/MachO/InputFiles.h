@@ -542,7 +542,8 @@ public:
   // Set if any member carries an LC_LINKER_OPTION; see fillMemberUndefineds().
   std::atomic<bool> memberLinkerOptions{false};
   // One per index entry while the index is being read, so that the member
-  // offsets can be resolved in parallel afterwards; dropped once they are.
+  // offsets can be resolved in parallel afterwards. Kept through the prepass
+  // join, and through residual publication when later inputs need lazy slots.
   std::vector<llvm::object::Archive::Symbol> indexSymbols;
   // Each member's child offset, and the index entries it provides.
   llvm::DenseMap<uint64_t, llvm::object::Archive::Child> indexChildren;
@@ -684,15 +685,15 @@ extern bool deferArchiveIndex;
 
 // True if the object carries an LC_LINKER_OPTION, read from the load commands
 // alone. The parallel input phase asks this before it holds an object, because
-// an autolinked library loads after the phase and the archive walker cannot run
-// when any input follows it.
+// an autolinked library loads after the phase and needs residual lazy slots.
 bool hasLinkerOptions(MemoryBufferRef mb);
 
 // Calls fn with the name of every external undefined symbol of a Mach-O object
 // file, in nlist order, without parsing it. This is what lets the walker decide
 // which archive member to extract next without waiting for the parse of the
-// member that triggered it.
-void forEachUndefinedName(MemoryBufferRef mb,
+// member that triggered it. Returns false if an external section label would
+// be ignored by the parser: the archive set must then be published serially.
+bool forEachUndefinedName(MemoryBufferRef mb,
                           llvm::function_ref<void(StringRef)> fn,
                           bool *sawLinkerOption = nullptr);
 

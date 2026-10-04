@@ -32,7 +32,13 @@
 
 ## An object file after the archive references _cf.
 # RUN: %lld -o %t/t1/obj --threads=1 -undefined dynamic_lookup %t/main.o %t/lib.a %t/refcf.o
-# RUN: %lld -o %t/t8/obj --threads=8 -undefined dynamic_lookup %t/main.o %t/lib.a %t/refcf.o
+## Ignored external labels decline before the walker mutates the table. The
+## later object must find exactly the lazy state serial publication left.
+# RUN: %lld -o %t/t8/obj --threads=8 -undefined dynamic_lookup %t/main.o %t/lib.a %t/refcf.o --time-trace=%t/residual.json --time-trace-granularity=0
+# RUN: FileCheck %s --check-prefix=RESIDUAL --input-file=%t/residual.json
+# RESIDUAL-NOT: Publish residual archive indexes
+# RESIDUAL: "Publish archive indexes"
+# RESIDUAL-NOT: Publish residual archive indexes
 # RUN: llvm-objdump --macho --bind --syms %t/t1/obj | FileCheck %s --check-prefix=BIND
 # RUN: llvm-objdump --macho --bind --syms %t/t8/obj | FileCheck %s --check-prefix=BIND
 # RUN: not %lld -o /dev/null --threads=1 %t/main.o %t/lib.a %t/refcf.o 2>&1 | FileCheck %s --check-prefix=OBJ

@@ -1,9 +1,6 @@
 # REQUIRES: x86
-## The archive walker cannot run when an input follows the input phase, and an
-## LC_LINKER_OPTION in a direct object loads one. The decline is decided when the
-## object is held, before the archive is, so the archive publishes its index at
-## its own command-line position on the ordinary serial path -- no held index, no
-## deferred publish -- and the result does not depend on the thread count.
+## Autolink inputs follow the held phase. Residual index publication preserves
+## the slots those inputs observe, so the archives can now be walked.
 
 # RUN: rm -rf %t; split-file %s %t
 # RUN: mkdir -p %t/opt1 %t/opt2 %t/opt8 %t/tt %t/mirror1 %t/mirror8 %t/mtt
@@ -37,17 +34,17 @@
 
 # AUTOLINK: libextra.dylib
 
-## Neither the walk nor the deferred publish runs: the archive is never held.
+## Both the walk and residual publication run; the serial fallback does not.
 # RUN: %lld -lSystem -L%t -o %t/tt/out --threads=8 --time-trace=%t/tt/trace.json \
 # RUN:     --time-trace-granularity=0 -why_load %t/main.o %t/abc.a > %t/tt/why 2>&1
 # RUN: cmp %t/opt1/out %t/tt/out
-# RUN: FileCheck %s --check-prefix=DECLINE --input-file=%t/tt/trace.json \
-# RUN:     --implicit-check-not="Publish archive indexes" \
-# RUN:     --implicit-check-not="Walk archives"
-# DECLINE: ExecuteLinker
+# RUN: FileCheck %s --check-prefix=RESIDUAL --input-file=%t/tt/trace.json \
+# RUN:     --implicit-check-not="Publish archive indexes"
+# RESIDUAL-DAG: Publish residual archive indexes
+# RESIDUAL-DAG: Walk archives
 
 ## The mirror: the same link with no LC_LINKER_OPTION still walks, so the gate
-## has not been widened. The dylibs after the archive do not close the phase.
+## avoids residual publication. Dylibs after the archive do not close the phase.
 # RUN: %lld -lSystem -L%t -o %t/mirror1/out --threads=1 -why_load %t/plain.o %t/abc.a > %t/mirror1/why 2>&1
 # RUN: %lld -lSystem -L%t -o %t/mirror8/out --threads=8 -why_load %t/plain.o %t/abc.a > %t/mirror8/why 2>&1
 # RUN: cmp %t/mirror1/out %t/mirror8/out
@@ -58,6 +55,7 @@
 # RUN: FileCheck %s --check-prefix=WALK --input-file=%t/mtt/trace.json \
 # RUN:     --implicit-check-not="Publish archive indexes"
 # WALK: Walk archives
+# WALK-NOT: Publish residual archive indexes
 
 #--- main.s
 .linker_option "-lextra"

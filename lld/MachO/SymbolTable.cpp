@@ -1133,38 +1133,91 @@ Symbol *SymbolTable::addLazyArchive(StringRef name, ArchiveFile *file,
   return s;
 }
 
+// The serial fallback and the post-walk publication must apply the same dylib
+// displacement rule. The latter has already extracted every Fetch case.
+enum class ResidualAction { Keep, Replace, Fetch };
+static ResidualAction residualAction(Symbol *s, ArchiveFile *file) {
+  if (isa<Undefined>(s))
+    return ResidualAction::Fetch;
+  if (auto *dysym = dyn_cast<DylibSymbol>(s)) {
+    if (dysym->isWeakDef())
+      return dysym->isReferenced() ? ResidualAction::Fetch
+                                  : ResidualAction::Replace;
+    if (!dysym->isDynamicLookup() && dysym->getFile()->id > file->id)
+      return ResidualAction::Replace;
+  }
+  return ResidualAction::Keep;
+}
+
+static void replaceResidual(Symbol *s, ArchiveFile *file,
+                            const object::Archive::Symbol &sym) {
+  if (auto *dysym = dyn_cast<DylibSymbol>(s))
+    dysym->unreference();
+  replaceSymbol<LazyArchive>(s, file, sym);
+}
+
 void SymbolTable::addResidualLazyArchive(
-    StringRef name, ArchiveFile *file,
-    const object::Archive::Symbol &sym) {
+    StringRef name, ArchiveFile *file, const object::Archive::Symbol &sym) {
   auto [s, wasInserted] = insert(name, file);
   if (wasInserted) {
-    constructOrReplaceSymbol<LazyArchive>(s, /*wasInserted=*/true, file, sym);
+    new (s) LazyArchive(file, sym);
     return;
   }
-  // A definition, or an earlier archive's lazy symbol, already owns the slot.
-  if (isa<Defined>(s) || isa<CommonSymbol>(s) || s->isLazy())
+  switch (residualAction(s, file)) {
+  case ResidualAction::Keep:
     return;
-  if (auto *dysym = dyn_cast<DylibSymbol>(s)) {
-    // A weak dylib definition always yields to an archive member, whichever was
-    // registered first.
-    if (dysym->isWeakDef()) {
-      if (dysym->getRefState() != RefState::Unreferenced)
-        file->fetch(sym);
-      else
-        replaceSymbol<LazyArchive>(s, file, sym);
-      return;
-    }
-    // A strong dylib registered before this archive kept the slot. One
-    // registered after it never had it: the serial linker found a lazy symbol
-    // here and left the dylib definition out.
-    if (dysym->isDynamicLookup() || dysym->getFile()->id < file->id)
-      return;
-    dysym->unreference();
-    replaceSymbol<LazyArchive>(s, file, sym);
+  case ResidualAction::Replace:
+    replaceResidual(s, file, sym);
     return;
-  }
-  if (isa<Undefined>(s)) {
+  case ResidualAction::Fetch:
     file->fetch(sym);
+    return;
+  }
+}
+
+void SymbolTable::publishResidualEntry(CachedHashStringRef name,
+                                       ArchiveFile *file,
+                                       const object::Archive::Symbol &sym,
+                                       RecordOrdinal ordinal) {
+  assert(folding);
+  Shard &shard = shards[shardOf(name)];
+  std::lock_guard<ShardMutex> lock(shard.mu);
+  auto [it, wasInserted] = shard.map.try_emplace(name, nullptr);
+  if (wasInserted) {
+    Symbol *s = allocateSlot();
+    it->second = s;
+    shard.created.push_back(s);
+    SlotMeta &meta = metaOf(s);
+    meta.firstOrdinal = ordinal;
+    meta.setWinner(ordinal);
+    new (s) LazyArchive(file, sym);
+    return;
+  }
+  Symbol *s = it->second;
+  SlotMeta &meta = metaOf(s);
+  if (ordinal < meta.firstOrdinal)
+    meta.firstOrdinal = ordinal;
+  // Chunks can finish out of order. Preserve both the earliest slot position
+  // and its provider, including duplicate names within the same archive.
+  if (isa<LazyArchive>(s)) {
+    if (ordinal < meta.winner()) {
+      replaceResidual(s, file, sym);
+      meta.setWinner(ordinal);
+    }
+    return;
+  }
+  switch (residualAction(s, file)) {
+  case ResidualAction::Keep:
+    return;
+  case ResidualAction::Replace:
+    replaceResidual(s, file, sym);
+    meta.setWinner(ordinal);
+    return;
+  case ResidualAction::Fetch:
+    // The prepass declines ignored external labels before the walk mutates
+    // anything. Every remaining referenced provider must have been resolved;
+    // publishing a residual entry must never initiate another extraction.
+    llvm_unreachable("archive walk left a referenced residual entry");
     return;
   }
 }
