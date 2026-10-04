@@ -1,0 +1,56 @@
+# REQUIRES: x86
+# RUN: rm -rf %t; mkdir -p %t/t1 %t/t8
+# RUN: %python %S/Inputs/parallel-unwind-shared.py shared > %t.s
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-macos %t.s -o %t.o
+# RUN: %lld -dylib -install_name out -lSystem --icf=all --threads=1 %t.o -o %t/t1/out
+# RUN: %lld -dylib -install_name out -lSystem --icf=all --threads=8 %t.o -o %t/t8/out
+# RUN: cmp %t/t1/out %t/t8/out
+# RUN: llvm-nm --defined-only --numeric-sort %t/t8/out | FileCheck %s --check-prefix=COUNT
+# RUN: llvm-nm --defined-only %t/t8/out | FileCheck %s --check-prefix=SYMS
+# RUN: llvm-objdump --macho --unwind-info %t/t8/out | FileCheck %s --check-prefix=SHARED
+
+## Function bodies are distinct and >8192 function slots survive ICF. LSDAs
+## fold to the same address, and the shared CUEs span all three worker chunks.
+# COUNT-COUNT-9000: T _f{{[0-9]+}}
+# SYMS-DAG: [[LSDA:[0-9a-f]+]] s _lsda0
+# SYMS-DAG: [[LSDA]] s _lsda1
+# SYMS-DAG: {{[0-9a-f]+}} T _f8999
+# SHARED: Personality functions: (count = 2)
+# SHARED: LSDA descriptors:
+# SHARED: [8999]:
+
+## Every shared undefined reference must retain its diagnostic occurrence.
+# RUN: %python %S/Inputs/parallel-unwind-shared.py undefined > %t-undef.s
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-macos %t-undef.s -o %t-undef.o
+# RUN: not %lld -dylib -install_name out -lSystem --icf=all --threads=1 %t-undef.o -o %t/t1/out 2> %t/err1
+# RUN: not %lld -dylib -install_name out -lSystem --icf=all --threads=8 %t-undef.o -o %t/t8/out 2> %t/err8
+# RUN: cmp %t/err1 %t/err8
+# RUN: %lld -dylib -install_name out -lSystem --icf=all -undefined dynamic_lookup --threads=1 %t-undef.o -o %t/t1/out
+# RUN: %lld -dylib -install_name out -lSystem --icf=all -undefined dynamic_lookup --threads=8 %t-undef.o -o %t/t8/out
+# RUN: cmp %t/t1/out %t/t8/out
+
+## Mixed CU/FDE entries, with either kind first in symbol order. Test the
+## workers without ICF too, so shared-record replay cannot hide a mixed-path bug.
+# RUN: %python %S/Inputs/parallel-unwind-shared.py mixed > %t-mixed.s
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-macos -emit-compact-unwind-non-canonical=true %t-mixed.s -o %t-mixed.o
+# RUN: %lld -dylib -install_name out -lSystem --threads=1 %t-mixed.o -o %t/t1/out
+# RUN: %lld -dylib -install_name out -lSystem --threads=8 %t-mixed.o -o %t/t8/out
+# RUN: cmp %t/t1/out %t/t8/out
+# RUN: llvm-objdump --macho --unwind-info %t/t8/out | FileCheck %s --check-prefix=MIXED
+# RUN: %lld -dylib -install_name out -lSystem --icf=all --threads=1 %t-mixed.o -o %t/t1/out
+# RUN: %lld -dylib -install_name out -lSystem --icf=all --threads=8 %t-mixed.o -o %t/t8/out
+# RUN: cmp %t/t1/out %t/t8/out
+# RUN: %python %S/Inputs/parallel-unwind-shared.py mixed-reverse > %t-mixed.s
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-macos -emit-compact-unwind-non-canonical=true %t-mixed.s -o %t-mixed.o
+# RUN: %lld -dylib -install_name out -lSystem --threads=1 %t-mixed.o -o %t/t1/out
+# RUN: %lld -dylib -install_name out -lSystem --threads=8 %t-mixed.o -o %t/t8/out
+# RUN: cmp %t/t1/out %t/t8/out
+# RUN: llvm-objdump --macho --unwind-info %t/t8/out | FileCheck %s --check-prefix=MIXED
+# RUN: %lld -dylib -install_name out -lSystem --icf=all --threads=1 %t-mixed.o -o %t/t1/out
+# RUN: %lld -dylib -install_name out -lSystem --icf=all --threads=8 %t-mixed.o -o %t/t8/out
+# RUN: cmp %t/t1/out %t/t8/out
+# MIXED: Personality functions: (count = 1)
+# MIXED: LSDA descriptors:
+# MIXED: [8999]:
+# MIXED: encoding{{.*}}=0x{{[0-9a-f]}}2010000
+# MIXED: encoding{{.*}}=0x{{[0-9a-f]}}4{{([0-9a-f]{6})}}

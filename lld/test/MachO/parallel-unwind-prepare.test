@@ -1,0 +1,20 @@
+# REQUIRES: x86
+# RUN: rm -rf %t; mkdir -p %t/t1 %t/t8
+# RUN: %python %S/Inputs/parallel-unwind-prepare.py > %t.s
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-macos %t.s -o %t.o
+# RUN: %lld -dylib -install_name out -lSystem --threads=1 %t.o -o %t/t1/out
+# RUN: %lld -dylib -install_name out -lSystem --threads=8 %t.o -o %t/t8/out
+# RUN: cmp %t/t1/out %t/t8/out
+# RUN: llvm-objdump --macho --unwind-info %t/t8/out | FileCheck %s
+# CHECK: Personality functions: (count = 2)
+
+## Missing personalities preserve every reference and its diagnostic order.
+# RUN: %python %S/Inputs/parallel-unwind-prepare.py undefined > %t-undef.s
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-macos %t-undef.s -o %t-undef.o
+# RUN: not %lld -dylib -install_name out -lSystem --threads=1 %t-undef.o -o %t/t1/out 2> %t/err1
+# RUN: not %lld -dylib -install_name out -lSystem --threads=8 %t-undef.o -o %t/t8/out 2> %t/err8
+# RUN: cmp %t/err1 %t/err8
+## Recovery replaces an Undefined in place during the serial replay.
+# RUN: %lld -dylib -install_name out -lSystem -undefined dynamic_lookup --threads=1 %t-undef.o -o %t/t1/out
+# RUN: %lld -dylib -install_name out -lSystem -undefined dynamic_lookup --threads=8 %t-undef.o -o %t/t8/out
+# RUN: cmp %t/t1/out %t/t8/out

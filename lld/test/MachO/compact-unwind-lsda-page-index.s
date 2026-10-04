@@ -22,9 +22,10 @@
 ## The first-level LSDA offsets are prefixes of the LSDA descriptors owned by
 ## their page. Exercise compressed pages, a trailing page without an LSDA, and
 ## the regular-page fallback. The records are manual so page formation does
-## not depend on assembler compact-unwind lowering.
+## not depend on assembler compact-unwind lowering. Each case has 9,000
+## surviving function slots, exercising multiple parallel prepare chunks.
 
-# COMPRESSED: Top level indices: (count = 4)
+# COMPRESSED: Top level indices: (count = 10)
 # COMPRESSED-NEXT: [0]: {{.*}} LSDA offset=0x[[#%.8x,C0:]]
 # COMPRESSED-NEXT: [1]: {{.*}} LSDA offset=0x[[#%.8x,C0 + 16]]
 # COMPRESSED-NEXT: [2]: {{.*}} LSDA offset=0x[[#%.8x,C0 + 32]]
@@ -41,7 +42,7 @@
 # COMPRESSED: Second level index[2]:
 # COMPRESSED: [1]: {{.*}} encoding[{{.*}}]=
 
-# REGULAR: Top level indices: (count = 3)
+# REGULAR: Top level indices: (count = 19)
 # REGULAR-NEXT: [0]: {{.*}} LSDA offset=0x[[#%.8x,R0:]]
 # REGULAR-NEXT: [1]: {{.*}} LSDA offset=0x[[#%.8x,R0 + 16]]
 # REGULAR-NEXT: [2]: {{.*}} LSDA offset=0x[[#%.8x,R0 + 32]]
@@ -53,7 +54,7 @@
 # REGULAR: Second level index[0]:
 # REGULAR: [510]: {{.*}} encoding=
 # REGULAR: Second level index[1]:
-# REGULAR: [1]: {{.*}} encoding[{{.*}}]=
+# REGULAR: [510]: {{.*}} encoding=
 
 #--- generate.py
 import sys
@@ -85,13 +86,13 @@ def emit_lsdas(indices):
 
 if sys.argv[1] == "compressed":
     lsda = {0, 1020, 1021, 1022}
-    for i in range(2044):
+    for i in range(9000):
         emit_function("c%d" % i)
         emit_compact_unwind("c%d" % i, 0x03000000, i if i in lsda else None)
     emit_lsdas(sorted(lsda))
 elif sys.argv[1] == "regular":
     lsda = {0, 510, 511, 512}
-    for i in range(513):
+    for i in range(9000):
         emit_function("r%d" % i)
         emit_compact_unwind("r%d" % i, 0x01000000 | i,
                             i if i in lsda else None)

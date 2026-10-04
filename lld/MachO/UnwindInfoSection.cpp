@@ -19,6 +19,7 @@
 #include "lld/Common/ErrorHandler.h"
 #include "lld/Common/Memory.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/Support/Parallel.h"
@@ -143,6 +144,7 @@ public:
 
 private:
   void prepareRelocations(ConcatInputSection *);
+  void prepareParallel();
   void relocateCompactUnwind(std::vector<CompactUnwindEntry> &);
   void encodePersonalities();
   Symbol *canonicalizePersonality(Symbol *);
@@ -221,6 +223,10 @@ void UnwindInfoSection::addSymbol(const Defined *d,
 }
 
 void UnwindInfoSectionImpl::prepare() {
+  if (parallel::strategy.ThreadsRequested != 1 && symbols.size() >= 4096) {
+    prepareParallel();
+    return;
+  }
   // This iteration needs to be deterministic, since prepareRelocations may add
   // entries to the GOT. symbols preserves Writer::scanSymbols() order, and
   // set_bits() walks the flagged slots in that same order; the unflagged
@@ -243,6 +249,143 @@ void UnwindInfoSectionImpl::prepare() {
         fde.lsda = fde.lsda->canonical();
     }
   }
+}
+
+// Workers own disjoint unwind storage; ICF-shared records are replayed only
+// on the main thread, once for every symbol occurrence. Only the first occurrence
+// of each personality in a chunk needs the ordered personality-table/GOT work.
+// Keep FDE and compact-unwind events distinct: only the latter adds GOT entries.
+void UnwindInfoSectionImpl::prepareParallel() {
+  // ICF folds CUEs independently of functions, so distinct symbol slots can
+  // refer to the same canonical CUE. Discover sharing before either worker
+  // pass. Shared records must not enter the chunk-local dedup/update tables:
+  // even reading an event representative there could race with another chunk.
+  DenseSet<ConcatInputSection *> shared;
+  if (config->icfLevel != ICFLevel::none) {
+    DenseSet<ConcatInputSection *> seen;
+    for (unsigned i : symbolHasEntry.set_bits()) {
+      ConcatInputSection *isec = symbols[i]->unwindEntry();
+      if (!seen.insert(isec).second)
+        shared.insert(isec);
+    }
+  }
+  struct Event {
+    ConcatInputSection *isec;
+    Relocation *reloc;
+    Symbol **fdePersonality;
+    const Defined *sharedSymbol = nullptr;
+  };
+  struct Update {
+    Relocation *reloc;
+    Symbol **fdePersonality;
+    size_t event;
+  };
+  struct Chunk {
+    SmallVector<Event, 4> events;
+    SmallVector<Update, 0> updates;
+  };
+  constexpr size_t chunkSize = 4096;
+  std::vector<Chunk> chunks(divideCeil(symbols.size(), chunkSize));
+  parallelFor(0, chunks.size(), [&](size_t chunkIndex) {
+    Chunk &chunk = chunks[chunkIndex];
+    SmallDenseMap<std::pair<Relocation::Referent, int64_t>, size_t, 4> cuSeen;
+    SmallDenseMap<Symbol *, size_t, 4> fdeSeen;
+    unsigned end = std::min((chunkIndex + 1) * chunkSize, symbols.size());
+    for (int i = symbolHasEntry.find_first_in(chunkIndex * chunkSize, end);
+         i >= 0 && static_cast<unsigned>(i) < end;
+         i = symbolHasEntry.find_next(i)) {
+      const Defined *d = symbols[i];
+      ConcatInputSection *isec = d->unwindEntry();
+      assert(isec);
+      if (shared.contains(isec)) {
+        // Keep every occurrence, including undefined-personality diagnostics,
+        // in its original symbol position. Neither worker pass touches it.
+        chunk.events.push_back({nullptr, nullptr, nullptr, d});
+        continue;
+      }
+      if (isec->getName() != section_names::compactUnwind) {
+        // The FDE exists already; do not insert into the file's map on workers.
+        auto &fdes = cast<ObjFile>(d->getFile())->fdes;
+        auto it = fdes.find(isec);
+        assert(it != fdes.end());
+        FDE &fde = it->second;
+        if (fde.lsda)
+          fde.lsda = fde.lsda->canonical();
+        if (!isa_and_nonnull<Defined>(fde.personality))
+          continue;
+        auto [seen, inserted] =
+            fdeSeen.try_emplace(fde.personality, chunk.events.size());
+        if (inserted)
+          chunk.events.push_back({nullptr, nullptr, &fde.personality});
+        chunk.updates.push_back({nullptr, &fde.personality, seen->second});
+        continue;
+      }
+      assert(!isec->shouldOmitFromOutput());
+      for (Relocation &r : isec->relocs) {
+        assert(target->hasAttr(r.getType(), RelocAttrBits::UNSIGNED));
+        if (auto *referentIsec = r.getReferent().dyn_cast<InputSection *>())
+          r.setReferent(referentIsec->canonical());
+        if (r.getOffset() != cuLayout.personalityOffset)
+          continue;
+        Symbol *s = r.getReferent().dyn_cast<Symbol *>();
+        if (auto *defined = dyn_cast_or_null<Defined>(s))
+          if (!defined->isExternal())
+            if (Symbol *sym = symtab->find(defined->getName()))
+              if (!sym->isLazy())
+                r.setReferent(s = sym);
+        size_t event = chunk.events.size();
+        // An unresolved symbol contributes a diagnostic at *every* reference.
+        // It can also be replaced in place during serial replay. Do not dedup
+        // these events or inspect symbol kinds concurrently with that replay.
+        if (!isa_and_nonnull<Undefined>(s)) {
+          auto [seen, inserted] = cuSeen.try_emplace(
+              std::make_pair(r.getReferent(), r.getAddend()), event);
+          event = seen->second;
+          if (inserted)
+            chunk.events.push_back({isec, &r, nullptr});
+        } else {
+          chunk.events.push_back({isec, &r, nullptr});
+        }
+        // Dylib referents never change; avoid a per-function update record on
+        // the common system-personality path.
+        if (!isa_and_nonnull<DylibSymbol>(s))
+          chunk.updates.push_back({&r, nullptr, event});
+      }
+    }
+  });
+
+  for (Chunk &chunk : chunks)
+    for (Event &event : chunk.events) {
+      if (event.sharedSymbol) {
+        const Defined *d = event.sharedSymbol;
+        ConcatInputSection *isec = d->unwindEntry();
+        if (isec->getName() == section_names::compactUnwind) {
+          prepareRelocations(isec);
+        } else {
+          FDE &fde = cast<ObjFile>(d->getFile())->fdes.find(isec)->second;
+          fde.personality = canonicalizePersonality(fde.personality);
+          if (fde.lsda)
+            fde.lsda = fde.lsda->canonical();
+        }
+      } else if (event.reloc)
+        prepareRelocations(event.isec);
+      else
+        *event.fdePersonality = canonicalizePersonality(*event.fdePersonality);
+    }
+
+  parallelFor(0, chunks.size(), [&](size_t chunkIndex) {
+    Chunk &chunk = chunks[chunkIndex];
+    for (const Update &update : chunk.updates) {
+      const Event &event = chunk.events[update.event];
+      if (update.reloc) {
+        if (update.reloc != event.reloc)
+          update.reloc->setTarget(event.reloc->getReferent(),
+                                  event.reloc->getAddend());
+      } else if (update.fdePersonality != event.fdePersonality) {
+        *update.fdePersonality = *event.fdePersonality;
+      }
+    }
+  });
 }
 
 // Compact unwind relocations have different semantics, so we handle them in a
