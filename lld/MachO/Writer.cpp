@@ -1843,6 +1843,10 @@ void Writer::writeOutputFile() {
     writeUuid();
   writeCodeSignature();
 
+  {
+    TimeTraceScope timeScope("Release output mapping");
+    buffer->releaseMappingInParallel();
+  }
   if (auto e = buffer->commit())
     fatal("failed to write output '" + buffer->getPath() +
           "': " + toString(std::move(e)));

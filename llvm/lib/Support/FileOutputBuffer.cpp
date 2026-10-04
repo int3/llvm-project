@@ -13,7 +13,9 @@
 #include "llvm/Support/FileOutputBuffer.h"
 #include "llvm/Support/Errc.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Memory.h"
+#include "llvm/Support/Parallel.h"
 #include "llvm/Support/TimeProfiler.h"
 #include <system_error>
 
@@ -21,6 +23,9 @@
 #include <unistd.h>
 #else
 #include <io.h>
+#endif
+#if defined(__linux__)
+#include <sys/mman.h>
 #endif
 
 using namespace llvm;
@@ -51,6 +56,35 @@ public:
 
     // Atomically replace the existing file with the new one.
     return Temp.keep(FinalPath);
+  }
+
+  // munmap of a large dirty shared mapping spends its time in zap_pte_range
+  // on the calling thread. MADV_DONTNEED on a MAP_SHARED file mapping removes
+  // the same page-table entries without discarding data: a page was marked
+  // dirty when it was first written, and zapping a dirty PTE marks its page
+  // dirty again, so the page cache keeps every byte and the munmap in
+  // commit() finds nothing left to zap. Two ranges, not one per thread: on
+  // ext4 re-dirtying each page takes the file's i_private_lock, so the zap
+  // stops scaling after two threads (about 1.6x on Firefox's 300 MB output at
+  // 2, 4 and 8 ranges alike) and more threads only spin on the lock. At one
+  // thread it would only move the same serial work.
+  void releaseMappingInParallel() override {
+#if defined(__linux__) && LLVM_ENABLE_THREADS
+    if (parallel::strategy.ThreadsRequested == 1)
+      return;
+    uint8_t *Base = (uint8_t *)Buffer.data();
+    size_t Size = Buffer.size();
+    if (!Base || Size == 0)
+      return;
+    constexpr size_t Parts = 2;
+    const size_t PageSize = fs::mapped_file_region::alignment();
+    const size_t Chunk = alignTo(divideCeil(Size, Parts), PageSize);
+    parallelFor(0, Parts, [&](size_t I) {
+      size_t Begin = I * Chunk;
+      if (Begin < Size)
+        ::madvise(Base + Begin, std::min(Chunk, Size - Begin), MADV_DONTNEED);
+    });
+#endif
   }
 
   ~OnDiskBuffer() override {

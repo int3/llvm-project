@@ -76,6 +76,14 @@ public:
   /// but keeps the memory mapping alive.
   virtual void discard() {}
 
+  /// Called just before commit() once the caller has finished writing. On
+  /// Linux an on-disk buffer drops the page-table entries of its file mapping
+  /// on several threads, so that commit()'s munmap does not tear them all down
+  /// on one. The written data stays in the page cache and the file content is
+  /// unchanged. Buffers that are not a shared file mapping (an in-memory
+  /// buffer, whose pages would be discarded) and other hosts do nothing.
+  virtual void releaseMappingInParallel() {}
+
 protected:
   FileOutputBuffer(StringRef Path) : FinalPath(Path) {}
 
