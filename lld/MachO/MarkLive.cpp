@@ -254,23 +254,23 @@ void MarkLiveImpl<RecordWhyLive>::markTransitively() {
           worklist.append(next.begin(), next.end());
       }
 
-      // Keep LIVE_SUPPORT and its fixed point serial. It depends on all literal
-      // writes from the preceding frontier and is usually a narrow tail.
-      for (ConcatInputSection *isec : inputSections) {
-        if (!(isec->getFlags() & S_ATTR_LIVE_SUPPORT) || isec->live)
+      // Keep LIVE_SUPPORT and its fixed point serial: each scan observes all
+      // literal writes from the preceding frontier and earlier support entries.
+      // Gathering retained the candidate subsequence in inputSections order.
+      for (ConcatInputSection *isec : liveSupportSections) {
+        if (isec->live)
           continue;
         for (const Relocation &r : isec->relocs) {
-          if (auto *s = r.getReferent().dyn_cast<Symbol *>()) {
-            if (s->isLive()) {
-              InputSection *referentIsec = nullptr;
-              if (auto *d = dyn_cast<Defined>(s))
-                referentIsec = d->isec();
-              enqueue(isec, 0, makeEntry(referentIsec, nullptr));
-            }
-          } else {
-            auto *referentIsec = cast<InputSection *>(r.getReferent());
-            if (referentIsec->isLive(r.getAddend()))
-              enqueue(isec, 0, makeEntry(referentIsec, nullptr));
+          bool live;
+          if (auto *s = r.getReferent().dyn_cast<Symbol *>())
+            live = s->isLive();
+          else
+            live = cast<InputSection *>(r.getReferent())->isLive(r.getAddend());
+          if (live) {
+            enqueue(isec, 0, nullptr);
+            // Subsequent referents can only enqueue this same section again.
+            // Its outgoing references are visited in the next frontier drain.
+            break;
           }
         }
       }

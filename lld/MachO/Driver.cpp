@@ -3451,6 +3451,8 @@ struct GatheredInputSection {
   // alone, and this record's base slot in `deadStripSectionRoots`.
   std::vector<uint32_t> roots;
   size_t rootBase = 0;
+  std::vector<uint32_t> liveSupport;
+  size_t liveSupportBase = 0;
 };
 
 struct GatheredInputFile {
@@ -3481,11 +3483,15 @@ static void classifyInputSection(const Section &section,
                  sectionType(concat->getFlags()) == S_MOD_INIT_FUNC_POINTERS) {
         result.special.push_back({isec, result.ordinary.size()});
       } else {
-        if (config->deadStrip && isDeadStripRootSection(concat->getFlags())) {
-          assert(!config->emitInitOffsets ||
-                 sectionType(concat->getFlags()) !=
-                     llvm::MachO::S_MOD_INIT_FUNC_POINTERS);
-          result.roots.push_back(result.ordinary.size());
+        if (config->deadStrip) {
+          uint32_t flags = concat->getFlags();
+          if (isDeadStripRootSection(flags)) {
+            assert(!config->emitInitOffsets ||
+                   sectionType(flags) != llvm::MachO::S_MOD_INIT_FUNC_POINTERS);
+            result.roots.push_back(result.ordinary.size());
+          }
+          if (flags & S_ATTR_LIVE_SUPPORT)
+            result.liveSupport.push_back(result.ordinary.size());
         }
         result.ordinary.push_back(concat);
       }
@@ -3525,10 +3531,14 @@ static void gatherInputSections() {
   // link has common symbols.
   if (config->deadStrip)
     for (ConcatInputSection *isec :
-         ArrayRef<ConcatInputSection *>(inputSections))
+         ArrayRef<ConcatInputSection *>(inputSections)) {
       if (isDeadStripRootSection(isec->getFlags()))
         deadStripSectionRoots.push_back(isec);
+      if (isec->getFlags() & S_ATTR_LIVE_SUPPORT)
+        liveSupportSections.push_back(isec);
+    }
   size_t rootIndex = deadStripSectionRoots.size();
+  size_t liveSupportIndex = liveSupportSections.size();
   for (size_t fileIndex = 0; fileIndex != files.size(); ++fileIndex) {
     const InputFile *file = files[fileIndex];
     for (GatheredInputSection &gatheredSection :
@@ -3554,6 +3564,9 @@ static void gatherInputSections() {
       for (const GatheredInputSection::SpecialInput &special :
            gatheredSection.special) {
         addOrdinaryRun(special.ordinaryCountBefore);
+        // These inputs go to synthetic sections, not inputSections, including
+        // the concat method-list and init-offset cases. They must not become
+        // candidates for the live-support scan.
         addInputSection(special.isec);
       }
       addOrdinaryRun(gatheredSection.ordinary.size());
@@ -3561,6 +3574,8 @@ static void gatherInputSections() {
       // order, so numbering the records here reproduces `inputSections` order.
       gatheredSection.rootBase = rootIndex;
       rootIndex += gatheredSection.roots.size();
+      gatheredSection.liveSupportBase = liveSupportIndex;
+      liveSupportIndex += gatheredSection.liveSupport.size();
     }
     if (!file->objCImageInfo.empty())
       in.objCImageInfo->addFile(file);
@@ -3568,11 +3583,15 @@ static void gatherInputSections() {
 
   inputSections.resize(inputSectionIndex);
   deadStripSectionRoots.resize(rootIndex);
+  liveSupportSections.resize(liveSupportIndex);
   parallelForEach(gatheredFiles, [](GatheredInputFile &gatheredFile) {
     for (GatheredInputSection &gatheredSection : gatheredFile.sections) {
       for (size_t j = 0, e = gatheredSection.roots.size(); j != e; ++j)
         deadStripSectionRoots[gatheredSection.rootBase + j] =
             gatheredSection.ordinary[gatheredSection.roots[j]];
+      for (size_t j = 0, e = gatheredSection.liveSupport.size(); j != e; ++j)
+        liveSupportSections[gatheredSection.liveSupportBase + j] =
+            gatheredSection.ordinary[gatheredSection.liveSupport[j]];
       for (const GatheredInputSection::OrdinaryRun &run :
            gatheredSection.runs) {
         for (size_t i = run.begin; i != run.end; ++i) {
@@ -3945,6 +3964,7 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     inputFiles.clear();
     inputSections.clear();
     deadStripSectionRoots.clear();
+    liveSupportSections.clear();
     inputSectionsOrder = 0;
     loadedArchives.clear();
     loadedObjectFrameworks.clear();

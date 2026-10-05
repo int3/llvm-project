@@ -395,6 +395,10 @@ extern std::vector<ConcatInputSection *> inputSections;
 // on the workers that already read each section's flags.
 extern std::vector<ConcatInputSection *> deadStripSectionRoots;
 
+// Stable subsequence of inputSections with S_ATTR_LIVE_SUPPORT, gathered only
+// for dead stripping. The fixed-point scan must retain this order.
+extern std::vector<ConcatInputSection *> liveSupportSections;
+
 // Is this section a dead-strip root on its own, independent of its symbols?
 inline bool isDeadStripRootSection(uint32_t flags) {
   return (flags & llvm::MachO::S_ATTR_NO_DEAD_STRIP) ||
