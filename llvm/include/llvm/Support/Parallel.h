@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -33,8 +34,12 @@ LLVM_ABI extern ThreadPoolStrategy strategy;
 
 #if LLVM_ENABLE_THREADS
 LLVM_ABI size_t getThreadCount();
+/// Index in the default executor, or UINT_MAX on non-executor threads.
+/// Unlike getThreadCount(), this does not create the executor.
+LLVM_ABI unsigned getWorkerIndex();
 #else
 inline size_t getThreadCount() { return 1; }
+inline unsigned getWorkerIndex() { return UINT_MAX; }
 #endif
 
 namespace detail {

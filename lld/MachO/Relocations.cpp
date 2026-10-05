@@ -14,6 +14,7 @@
 
 #include "lld/Common/ErrorHandler.h"
 #include "lld/Common/CommonLinkerContext.h"
+#include "llvm/Support/Parallel.h"
 
 using namespace llvm;
 using namespace lld;
@@ -23,6 +24,33 @@ static_assert(sizeof(void *) != 8 || sizeof(Relocation) == 16,
               "Try to minimize Reloc's size; we create many instances");
 static_assert(alignof(Symbol) >= 4 && alignof(InputSection) >= 4,
               "RelocationReferent must preserve one spare tag bit");
+
+void macho::initRelocationBufferSlabs() {
+  auto &ctx = lld::context();
+  assert(!ctx.relocationBufferSlabs);
+  ctx.relocationBufferSlotCount =
+      1 + (parallel::strategy.ThreadsRequested == 1
+               ? 0
+               : parallel::getThreadCount());
+  ctx.relocationBufferSlabs =
+      std::make_unique<CommonLinkerContext::RelocationBufferSlabs[]>(
+          ctx.relocationBufferSlotCount);
+}
+
+void *macho::allocateSmallRelocationBuffer(size_t bytes) {
+  auto &ctx = lld::context();
+  // Relocation vectors are allocated by the driver or default executor only;
+  // read workers and LTO backend threads do not allocate these buffers.
+  // A serial library link can itself run on an existing executor worker.
+  // Its only slot belongs to that caller, regardless of the worker identity.
+  size_t slot = 0;
+  if (ctx.relocationBufferSlotCount != 1) {
+    unsigned worker = parallel::getWorkerIndex();
+    slot = worker == UINT_MAX ? 0 : size_t(worker) + 1;
+  }
+  assert(slot < ctx.relocationBufferSlotCount);
+  return ctx.relocationBufferSlabs[slot].Allocate(bytes, alignof(Relocation));
+}
 
 void Relocation::setTarget(Referent referent, int64_t addend) {
   if (referent == getReferent() && addend == getAddend())

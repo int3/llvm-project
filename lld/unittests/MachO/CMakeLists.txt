@@ -1,6 +1,7 @@
 add_lld_unittests(LLDMachOTests
   CodeSignatureFlushTest.cpp
   RelocationsTest.cpp
+  RelocationStorageTest.cpp
 )
 
 target_include_directories(LLDMachOTests PRIVATE

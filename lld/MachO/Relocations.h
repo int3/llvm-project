@@ -17,7 +17,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <type_traits>
+#include <vector>
 
 namespace lld::macho {
 LLVM_ENABLE_BITMASK_ENUMS_IN_NAMESPACE();
@@ -170,6 +172,43 @@ public:
 };
 
 static_assert(std::is_trivially_copyable_v<Relocation>);
+static_assert(std::is_trivially_destructible_v<Relocation>);
+
+void initRelocationBufferSlabs();
+void *allocateSmallRelocationBuffer(size_t bytes);
+
+// Stateless and link-scoped: vectors may move/swap between workers, and frees
+// need neither the allocating thread nor a live linker context. All allocator
+// instances are interchangeable within a link; buffers must not escape it.
+// Only requests strictly below 4 KiB use the slabs. Growth beyond that boundary
+// uses the same std::allocator allocation and sized deallocation as before.
+template <class T> class RelocationAllocator {
+  static_assert(std::is_same_v<T, Relocation>);
+  static_assert(4096 % sizeof(T) == 0);
+
+public:
+  using value_type = T;
+  using is_always_equal = std::true_type;
+  using propagate_on_container_move_assignment = std::true_type;
+  using propagate_on_container_swap = std::true_type;
+
+  T *allocate(size_t n) {
+    if (n == 0)
+      return nullptr;
+    if (n < 4096 / sizeof(T))
+      return static_cast<T *>(allocateSmallRelocationBuffer(n * sizeof(T)));
+    return std::allocator<T>().allocate(n);
+  }
+  void deallocate(T *p, size_t n) noexcept {
+    if (n >= 4096 / sizeof(T))
+      std::allocator<T>().deallocate(p, n);
+  }
+  bool operator==(const RelocationAllocator &) const noexcept { return true; }
+  bool operator!=(const RelocationAllocator &) const noexcept { return false; }
+};
+using RelocationVector = std::vector<Relocation, RelocationAllocator<Relocation>>;
+static_assert(std::is_empty_v<RelocationAllocator<Relocation>>);
+static_assert(sizeof(RelocationVector) == sizeof(std::vector<Relocation>));
 
 bool validateSymbolRelocation(const Symbol *, const InputSection *,
                               const Relocation &);

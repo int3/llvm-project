@@ -1665,7 +1665,7 @@ static CIE parseCIE(const InputSection *isec, const EhReader &reader,
 template <bool Invert = false>
 Defined *
 targetSymFromCanonicalSubtractor(const InputSection *isec,
-                                 std::vector<Relocation>::iterator relocIt) {
+                                 RelocationVector::iterator relocIt) {
   Relocation &subtrahend = *relocIt;
   Relocation &minuend = *std::next(relocIt);
   assert(target->hasAttr(subtrahend.getType(), RelocAttrBits::SUBTRAHEND));

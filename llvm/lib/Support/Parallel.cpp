@@ -216,6 +216,8 @@ static ThreadPoolExecutor *getDefaultExecutor() {
 #endif
 }
 
+unsigned parallel::getWorkerIndex() { return threadIndex; }
+
 size_t parallel::getThreadCount() {
   return getDefaultExecutor()->getThreadCount();
 }

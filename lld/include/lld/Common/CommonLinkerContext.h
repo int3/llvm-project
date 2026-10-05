@@ -24,6 +24,8 @@
 #include "llvm/Support/StringSaver.h"
 #include "llvm/Support/ThreadSafeAllocator.h"
 
+#include <memory>
+
 namespace llvm {
 class raw_ostream;
 } // namespace llvm
@@ -42,6 +44,27 @@ public:
   // payloads in a link-owned allocator rather than lazily registering a
   // SpecificAlloc from a worker.
   llvm::ThreadSafeAllocator<llvm::BumpPtrAllocator> relocationAlloc;
+  // Small Mach-O relocation vector buffers. Fixed 16 KiB slabs avoid growth
+  // into oversized worker-local allocations. Seed the slots before parsing;
+  // slot zero is the serial caller, or the non-worker driver in parallel mode.
+  // Members outlive the SpecificAlloc destruction in ~CommonLinkerContext,
+  // including vectors embedded in input sections, and are released during
+  // normal context destruction.
+  // These slabs replace small malloc buffers. Keep them outside allocate_buffer's
+  // huge-page pool: moving them there increases THP demand and compaction stalls.
+  struct RelocationSlabAllocator {
+    void *Allocate(size_t size, size_t alignment) {
+      assert(alignment <= alignof(std::max_align_t));
+      return llvm::safe_malloc(size);
+    }
+    void Deallocate(const void *ptr, size_t, size_t) {
+      std::free(const_cast<void *>(ptr));
+    }
+  };
+  using RelocationBufferSlabs = llvm::BumpPtrAllocatorImpl<
+      RelocationSlabAllocator, 16384, 16384, SIZE_MAX>;
+  std::unique_ptr<RelocationBufferSlabs[]> relocationBufferSlabs;
+  size_t relocationBufferSlotCount = 0;
   llvm::StringSaver saver{bAlloc};
   llvm::UniqueStringSaver uniqueSaver{bAlloc};
   llvm::DenseMap<void *, SpecificAllocBase *> instances;

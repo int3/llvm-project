@@ -4143,6 +4143,7 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
   // nothing is sharded and the input phase is bit-for-bit the old one. The
   // ordinal field widths have to be settled before the first ordinal, which is
   // the first -u symbol just below.
+  initRelocationBufferSlabs();
   initRecordOrdinalWidths();
   if (parallel::strategy.ThreadsRequested != 1)
     symtab->enableSharding();
