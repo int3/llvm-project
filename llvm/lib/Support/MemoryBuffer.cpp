@@ -247,6 +247,12 @@ public:
     return MemoryBuffer::MemoryBuffer_MMap;
   }
 
+  StringRef getReadOnlyMappedRegion() const override {
+    if constexpr (Mapmode<MB> == sys::fs::mapped_file_region::readonly)
+      return StringRef(MFR.const_data(), MFR.size());
+    return {};
+  }
+
   void dontNeedIfMmap() override { MFR.dontNeed(); }
   void willNeedIfMmap() override { MFR.willNeed(); }
   void randomAccessIfMmap() override { MFR.randomAccess(); }

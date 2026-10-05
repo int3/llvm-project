@@ -73,6 +73,13 @@ public:
   /// function should not be called on a writable buffer.
   virtual void dontNeedIfMmap() {}
 
+  /// Return the actual read-only file mapping, including any prefix before a
+  /// file slice. The start is mapping-aligned; the length need not be a whole
+  /// number of pages. Heap, non-owning, private writable and write-through
+  /// buffers return an empty range. The owner must outlive all uses of the
+  /// range, including any OS advice; this does not transfer ownership.
+  virtual StringRef getReadOnlyMappedRegion() const { return {}; }
+
   /// Mark the buffer as to-be-used in a near future. This shall trigger OS
   /// prefetching from the storage device and into memory, if possible.
   /// This should be use purely as an read optimization.

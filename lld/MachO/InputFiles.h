@@ -608,6 +608,14 @@ public:
   // Unmaps the thin-archive members mapWalkedMember() mapped; see
   // releaseInputBuffers().
   void releaseMemberBuffers() { memberBuffers.clear(); }
+  // Only owning walker buffers, never archive slices or MemoryBufferRefs.
+  void appendMemberMappings(llvm::SmallVectorImpl<StringRef> &ranges) const {
+    for (const auto &entry : memberBuffers)
+      if (entry.second)
+        if (StringRef range = entry.second->getReadOnlyMappedRegion();
+            !range.empty())
+          ranges.push_back(range);
+  }
   static bool classof(const InputFile *f) { return f->kind() == ArchiveKind; }
 
 private:

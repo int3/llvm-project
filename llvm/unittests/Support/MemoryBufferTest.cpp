@@ -25,6 +25,9 @@
 #endif
 #if LLVM_ON_UNIX
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #endif
 #if _WIN32
 #include <windows.h>
@@ -126,6 +129,57 @@ TEST_F(MemoryBufferTest, getOpenFile) {
         [&] { ASSERT_NO_ERROR(sys::fs::closeFile(*File)); });
     ASSERT_ERROR(MemoryBuffer::getOpenFile(*File, TestPath, 6).getError());
   }
+}
+
+TEST_F(MemoryBufferTest, ReadOnlyMappedRegion) {
+  int FD;
+  SmallString<128> Path;
+  ASSERT_NO_ERROR(sys::fs::createTemporaryFile("MemoryBufferMapping", "tmp", FD,
+                                               Path));
+  FileRemover Cleanup(Path);
+  size_t Page = sys::fs::mapped_file_region::alignment();
+  std::string Contents(8 * Page + 79, 'x');
+  raw_fd_ostream OS(FD, true);
+  OS << Contents;
+  OS.close();
+
+  // The mapped base precedes this unaligned slice; the last page is partial.
+  size_t Offset = Page + 13;
+  auto MB = MemoryBuffer::getFileSlice(Path, Contents.size() - Offset, Offset);
+  ASSERT_NO_ERROR(MB.getError());
+  StringRef Region = (*MB)->getReadOnlyMappedRegion();
+  ASSERT_FALSE(Region.empty());
+  EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(Region.data()) % Page);
+  EXPECT_EQ((*MB)->getBufferStart() - 13, Region.data());
+  EXPECT_EQ(Contents.size() - Page, Region.size());
+  EXPECT_EQ((*MB)->getBufferEnd(), Region.end());
+
+  auto View = MemoryBuffer::getMemBuffer((*MB)->getBuffer(), "view", false);
+  EXPECT_TRUE(View->getReadOnlyMappedRegion().empty());
+  EXPECT_TRUE(MemoryBuffer::getMemBufferCopy("heap")
+                  ->getReadOnlyMappedRegion().empty());
+  EXPECT_TRUE(WritableMemoryBuffer::getNewMemBuffer(Page)
+                  ->getReadOnlyMappedRegion().empty());
+  auto Private = WritableMemoryBuffer::getFileSlice(Path, 4 * Page, Page);
+  ASSERT_NO_ERROR(Private.getError());
+  EXPECT_EQ(MemoryBuffer::MemoryBuffer_MMap, (*Private)->getBufferKind());
+  EXPECT_TRUE((*Private)->getReadOnlyMappedRegion().empty());
+  auto Shared = WriteThroughMemoryBuffer::getFile(Path);
+  ASSERT_NO_ERROR(Shared.getError());
+  EXPECT_EQ(MemoryBuffer::MemoryBuffer_MMap, (*Shared)->getBufferKind());
+  EXPECT_TRUE((*Shared)->getReadOnlyMappedRegion().empty());
+
+#if defined(__linux__)
+  // Advice preserves file contents, including the last partial page, and is
+  // repeatable while the owner stays alive. Ordinary destruction still owns
+  // the complete mapping. Never advise the writable mappings above.
+  for (unsigned I = 0; I != 8; ++I) {
+    EXPECT_EQ(StringRef(Contents).drop_front(Offset), (*MB)->getBuffer());
+    ASSERT_EQ(0, ::madvise(const_cast<char *>(Region.data()), Region.size(),
+                          MADV_DONTNEED));
+  }
+  EXPECT_EQ(StringRef(Contents).drop_front(Offset), (*MB)->getBuffer());
+#endif
 }
 
 TEST_F(MemoryBufferTest, NullTerminator4K) {

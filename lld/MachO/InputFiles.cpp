@@ -81,7 +81,11 @@
 #include "llvm/TextAPI/Architecture.h"
 #include "llvm/TextAPI/InterfaceFile.h"
 
+#include <array>
 #include <cstdio>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #include <optional>
 #include <type_traits>
 
@@ -256,7 +260,64 @@ void macho::ownInputBuffer(std::unique_ptr<MemoryBuffer> mb) {
 #endif
 }
 
+#if defined(__linux__) && LLVM_ENABLE_THREADS
+// Clear read-only input PTEs before the serial owner destruction. Unlike
+// posix_madvise(POSIX_MADV_DONTNEED), Linux madvise actually drops these PTEs.
+// It retains the file pages in cache and needs no address-space write lock.
+static void releaseInputPages() {
+  SmallVector<StringRef, 0> ranges;
+  for (const std::unique_ptr<MemoryBuffer> *owner : inputBufferOwners)
+    if (*owner)
+      if (StringRef range = (*owner)->getReadOnlyMappedRegion(); !range.empty())
+        ranges.push_back(range);
+  for (InputFile *file : inputFiles)
+    if (auto *archive = dyn_cast<ArchiveFile>(file))
+      archive->appendMemberMappings(ranges);
+
+  size_t total = 0;
+  for (StringRef range : ranges)
+    total += range.size();
+  // Small inputs retain ordinary serial destruction, without executor work.
+  if (total < 32 * 1024 * 1024)
+    return;
+
+  TimeTraceScope timeScope("Release input PTEs");
+  constexpr size_t tileSize = 2 * 1024 * 1024;
+  unsigned participants = std::min(4u, parallel::strategy.compute_thread_count());
+  std::array<SmallVector<StringRef, 0>, 4> tasks;
+  std::array<size_t, 4> sizes{};
+  for (StringRef range : ranges) {
+    while (!range.empty()) {
+      unsigned task = std::min_element(sizes.begin(),
+                                      sizes.begin() + participants) - sizes.begin();
+      StringRef tile = range.take_front(tileSize);
+      tasks[task].push_back(tile);
+      sizes[task] += tile.size();
+      range = range.drop_front(tile.size());
+    }
+  }
+  auto advise = [&](unsigned task) {
+    for (StringRef tile : tasks[task])
+      // Advice failure is only a missed optimization. Never diagnose or exit
+      // here: other participants can still be using the mapping metadata.
+      (void)::madvise(const_cast<char *>(tile.data()), tile.size(), MADV_DONTNEED);
+  };
+  // Three executor tasks plus this helper at most. Small owners are grouped
+  // into these same tasks; large owners contribute disjoint aligned tiles.
+  // All owners stay live until this TaskGroup has joined. In particular, no
+  // input munmap may race advice and allow the address to be reused.
+  parallel::TaskGroup group;
+  for (unsigned task = 1; task != participants; ++task)
+    group.spawn([&, task] { advise(task); });
+  advise(0);
+}
+#endif
+
 void macho::releaseInputBuffers() {
+#if defined(__linux__) && LLVM_ENABLE_THREADS
+  releaseInputPages();
+#endif
+  TimeTraceScope timeScope("Destroy input buffers");
   // cachedReads points into the buffers released below. All its readers must
   // have finished before release starts: clearing it is not synchronization
   // for a concurrent readFile(), whose path may also borrow input storage.
