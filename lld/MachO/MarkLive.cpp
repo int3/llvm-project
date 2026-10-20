@@ -14,6 +14,8 @@
 #include "UnwindInfoSection.h"
 
 #include "lld/Common/ErrorHandler.h"
+#include "llvm/Support/Parallel.h"
+#include "llvm/Support/SwapByteOrder.h"
 #include "llvm/Support/TimeProfiler.h"
 
 namespace lld::macho {
@@ -58,6 +60,8 @@ public:
 private:
   void enqueue(InputSection *isec, uint64_t off, const WorklistEntry *prev);
   void addSym(Symbol *s, const WorklistEntry *prev);
+  template <bool Parallel> void drain();
+  void drainParallel();
   const InputSection *getInputSection(const WorklistEntry *) const;
   WorklistEntry *makeEntry(InputSection *, const WorklistEntry *prev) const;
 
@@ -101,7 +105,7 @@ template <bool RecordWhyLive>
 void MarkLiveImpl<RecordWhyLive>::addSym(
     Symbol *s,
     const typename MarkLiveImpl<RecordWhyLive>::WorklistEntry *prev) {
-  if (s->used)
+  if (s->isLive())
     return;
   s->used = true;
   if constexpr (RecordWhyLive)
@@ -141,28 +145,119 @@ MarkLiveImpl<RecordWhyLive>::makeEntry(
 }
 
 template <bool RecordWhyLive>
+void MarkLiveImpl<RecordWhyLive>::drainParallel() {
+  const size_t numThreads = parallel::getThreadCount();
+  auto queues =
+      std::make_unique<SmallVector<ConcatInputSection *, 0>[]>(numThreads);
+  auto visit = [&](ConcatInputSection &isec, int depth,
+                   SmallVector<ConcatInputSection *, 0> &localQueue,
+                   auto &self) -> void {
+    auto enqueue = [&](InputSection *target, uint64_t off) {
+      if (auto *s = dyn_cast<ConcatInputSection>(target)) {
+        auto &live = reinterpret_cast<std::atomic<bool> &>(s->live);
+        // Optimistic load-then-exchange avoids expensive atomic RMW on
+        // already-visited sections.
+        if (live.load(std::memory_order_relaxed) ||
+            live.exchange(true, std::memory_order_relaxed))
+          return;
+        assert(!s->isCoalescedWeak());
+        if (depth < 3)
+          self(*s, depth + 1, localQueue, self);
+        else
+          localQueue.push_back(s);
+      } else if (auto *s = dyn_cast<CStringInputSection>(target)) {
+        auto &piece = s->getStringPiece(off);
+        auto *word =
+            reinterpret_cast<std::atomic<uint32_t> *>(&piece.inSecOff + 1);
+        constexpr uint32_t liveBit =
+            llvm::sys::IsBigEndianHost ? (1U << 31) : 1U;
+        word->fetch_or(liveBit, std::memory_order_relaxed);
+      } else {
+        target->markLive(off);
+      }
+    };
+    auto addSym = [&](Symbol *s) {
+      auto &used = reinterpret_cast<std::atomic<bool> &>(s->used);
+      if (used.load(std::memory_order_relaxed) ||
+          used.exchange(true, std::memory_order_relaxed))
+        return;
+      if (auto *d = dyn_cast<Defined>(s)) {
+        if (d->isec())
+          enqueue(d->isec(), d->value);
+        if (d->unwindEntry())
+          enqueue(d->unwindEntry(), 0);
+      }
+    };
+    for (const Relocation &r : isec.relocs) {
+      if (auto *s = dyn_cast<Symbol *>(r.referent))
+        addSym(s);
+      else
+        enqueue(cast<InputSection *>(r.referent), r.addend);
+    }
+    for (Defined *d : isec.symbols)
+      addSym(d);
+  };
+
+  // Workers claim chunks of the current frontier and accumulate deeper
+  // discoveries into their own queues. The join orders all live-bit updates
+  // before the serial traversal and live-support scan resume.
+  SmallVector<WorklistEntry *, 256> frontier = std::move(worklist);
+  std::atomic<size_t> next{0};
+  parallelFor(0, numThreads, [&](size_t shard) {
+    for (;;) {
+      size_t begin = next.fetch_add(64, std::memory_order_relaxed);
+      if (begin >= frontier.size())
+        break;
+      size_t end = std::min(begin + 64, frontier.size());
+      for (size_t i = begin; i != end; ++i)
+        visit(*cast<ConcatInputSection>(frontier[i]), 0, queues[shard], visit);
+    }
+  });
+  for (size_t shard = 0; shard != numThreads; ++shard)
+    worklist.append(queues[shard].begin(), queues[shard].end());
+}
+
+template <bool RecordWhyLive>
+template <bool Parallel>
+void MarkLiveImpl<RecordWhyLive>::drain() {
+  while (!worklist.empty()) {
+    if constexpr (Parallel) {
+      if (worklist.size() >= 1024) {
+        drainParallel();
+        continue;
+      }
+    }
+    WorklistEntry *entry = worklist.pop_back_val();
+    // Entries that get placed onto the worklist always contain
+    // ConcatInputSections. `WhyLiveEntry::prev` may point to entries that
+    // contain other types of InputSections (due to S_ATTR_LIVE_SUPPORT), but
+    // those entries should never be pushed onto the worklist.
+    auto *isec = cast<ConcatInputSection>(getInputSection(entry));
+    assert(isec->live && "We mark as live when pushing onto the worklist!");
+
+    // Mark all symbols listed in the relocation table for this section.
+    for (const Relocation &r : isec->relocs) {
+      if (auto *s = dyn_cast<Symbol *>(r.referent))
+        addSym(s, entry);
+      else
+        enqueue(cast<InputSection *>(r.referent), r.addend, entry);
+    }
+    for (Defined *d : getInputSection(entry)->symbols)
+      addSym(d, entry);
+  }
+}
+
+template <bool RecordWhyLive>
 void MarkLiveImpl<RecordWhyLive>::markTransitively() {
   do {
     // Mark things reachable from GC roots as live.
-    while (!worklist.empty()) {
-      WorklistEntry *entry = worklist.pop_back_val();
-      // Entries that get placed onto the worklist always contain
-      // ConcatInputSections. `WhyLiveEntry::prev` may point to entries that
-      // contain other types of InputSections (due to S_ATTR_LIVE_SUPPORT), but
-      // those entries should never be pushed onto the worklist.
-      auto *isec = cast<ConcatInputSection>(getInputSection(entry));
-      assert(isec->live && "We mark as live when pushing onto the worklist!");
-
-      // Mark all symbols listed in the relocation table for this section.
-      for (const Relocation &r : isec->relocs) {
-        if (auto *s = dyn_cast<Symbol *>(r.referent))
-          addSym(s, entry);
-        else
-          enqueue(cast<InputSection *>(r.referent), r.addend, entry);
-      }
-      for (Defined *d : getInputSection(entry)->symbols)
-        addSym(d, entry);
-    }
+    // WhyLiveEntry requires the serial traversal, including its entry type.
+    if constexpr (RecordWhyLive)
+      drain<false>();
+    else if (parallel::strategy.ThreadsRequested == 1)
+      drain<false>();
+    else
+      drain<true>();
 
     // S_ATTR_LIVE_SUPPORT sections are live if they point _to_ a live
     // section. Process them in a second pass.
