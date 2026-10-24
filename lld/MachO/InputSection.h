@@ -16,10 +16,12 @@
 #include "lld/Common/LLVM.h"
 #include "lld/Common/Memory.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/CachedHashString.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/BinaryFormat/MachO.h"
+
+#include <atomic>
+#include <memory>
 
 namespace lld {
 namespace macho {
@@ -259,10 +261,13 @@ public:
                           uint32_t align);
   uint64_t getOffset(uint64_t off) const override;
   bool isLive(uint64_t off) const override {
-    return live[off >> power2LiteralSize];
+    size_t i = off >> power2LiteralSize;
+    return live[i / 64].load(std::memory_order_relaxed) &
+           (uint64_t(1) << (i % 64));
   }
   void markLive(uint64_t off) override {
-    live[off >> power2LiteralSize] = true;
+    size_t i = off >> power2LiteralSize;
+    live[i / 64].fetch_or(uint64_t(1) << (i % 64), std::memory_order_relaxed);
   }
 
   static bool classof(const InputSection *isec) {
@@ -271,8 +276,8 @@ public:
 
 private:
   unsigned power2LiteralSize;
-  // The liveness of data[off] is tracked by live[off >> power2LiteralSize].
-  llvm::BitVector live;
+  // One bit per literal, packed into atomic words for parallel marking.
+  std::unique_ptr<std::atomic<uint64_t>[]> live;
 };
 
 inline uint8_t sectionType(uint32_t flags) {

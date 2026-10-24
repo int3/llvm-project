@@ -109,7 +109,7 @@ public:
   bool isUsedInRegularObj : 1;
 
   // True if this symbol is used from a live section.
-  bool used : 1;
+  bool used;
 };
 
 class Defined : public Symbol {
