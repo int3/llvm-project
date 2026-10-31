@@ -12,9 +12,9 @@
 // class because we don't need a full-fledged archive file generator in LLVM
 // at the moment.
 //
-// The filename field in the Unix V7 tar header is 100 bytes. Longer filenames
-// are stored using the PAX extension. The PAX header is standardized in
-// POSIX.1-2001.
+// The filename field in the Unix V7 tar header is 100 bytes, and the size field
+// holds at most 11 octal digits. Longer filenames and larger sizes are stored
+// using the PAX extension. The PAX header is standardized in POSIX.1-2001.
 //
 // The struct definition of UstarHeader is copied from
 // https://www.freebsd.org/cgi/man.cgi?query=tar&sektion=5
@@ -31,6 +31,9 @@ using namespace llvm;
 
 // Each file in an archive must be aligned to this block size.
 static const int BlockSize = 512;
+
+// The largest size that fits in the 11 octal digits of a Ustar size field.
+static const uint64_t MaxUstarSize = 077777777777;
 
 struct UstarHeader {
   char Name[100];
@@ -98,12 +101,9 @@ static void computeChecksum(UstarHeader &Hdr) {
 }
 
 // Create a tar header and write it to a given output stream.
-static void writePaxHeader(raw_fd_ostream &OS, StringRef Path) {
+static void writePaxHeader(raw_fd_ostream &OS, StringRef PaxAttr) {
   // A PAX header consists of a 512-byte header followed
-  // by key-value strings. First, create key-value strings.
-  std::string PaxAttr = formatPax("path", Path);
-
-  // Create a 512-byte header.
+  // by key-value strings. Create a 512-byte header.
   UstarHeader Hdr = makeUstarHeader();
   snprintf(Hdr.Size, sizeof(Hdr.Size), "%011zo", PaxAttr.size());
   Hdr.TypeFlag = 'x'; // PAX magic
@@ -189,14 +189,19 @@ void TarWriter::append(StringRef Path, StringRef Data) {
   if (!Files.insert(Fullpath).second)
     return;
 
+  std::string PaxAttr;
   StringRef Prefix;
   StringRef Name;
-  if (splitUstar(Fullpath, Prefix, Name)) {
-    writeUstarHeader(OS, Prefix, Name, Data.size());
-  } else {
-    writePaxHeader(OS, Fullpath);
-    writeUstarHeader(OS, "", "", Data.size());
+  if (!splitUstar(Fullpath, Prefix, Name))
+    PaxAttr += formatPax("path", Fullpath);
+  size_t UstarSize = Data.size();
+  if (UstarSize > MaxUstarSize) {
+    PaxAttr += formatPax("size", Twine(Data.size()).str());
+    UstarSize = 0;
   }
+  if (!PaxAttr.empty())
+    writePaxHeader(OS, PaxAttr);
+  writeUstarHeader(OS, Prefix, Name, UstarSize);
 
   OS << Data;
   pad(OS);
