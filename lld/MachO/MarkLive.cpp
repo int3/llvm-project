@@ -22,6 +22,93 @@ namespace lld::macho {
 using namespace llvm;
 using namespace llvm::MachO;
 
+// Calls addSym for each symbol and enqueue for each section that a live `isec`
+// keeps alive.
+template <class AddSym, class Enqueue>
+static void forEachReferent(const ConcatInputSection &isec, AddSym addSym,
+                            Enqueue enqueue) {
+  for (const Relocation &r : isec.relocs) {
+    if (auto *s = dyn_cast<Symbol *>(r.referent))
+      addSym(s);
+    else
+      enqueue(cast<InputSection *>(r.referent), r.getAddend());
+  }
+  for (Defined *d : isec.symbols)
+    addSym(d);
+}
+
+// Calls enqueue for each section that a live symbol keeps alive.
+template <class Enqueue>
+static void forEachSymbolSection(Symbol *s, Enqueue enqueue) {
+  if (auto *d = dyn_cast<Defined>(s)) {
+    if (d->isec())
+      enqueue(d->isec(), d->value);
+    if (d->unwindEntry())
+      enqueue(d->unwindEntry(), 0);
+  }
+}
+
+// Used for adding roots to the liveness graph and marking everything they
+// reach.
+class MarkLive {
+public:
+  virtual void enqueue(InputSection *isec, uint64_t off) = 0;
+  virtual void addSym(Symbol *s) = 0;
+  void markTransitively();
+  virtual ~MarkLive() = default;
+
+protected:
+  // Marks everything reachable from the sections enqueued so far.
+  virtual void drain() = 0;
+  // Marks the S_ATTR_LIVE_SUPPORT section `isec` live because it refers to
+  // the live `referent`, which may be null.
+  virtual void enqueueLiveSupport(ConcatInputSection *isec,
+                                  InputSection *referent) = 0;
+
+private:
+  bool markLiveSupport();
+};
+
+void MarkLive::markTransitively() {
+  // Marking S_ATTR_LIVE_SUPPORT sections can make more sections live, which in
+  // turn can make more S_ATTR_LIVE_SUPPORT sections live, so iterate. In
+  // practice, the second iteration won't mark additional sections live.
+  do
+    drain();
+  while (markLiveSupport());
+}
+
+// S_ATTR_LIVE_SUPPORT sections are live if they point _to_ a live section.
+// Returns true if any were newly marked.
+bool MarkLive::markLiveSupport() {
+  bool marked = false;
+  for (ConcatInputSection *isec : inputSections) {
+    // FIXME: Check if copying all S_ATTR_LIVE_SUPPORT sections into a
+    // separate vector and only walking that here is faster.
+    if (!(isec->getFlags() & S_ATTR_LIVE_SUPPORT) || isec->live)
+      continue;
+
+    for (const Relocation &r : isec->relocs) {
+      InputSection *referentIsec = nullptr;
+      bool referentLive;
+      if (auto *s = dyn_cast<Symbol *>(r.referent)) {
+        referentLive = s->isLive();
+        if (auto *d = dyn_cast<Defined>(s))
+          referentIsec = d->isec();
+      } else {
+        referentIsec = cast<InputSection *>(r.referent);
+        referentLive = referentIsec->isLive(r.getAddend());
+      }
+      if (referentLive) {
+        enqueueLiveSupport(isec, referentIsec);
+        marked = true;
+        break;
+      }
+    }
+  }
+  return marked;
+}
+
 struct WhyLiveEntry {
   InputSection *isec;
   // Keep track of the entry that caused us to mark `isec` as live.
@@ -31,57 +118,42 @@ struct WhyLiveEntry {
       : isec(isec), prev(prev) {}
 };
 
-// Type-erased interface to MarkLiveImpl. Used for adding roots to the liveness
-// graph.
-class MarkLive {
+// Marks liveness on one thread, recording which section made each section
+// live so that -why_live can print the chain. -why_live is rarely used, so
+// the normal -dead_strip path uses ParallelMarkLive instead.
+class WhyLiveMarkLive : public MarkLive {
 public:
-  virtual void enqueue(InputSection *isec, uint64_t off) = 0;
-  virtual void addSym(Symbol *s) = 0;
-  virtual void markTransitively() = 0;
-  virtual ~MarkLive() = default;
-};
-
-template <bool RecordWhyLive> class MarkLiveImpl : public MarkLive {
-public:
-  // -why_live is a rarely used option, so we don't want support for that flag
-  // to slow down the main -dead_strip code path. As such, we employ templates
-  // to avoid the usage of WhyLiveEntry in the main code path. This saves us
-  // from needless allocations and pointer indirections.
-  using WorklistEntry =
-      std::conditional_t<RecordWhyLive, WhyLiveEntry, InputSection>;
-
   void enqueue(InputSection *isec, uint64_t off) override {
     enqueue(isec, off, nullptr);
   }
   void addSym(Symbol *s) override { addSym(s, nullptr); }
-  void markTransitively() override;
 
 private:
-  void enqueue(InputSection *isec, uint64_t off, const WorklistEntry *prev);
-  void addSym(Symbol *s, const WorklistEntry *prev);
-  template <bool Parallel> void drain();
-  void drainParallel();
-  const InputSection *getInputSection(const WorklistEntry *) const;
-  WorklistEntry *makeEntry(InputSection *, const WorklistEntry *prev) const;
+  void enqueue(InputSection *isec, uint64_t off, const WhyLiveEntry *prev);
+  void addSym(Symbol *s, const WhyLiveEntry *prev);
+  void drain() override;
+  void enqueueLiveSupport(ConcatInputSection *isec,
+                          InputSection *referent) override {
+    enqueue(isec, 0,
+            referent ? make<WhyLiveEntry>(referent, nullptr) : nullptr);
+  }
 
   // We build up a worklist of sections which have been marked as live. We
   // only push into the worklist when we discover an unmarked section, and we
   // mark as we push, so sections never appear twice in the list. Literal
   // sections cannot contain references to other sections, so we only store
   // ConcatInputSections in our worklist.
-  SmallVector<WorklistEntry *, 256> worklist;
+  SmallVector<WhyLiveEntry *, 256> worklist;
 };
 
-template <bool RecordWhyLive>
-void MarkLiveImpl<RecordWhyLive>::enqueue(
-    InputSection *isec, uint64_t off,
-    const typename MarkLiveImpl<RecordWhyLive>::WorklistEntry *prev) {
+void WhyLiveMarkLive::enqueue(InputSection *isec, uint64_t off,
+                              const WhyLiveEntry *prev) {
   if (isec->isLive(off))
     return;
   isec->markLive(off);
   if (auto s = dyn_cast<ConcatInputSection>(isec)) {
     assert(!s->isCoalescedWeak());
-    worklist.push_back(makeEntry(s, prev));
+    worklist.push_back(make<WhyLiveEntry>(s, prev));
   }
 }
 
@@ -100,46 +172,30 @@ static void printWhyLive(const Symbol *s, const WhyLiveEntry *prev) {
   message(out);
 }
 
-template <bool RecordWhyLive>
-void MarkLiveImpl<RecordWhyLive>::addSym(
-    Symbol *s,
-    const typename MarkLiveImpl<RecordWhyLive>::WorklistEntry *prev) {
+void WhyLiveMarkLive::addSym(Symbol *s, const WhyLiveEntry *prev) {
   if (s->used)
     return;
   s->used = true;
-  if constexpr (RecordWhyLive)
-    if (!config->whyLive.empty() && config->whyLive.match(s->getName()))
-      printWhyLive(s, prev);
-  if (auto *d = dyn_cast<Defined>(s)) {
-    if (d->isec())
-      enqueue(d->isec(), d->value, prev);
-    if (d->unwindEntry())
-      enqueue(d->unwindEntry(), 0, prev);
-  }
+  if (config->whyLive.match(s->getName()))
+    printWhyLive(s, prev);
+  forEachSymbolSection(
+      s, [&](InputSection *isec, uint64_t off) { enqueue(isec, off, prev); });
 }
 
-template <bool RecordWhyLive>
-const InputSection *MarkLiveImpl<RecordWhyLive>::getInputSection(
-    const MarkLiveImpl<RecordWhyLive>::WorklistEntry *entry) const {
-  if constexpr (RecordWhyLive)
-    return entry->isec;
-  else
-    return entry;
-}
-
-template <bool RecordWhyLive>
-typename MarkLiveImpl<RecordWhyLive>::WorklistEntry *
-MarkLiveImpl<RecordWhyLive>::makeEntry(
-    InputSection *isec,
-    const MarkLiveImpl<RecordWhyLive>::WorklistEntry *prev) const {
-  if constexpr (RecordWhyLive) {
-    if (!isec) {
-      assert(!prev);
-      return nullptr;
-    }
-    return make<WhyLiveEntry>(isec, prev);
-  } else {
-    return isec;
+void WhyLiveMarkLive::drain() {
+  while (!worklist.empty()) {
+    WhyLiveEntry *entry = worklist.pop_back_val();
+    // Entries that get placed onto the worklist always contain
+    // ConcatInputSections. `WhyLiveEntry::prev` may point to entries that
+    // contain other types of InputSections (due to S_ATTR_LIVE_SUPPORT), but
+    // those entries should never be pushed onto the worklist.
+    auto *isec = cast<ConcatInputSection>(entry->isec);
+    assert(isec->live && "We mark as live when pushing onto the worklist!");
+    forEachReferent(
+        *isec, [&](Symbol *s) { addSym(s, entry); },
+        [&](InputSection *referent, uint64_t off) {
+          enqueue(referent, off, entry);
+        });
   }
 }
 
@@ -153,21 +209,24 @@ static bool tryClaim(bool &flag) {
          !atomicFlag.exchange(true, std::memory_order_relaxed);
 }
 
-using ShardQueue = SmallVector<ConcatInputSection *, 0>;
+using SectionQueue = SmallVector<ConcatInputSection *, 0>;
+
+// A thread visits the sections it claims directly, up to this depth of
+// recursion, which keeps chains of references on one thread. Deeper sections
+// go to the next level of the traversal.
+static constexpr int maxInlineDepth = 3;
 
 static void visitParallel(ConcatInputSection &isec, int depth,
-                          ShardQueue &queue);
+                          SectionQueue &queue);
 
-// The parallel counterpart of MarkLiveImpl::enqueue(). The thread that claims
-// a section visits it: directly while the recursion is shallow, which keeps
-// chains of references on one thread, and in the next frontier otherwise.
+// Marks `isec` (at `off`) live. Safe to call from several threads at once.
 static void enqueueParallel(InputSection *isec, uint64_t off, int depth,
-                            ShardQueue &queue) {
+                            SectionQueue &queue) {
   if (auto *s = dyn_cast<ConcatInputSection>(isec)) {
     if (!tryClaim(s->live))
       return;
     assert(!s->isCoalescedWeak());
-    if (depth < 3)
+    if (depth < maxInlineDepth)
       visitParallel(*s, depth + 1, queue);
     else
       queue.push_back(s);
@@ -179,126 +238,73 @@ static void enqueueParallel(InputSection *isec, uint64_t off, int depth,
   }
 }
 
-// The parallel counterpart of MarkLiveImpl::addSym().
-static void addSymParallel(Symbol *s, int depth, ShardQueue &queue) {
+static void addSymParallel(Symbol *s, int depth, SectionQueue &queue) {
   if (!tryClaim(s->used))
     return;
-  if (auto *d = dyn_cast<Defined>(s)) {
-    if (d->isec())
-      enqueueParallel(d->isec(), d->value, depth, queue);
-    if (d->unwindEntry())
-      enqueueParallel(d->unwindEntry(), 0, depth, queue);
-  }
+  forEachSymbolSection(s, [&](InputSection *isec, uint64_t off) {
+    enqueueParallel(isec, off, depth, queue);
+  });
 }
 
 static void visitParallel(ConcatInputSection &isec, int depth,
-                          ShardQueue &queue) {
-  for (const Relocation &r : isec.relocs) {
-    if (auto *s = dyn_cast<Symbol *>(r.referent))
-      addSymParallel(s, depth, queue);
-    else
-      enqueueParallel(cast<InputSection *>(r.referent), r.getAddend(), depth,
-                      queue);
+                          SectionQueue &queue) {
+  forEachReferent(
+      isec, [&](Symbol *s) { addSymParallel(s, depth, queue); },
+      [&](InputSection *referent, uint64_t off) {
+        enqueueParallel(referent, off, depth, queue);
+      });
+}
+
+// Marks liveness level by level, on as many threads as are available.
+class ParallelMarkLive : public MarkLive {
+public:
+  void enqueue(InputSection *isec, uint64_t off) override {
+    enqueueParallel(isec, off, maxInlineDepth, worklist);
   }
-  for (Defined *d : isec.symbols)
-    addSymParallel(d, depth, queue);
-}
+  void addSym(Symbol *s) override {
+    addSymParallel(s, maxInlineDepth, worklist);
+  }
 
-// Visits the whole worklist in parallel. Workers claim chunks of it and collect
-// the sections they claim but don't visit in their own queues, which together
-// become the new worklist. The join orders all live-bit updates before the
-// serial traversal and live-support scan resume.
-template <bool RecordWhyLive>
-void MarkLiveImpl<RecordWhyLive>::drainParallel() {
-  const size_t numThreads = parallel::getThreadCount();
-  auto queues = std::make_unique<ShardQueue[]>(numThreads);
-  SmallVector<WorklistEntry *, 256> frontier = std::move(worklist);
-  std::atomic<size_t> next{0};
-  parallelFor(0, numThreads, [&](size_t shard) {
-    for (;;) {
-      size_t begin = next.fetch_add(64, std::memory_order_relaxed);
-      if (begin >= frontier.size())
-        break;
-      size_t end = std::min(begin + 64, frontier.size());
-      for (size_t i = begin; i != end; ++i)
-        visitParallel(*cast<ConcatInputSection>(frontier[i]), 0, queues[shard]);
-    }
-  });
-  for (size_t shard = 0; shard != numThreads; ++shard)
-    worklist.append(queues[shard].begin(), queues[shard].end());
-}
+private:
+  void drain() override;
+  void enqueueLiveSupport(ConcatInputSection *isec, InputSection *) override {
+    enqueue(isec, 0);
+  }
 
-template <bool RecordWhyLive>
-template <bool Parallel>
-void MarkLiveImpl<RecordWhyLive>::drain() {
+  // Sections that have been marked live but not yet visited.
+  SectionQueue worklist;
+};
+
+// Visits the worklist one level at a time. Workers claim chunks of a level and
+// collect the sections they claim but don't visit in their own queues, which
+// together become the next level. Small levels, and every level when running
+// with one thread, are visited on this thread. The join orders all live-bit
+// updates before the next level and the live-support scan.
+void ParallelMarkLive::drain() {
   while (!worklist.empty()) {
-    if constexpr (Parallel) {
-      if (worklist.size() >= 1024) {
-        drainParallel();
-        continue;
+    SectionQueue level = std::move(worklist);
+    worklist.clear();
+    if (level.size() < 1024) {
+      for (ConcatInputSection *isec : level)
+        visitParallel(*isec, 0, worklist);
+      continue;
+    }
+    const size_t numThreads = parallel::getThreadCount();
+    auto queues = std::make_unique<SectionQueue[]>(numThreads);
+    std::atomic<size_t> next{0};
+    parallelFor(0, numThreads, [&](size_t shard) {
+      for (;;) {
+        size_t begin = next.fetch_add(64, std::memory_order_relaxed);
+        if (begin >= level.size())
+          break;
+        size_t end = std::min(begin + 64, level.size());
+        for (size_t i = begin; i != end; ++i)
+          visitParallel(*level[i], 0, queues[shard]);
       }
-    }
-    WorklistEntry *entry = worklist.pop_back_val();
-    // Entries that get placed onto the worklist always contain
-    // ConcatInputSections. `WhyLiveEntry::prev` may point to entries that
-    // contain other types of InputSections (due to S_ATTR_LIVE_SUPPORT), but
-    // those entries should never be pushed onto the worklist.
-    auto *isec = cast<ConcatInputSection>(getInputSection(entry));
-    assert(isec->live && "We mark as live when pushing onto the worklist!");
-
-    // Mark all symbols listed in the relocation table for this section.
-    for (const Relocation &r : isec->relocs) {
-      if (auto *s = dyn_cast<Symbol *>(r.referent))
-        addSym(s, entry);
-      else
-        enqueue(cast<InputSection *>(r.referent), r.getAddend(), entry);
-    }
-    for (Defined *d : getInputSection(entry)->symbols)
-      addSym(d, entry);
+    });
+    for (size_t shard = 0; shard != numThreads; ++shard)
+      worklist.append(queues[shard].begin(), queues[shard].end());
   }
-}
-
-template <bool RecordWhyLive>
-void MarkLiveImpl<RecordWhyLive>::markTransitively() {
-  do {
-    // Mark things reachable from GC roots as live.
-    // WhyLiveEntry requires the serial traversal, including its entry type.
-    if constexpr (RecordWhyLive)
-      drain<false>();
-    else if (parallel::strategy.ThreadsRequested == 1)
-      drain<false>();
-    else
-      drain<true>();
-
-    // S_ATTR_LIVE_SUPPORT sections are live if they point _to_ a live
-    // section. Process them in a second pass.
-    for (ConcatInputSection *isec : inputSections) {
-      // FIXME: Check if copying all S_ATTR_LIVE_SUPPORT sections into a
-      // separate vector and only walking that here is faster.
-      if (!(isec->getFlags() & S_ATTR_LIVE_SUPPORT) || isec->live)
-        continue;
-
-      for (const Relocation &r : isec->relocs) {
-        if (auto *s = dyn_cast<Symbol *>(r.referent)) {
-          if (s->isLive()) {
-            InputSection *referentIsec = nullptr;
-            if (auto *d = dyn_cast<Defined>(s))
-              referentIsec = d->isec();
-            enqueue(isec, 0, makeEntry(referentIsec, nullptr));
-          }
-        } else {
-          auto *referentIsec = cast<InputSection *>(r.referent);
-          if (referentIsec->isLive(r.getAddend()))
-            enqueue(isec, 0, makeEntry(referentIsec, nullptr));
-        }
-      }
-    }
-
-    // S_ATTR_LIVE_SUPPORT could have marked additional sections live,
-    // which in turn could mark additional S_ATTR_LIVE_SUPPORT sections live.
-    // Iterate. In practice, the second iteration won't mark additional
-    // S_ATTR_LIVE_SUPPORT sections live.
-  } while (!worklist.empty());
 }
 
 // Set live bit on for each reachable chunk. Unmarked (unreachable)
@@ -308,9 +314,9 @@ void markLive() {
   TimeTraceScope timeScope("markLive");
   MarkLive *marker;
   if (config->whyLive.empty())
-    marker = make<MarkLiveImpl<false>>();
+    marker = make<ParallelMarkLive>();
   else
-    marker = make<MarkLiveImpl<true>>();
+    marker = make<WhyLiveMarkLive>();
   // Add GC roots.
   if (config->entry)
     marker->addSym(config->entry);

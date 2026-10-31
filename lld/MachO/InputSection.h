@@ -201,7 +201,10 @@ struct StringPiece {
   void markLiveAtomic() {
     auto *word = reinterpret_cast<std::atomic<uint32_t> *>(&inSecOff + 1);
     constexpr uint32_t liveBit = llvm::sys::IsBigEndianHost ? (1U << 31) : 1U;
-    word->fetch_or(liveBit, std::memory_order_relaxed);
+    // Pieces are often marked again after they are live, and the plain load
+    // lets those skip the atomic OR.
+    if (!(word->load(std::memory_order_relaxed) & liveBit))
+      word->fetch_or(liveBit, std::memory_order_relaxed);
   }
 };
 
