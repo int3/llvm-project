@@ -15,6 +15,10 @@ using namespace llvm;
 using namespace lld;
 
 StringRef lld::utils::getRootSymbol(StringRef name) {
+  // Every suffix below starts with a dot. Most names have none, so skip the
+  // reverse scans for them.
+  if (!name.contains('.'))
+    return name;
   name.consume_back(".Tgm");
   auto [P0, S0] = name.rsplit(".llvm.");
   auto [P1, S1] = P0.rsplit(".__uniq.");
