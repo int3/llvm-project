@@ -1365,6 +1365,13 @@ void SymbolPatterns::insert(StringRef symbolName) {
 }
 
 bool SymbolPatterns::matchLiteral(StringRef symbolName) const {
+  // Export lists often name only a few literals, and every symbol is checked
+  // against them. Hashing the name reads all of it, whereas most comparisons
+  // with a literal stop at the length, so for a short list, compare.
+  if (literals.size() <= 8)
+    return llvm::any_of(literals, [&](CachedHashStringRef literal) {
+      return literal.val() == symbolName;
+    });
   return literals.contains(CachedHashStringRef(symbolName));
 }
 
