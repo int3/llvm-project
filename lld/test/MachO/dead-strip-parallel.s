@@ -3,6 +3,8 @@
 ## Fan out beyond the parallel frontier threshold. Workers share literal words
 ## and symbols, claim new unwind entries, and queue sections beyond the DFS limit.
 ## The live-support chain requires another traversal after the support scan.
+## The symbol table is large enough for roots to be collected in parallel, and
+## -export_dynamic makes all its symbols roots.
 # RUN: rm -rf %t; split-file %s %t
 # RUN: %python %t/generate.py > %t/input.s
 # RUN: llvm-mc -filetype=obj -triple=x86_64-apple-macos11.0 %t/input.s -o %t/input.o
@@ -17,6 +19,11 @@
 # RUN: %lld -lSystem -dead_strip --threads=1 -why_live '_*' %t/input.o -o %t/out > %t/why1 2>&1
 # RUN: %lld -lSystem -dead_strip --threads=8 -why_live '_*' %t/input.o -o %t/out > %t/why8 2>&1
 # RUN: cmp %t/why1 %t/why8
+# RUN: %lld -lSystem -dead_strip -export_dynamic --threads=1 %t/input.o -o %t/out
+# RUN: cp %t/out %t/reference-dynamic
+# RUN: %lld -lSystem -dead_strip -export_dynamic --threads=8 %t/input.o -o %t/out
+# RUN: cmp %t/reference-dynamic %t/out
+# RUN: llvm-nm --defined-only %t/out | FileCheck %s --check-prefix=DYN
 # RUN: llvm-nm --defined-only %t/out | FileCheck %s
 # RUN: llvm-dwarfdump --eh-frame %t/out | FileCheck %s --check-prefix=UNWIND
 
@@ -30,6 +37,7 @@
 # CHECK: _support2
 # CHECK: _support_target
 # CHECK-NOT: _dead
+# DYN: _dead
 # UNWIND-COUNT-4000: FDE cie=
 # UNWIND-NOT: FDE cie=
 
@@ -44,7 +52,7 @@ for i in range(2000):
     print('leaq Lshared(%rip), %rax\ncallq _shared')
     print(f'callq _chain{i}_0\nretq\n.cfi_endproc')
     for depth in range(5):
-        print(f'_chain{i}_{depth}:')
+        print(f'.globl _chain{i}_{depth}\n_chain{i}_{depth}:')
         if depth == 4:
             print('.cfi_startproc\n.cfi_escape 0')
         if depth != 4:

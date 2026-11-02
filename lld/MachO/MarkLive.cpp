@@ -48,12 +48,63 @@ static void forEachSymbolSection(Symbol *s, Enqueue enqueue) {
   }
 }
 
+// Returns true if the global symbol `defined` is a GC root.
+static bool isRootSymbol(Defined *defined) {
+  // -exported_symbol(s_list)
+  // NOTE: Even though exporting private externs is an ill-defined operation,
+  // we are purposely not checking for privateExtern in order to follow ld64's
+  // behavior of treating all exported private extern symbols as live,
+  // irrespective of whether they are autohide.
+  if (!config->exportedSymbols.empty() &&
+      config->exportedSymbols.match(defined->getName()))
+    return true;
+
+  // public symbols explicitly marked .no_dead_strip
+  if (defined->referencedDynamically || defined->noDeadStrip)
+    return true;
+
+  // FIXME: When we implement these flags, make symbols from them GC roots:
+  // * -reexported_symbol(s_list)
+  // * -alias_list
+  // * -init
+
+  // In dylibs and bundles and in executables with -export_dynamic, all
+  // external functions are GC roots.
+  bool externsAreRoots =
+      config->outputType != MH_EXECUTE || config->exportDynamic;
+  return externsAreRoots && !defined->privateExtern;
+}
+
+// Calls addSym for each local symbol of `file` explicitly marked
+// .no_dead_strip.
+template <class AddSym>
+static void forEachLocalRoot(const InputFile *file, AddSym addSym) {
+  if (auto *objFile = dyn_cast<ObjFile>(file))
+    for (Symbol *sym : objFile->symbols)
+      if (auto *defined = dyn_cast_or_null<Defined>(sym))
+        if (!defined->isExternal() && defined->noDeadStrip)
+          addSym(defined);
+}
+
+// Returns true if `isec` is a GC root.
+static bool isRootSection(const ConcatInputSection *isec) {
+  // Sections marked no_dead_strip
+  if (isec->getFlags() & S_ATTR_NO_DEAD_STRIP)
+    return true;
+  // mod_init_funcs, mod_term_funcs sections
+  uint32_t type = sectionType(isec->getFlags());
+  assert(!config->emitInitOffsets || type != S_MOD_INIT_FUNC_POINTERS);
+  return type == S_MOD_INIT_FUNC_POINTERS || type == S_MOD_TERM_FUNC_POINTERS;
+}
+
 // Used for adding roots to the liveness graph and marking everything they
 // reach.
 class MarkLive {
 public:
   virtual void enqueue(InputSection *isec, uint64_t off) = 0;
   virtual void addSym(Symbol *s) = 0;
+  // Adds every GC root.
+  virtual void addRoots();
   void markTransitively();
   virtual ~MarkLive() = default;
 
@@ -64,10 +115,60 @@ protected:
   // the live `referent`, which may be null.
   virtual void enqueueLiveSupport(ConcatInputSection *isec,
                                   InputSection *referent) = 0;
-
-private:
-  bool markLiveSupport();
+  // Marks the S_ATTR_LIVE_SUPPORT sections that refer to a live section.
+  // Returns true if any were newly marked.
+  virtual bool markLiveSupport();
 };
+
+// Returns true if `isec` is an S_ATTR_LIVE_SUPPORT section that is not yet
+// live, and refers to a live section; sets `referent` to that section, which
+// may be null.
+static bool isLiveSupported(const ConcatInputSection *isec,
+                            InputSection *&referent) {
+  if (!(isec->getFlags() & S_ATTR_LIVE_SUPPORT) || isec->live)
+    return false;
+  for (const Relocation &r : isec->relocs) {
+    InputSection *referentIsec = nullptr;
+    bool referentLive;
+    if (auto *s = dyn_cast<Symbol *>(r.referent)) {
+      referentLive = s->isLive();
+      if (auto *d = dyn_cast<Defined>(s))
+        referentIsec = d->isec();
+    } else {
+      referentIsec = cast<InputSection *>(r.referent);
+      referentLive = referentIsec->isLive(r.getAddend());
+    }
+    if (referentLive) {
+      referent = referentIsec;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Adds the roots one at a time, in a fixed order, on this thread.
+void MarkLive::addRoots() {
+  if (config->entry)
+    addSym(config->entry);
+  for (Symbol *sym : symtab->getSymbols())
+    if (auto *defined = dyn_cast<Defined>(sym))
+      if (isRootSymbol(defined))
+        addSym(defined);
+  // -u symbols
+  for (Symbol *sym : config->explicitUndefineds)
+    addSym(sym);
+  // local symbols explicitly marked .no_dead_strip
+  for (const InputFile *file : inputFiles)
+    forEachLocalRoot(file, [&](Defined *defined) { addSym(defined); });
+  if (auto *stubBinder =
+          dyn_cast_or_null<DylibSymbol>(symtab->find("dyld_stub_binder")))
+    addSym(stubBinder);
+  for (ConcatInputSection *isec : inputSections)
+    if (isRootSection(isec))
+      enqueue(isec, 0);
+  for (ConcatInputSection *isec : in.initOffsets->inputs())
+    enqueue(isec, 0);
+}
 
 void MarkLive::markTransitively() {
   // Marking S_ATTR_LIVE_SUPPORT sections can make more sections live, which in
@@ -79,31 +180,15 @@ void MarkLive::markTransitively() {
 }
 
 // S_ATTR_LIVE_SUPPORT sections are live if they point _to_ a live section.
-// Returns true if any were newly marked.
 bool MarkLive::markLiveSupport() {
   bool marked = false;
   for (ConcatInputSection *isec : inputSections) {
     // FIXME: Check if copying all S_ATTR_LIVE_SUPPORT sections into a
     // separate vector and only walking that here is faster.
-    if (!(isec->getFlags() & S_ATTR_LIVE_SUPPORT) || isec->live)
-      continue;
-
-    for (const Relocation &r : isec->relocs) {
-      InputSection *referentIsec = nullptr;
-      bool referentLive;
-      if (auto *s = dyn_cast<Symbol *>(r.referent)) {
-        referentLive = s->isLive();
-        if (auto *d = dyn_cast<Defined>(s))
-          referentIsec = d->isec();
-      } else {
-        referentIsec = cast<InputSection *>(r.referent);
-        referentLive = referentIsec->isLive(r.getAddend());
-      }
-      if (referentLive) {
-        enqueueLiveSupport(isec, referentIsec);
-        marked = true;
-        break;
-      }
+    InputSection *referent;
+    if (isLiveSupported(isec, referent)) {
+      enqueueLiveSupport(isec, referent);
+      marked = true;
     }
   }
   return marked;
@@ -258,9 +343,39 @@ static void visitParallel(ConcatInputSection &isec, int depth,
       });
 }
 
+// Calls fn(i, queue) for each i in [0, size). With more than one thread and
+// at least 16 chunks of `chunkSize` items, the chunks are spread over all
+// threads; each thread passes its own queue, and the queues are appended to
+// `out` after the join. Otherwise fn runs on this thread and is passed `out`.
+template <class Fn>
+static void forEachQueued(size_t size, size_t chunkSize, SectionQueue &out,
+                          Fn fn) {
+  if (singleThreaded || size < 16 * chunkSize) {
+    for (size_t i = 0; i != size; ++i)
+      fn(i, out);
+    return;
+  }
+  const size_t numThreads = parallel::getThreadCount();
+  auto queues = std::make_unique<SectionQueue[]>(numThreads);
+  std::atomic<size_t> next{0};
+  parallelFor(0, numThreads, [&](size_t shard) {
+    for (;;) {
+      size_t begin = next.fetch_add(chunkSize, std::memory_order_relaxed);
+      if (begin >= size)
+        break;
+      size_t end = std::min(begin + chunkSize, size);
+      for (size_t i = begin; i != end; ++i)
+        fn(i, queues[shard]);
+    }
+  });
+  for (size_t shard = 0; shard != numThreads; ++shard)
+    out.append(queues[shard].begin(), queues[shard].end());
+}
+
 // Marks liveness level by level, on as many threads as are available.
 class ParallelMarkLive : public MarkLive {
 public:
+  void addRoots() override;
   void enqueue(InputSection *isec, uint64_t off) override {
     enqueueParallel(isec, off, maxInlineDepth, worklist);
   }
@@ -273,6 +388,7 @@ private:
   void enqueueLiveSupport(ConcatInputSection *isec, InputSection *) override {
     enqueue(isec, 0);
   }
+  bool markLiveSupport() override;
 
   // Sections that have been marked live but not yet visited.
   SectionQueue worklist;
@@ -299,27 +415,65 @@ void ParallelMarkLive::drain() {
   while (!worklist.empty()) {
     SectionQueue level = std::move(worklist);
     worklist.clear();
-    if (level.size() < 1024) {
-      for (ConcatInputSection *isec : level)
-        visitParallel(*isec, 0, worklist);
-      continue;
-    }
-    const size_t numThreads = parallel::getThreadCount();
-    auto queues = std::make_unique<SectionQueue[]>(numThreads);
-    std::atomic<size_t> next{0};
-    parallelFor(0, numThreads, [&](size_t shard) {
-      for (;;) {
-        size_t begin = next.fetch_add(64, std::memory_order_relaxed);
-        if (begin >= level.size())
-          break;
-        size_t end = std::min(begin + 64, level.size());
-        for (size_t i = begin; i != end; ++i)
-          visitParallel(*level[i], 0, queues[shard]);
-      }
-    });
-    for (size_t shard = 0; shard != numThreads; ++shard)
-      worklist.append(queues[shard].begin(), queues[shard].end());
+    forEachQueued(level.size(), 64, worklist,
+                  [&](size_t i, SectionQueue &queue) {
+                    visitParallel(*level[i], 0, queue);
+                  });
   }
+}
+
+// Finds the S_ATTR_LIVE_SUPPORT sections to mark on all threads, without
+// marking any, and then marks them. A section that refers only to another one
+// found in the same scan is not found until the next scan, after the drain.
+// markTransitively() scans until nothing more is found, so the final live set
+// is the same as with MarkLive::markLiveSupport.
+bool ParallelMarkLive::markLiveSupport() {
+  SectionQueue found;
+  forEachQueued(inputSections.size(), 256, found,
+                [&](size_t i, SectionQueue &queue) {
+                  InputSection *referent;
+                  if (isLiveSupported(inputSections[i], referent))
+                    queue.push_back(inputSections[i]);
+                });
+  for (ConcatInputSection *isec : found)
+    enqueue(isec, 0);
+  return !found.empty();
+}
+
+// Adds the same roots as MarkLive::addRoots, scanning the symbol table, the
+// object files' local symbols and the input sections on all threads. Each
+// thread claims the roots it finds and queues their sections; the order of
+// the worklist varies, but the set of live sections and symbols does not.
+void ParallelMarkLive::addRoots() {
+  if (config->entry)
+    addSym(config->entry);
+  ArrayRef<Symbol *> symbols = symtab->getSymbols();
+  forEachQueued(symbols.size(), 256, worklist,
+                [&](size_t i, SectionQueue &queue) {
+                  if (auto *defined = dyn_cast<Defined>(symbols[i]))
+                    if (isRootSymbol(defined))
+                      addSymParallel(defined, maxInlineDepth, queue);
+                });
+  // -u symbols
+  for (Symbol *sym : config->explicitUndefineds)
+    addSym(sym);
+  // local symbols explicitly marked .no_dead_strip
+  forEachQueued(inputFiles.size(), 4, worklist,
+                [&](size_t i, SectionQueue &queue) {
+                  forEachLocalRoot(inputFiles[i], [&](Defined *defined) {
+                    addSymParallel(defined, maxInlineDepth, queue);
+                  });
+                });
+  if (auto *stubBinder =
+          dyn_cast_or_null<DylibSymbol>(symtab->find("dyld_stub_binder")))
+    addSym(stubBinder);
+  forEachQueued(inputSections.size(), 256, worklist,
+                [&](size_t i, SectionQueue &queue) {
+                  if (isRootSection(inputSections[i]))
+                    enqueueParallel(inputSections[i], 0, maxInlineDepth, queue);
+                });
+  for (ConcatInputSection *isec : in.initOffsets->inputs())
+    enqueue(isec, 0);
 }
 
 // Set live bit on for each reachable chunk. Unmarked (unreachable)
@@ -333,77 +487,7 @@ void markLive() {
     marker = make<ParallelMarkLive>();
   else
     marker = make<WhyLiveMarkLive>();
-  // Add GC roots.
-  if (config->entry)
-    marker->addSym(config->entry);
-  for (Symbol *sym : symtab->getSymbols()) {
-    if (auto *defined = dyn_cast<Defined>(sym)) {
-      // -exported_symbol(s_list)
-      if (!config->exportedSymbols.empty() &&
-          config->exportedSymbols.match(defined->getName())) {
-        // NOTE: Even though exporting private externs is an ill-defined
-        // operation, we are purposely not checking for privateExtern in
-        // order to follow ld64's behavior of treating all exported private
-        // extern symbols as live, irrespective of whether they are autohide.
-        marker->addSym(defined);
-        continue;
-      }
-
-      // public symbols explicitly marked .no_dead_strip
-      if (defined->referencedDynamically || defined->noDeadStrip) {
-        marker->addSym(defined);
-        continue;
-      }
-
-      // FIXME: When we implement these flags, make symbols from them GC
-      // roots:
-      // * -reexported_symbol(s_list)
-      // * -alias_list
-      // * -init
-
-      // In dylibs and bundles and in executables with -export_dynamic,
-      // all external functions are GC roots.
-      bool externsAreRoots =
-          config->outputType != MH_EXECUTE || config->exportDynamic;
-      if (externsAreRoots && !defined->privateExtern) {
-        marker->addSym(defined);
-        continue;
-      }
-    }
-  }
-  // -u symbols
-  for (Symbol *sym : config->explicitUndefineds)
-    marker->addSym(sym);
-  // local symbols explicitly marked .no_dead_strip
-  for (const InputFile *file : inputFiles)
-    if (auto *objFile = dyn_cast<ObjFile>(file))
-      for (Symbol *sym : objFile->symbols)
-        if (auto *defined = dyn_cast_or_null<Defined>(sym))
-          if (!defined->isExternal() && defined->noDeadStrip)
-            marker->addSym(defined);
-  if (auto *stubBinder =
-          dyn_cast_or_null<DylibSymbol>(symtab->find("dyld_stub_binder")))
-    marker->addSym(stubBinder);
-  for (ConcatInputSection *isec : inputSections) {
-    // Sections marked no_dead_strip
-    if (isec->getFlags() & S_ATTR_NO_DEAD_STRIP) {
-      marker->enqueue(isec, 0);
-      continue;
-    }
-
-    // mod_init_funcs, mod_term_funcs sections
-    if (sectionType(isec->getFlags()) == S_MOD_INIT_FUNC_POINTERS ||
-        sectionType(isec->getFlags()) == S_MOD_TERM_FUNC_POINTERS) {
-      assert(!config->emitInitOffsets ||
-             sectionType(isec->getFlags()) != S_MOD_INIT_FUNC_POINTERS);
-      marker->enqueue(isec, 0);
-      continue;
-    }
-  }
-
-  for (ConcatInputSection *isec : in.initOffsets->inputs())
-    marker->enqueue(isec, 0);
-
+  marker->addRoots();
   marker->markTransitively();
 }
 
