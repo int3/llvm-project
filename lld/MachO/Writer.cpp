@@ -1028,6 +1028,12 @@ static void sortSegmentsAndSections() {
 
   orderObjCStubsByCallerPriority(isecPriorities);
 
+  // Sections without a priority sort as 0. Order file priorities are all
+  // negative, so unless another source assigned a positive priority, only the
+  // sections with a negative priority need sorting.
+  bool hasPositivePriority = llvm::any_of(
+      isecPriorities, [](const auto &entry) { return entry.second > 0; });
+
   uint32_t sectionIndex = 0;
   for (OutputSegment *seg : outputSegments) {
     seg->sortOutputSections();
@@ -1059,7 +1065,13 @@ static void sortSegmentsAndSections() {
             merged->inputs.begin(), merged->inputs.end(),
             [](InputSection *isec) { return !isec->isCold; });
         if (!isecPriorities.empty()) {
-          std::stable_sort(merged->inputs.begin(), coldIt,
+          auto sortEnd = coldIt;
+          if (!hasPositivePriority)
+            sortEnd = std::stable_partition(
+                merged->inputs.begin(), coldIt, [&](InputSection *isec) {
+                  return isecPriorities.lookup(isec) < 0;
+                });
+          std::stable_sort(merged->inputs.begin(), sortEnd,
                            [&](InputSection *a, InputSection *b) {
                              return isecPriorities.lookup(a) <
                                     isecPriorities.lookup(b);

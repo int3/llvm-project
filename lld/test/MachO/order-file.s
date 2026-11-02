@@ -3,6 +3,7 @@
 # RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/test.s -o %t/test.o
 # RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/foo.s -o %t/foo.o
 # RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/abs.s -o %t/abs.o
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/zero.s -o %t/zero.o
 # RUN: llvm-ar rcs %t/foo.a %t/foo.o
 
 # FOO-FIRST: <_bar>:
@@ -105,6 +106,21 @@
 ## Absolute in symbols in order files make no sense. Just ignore them.
 # RUN: %lld -lSystem -dylib -o %t/test-abs %t/abs.o -order_file %t/ord-abs
 
+## A sole nonmatching file-qualified entry leaves _zero_explicit at explicit
+## priority zero. It must remain in order with the default-zero tail.
+# RUN: %lld -lSystem -o %t/test-zero-tail %t/test.o %t/foo.o %t/zero.o -order_file %t/ord-zero-tail
+# RUN: llvm-objdump -d %t/test-zero-tail | FileCheck %s --check-prefix=ZERO-TAIL
+
+# ZERO-TAIL: <_bar>:
+# ZERO-TAIL: <_main>:
+# ZERO-TAIL: <_zero_first>:
+# ZERO-TAIL: <_zero_explicit>:
+# ZERO-TAIL: <_zero_last>:
+
+#--- ord-zero-tail
+_bar
+does-not-match.o:_zero_explicit
+
 #--- ord-1
 -[Foo doFoo:andBar:] # just a comment
 _main # another comment
@@ -183,6 +199,16 @@ _main:
 .section  __DWARF,__debug_aranges,regular,debug
 ltmp1:
   .byte 0
+
+#--- zero.s
+.subsections_via_symbols
+.globl _zero_first, _zero_explicit, _zero_last
+_zero_first:
+  ret
+_zero_explicit:
+  ret
+_zero_last:
+  ret
 
 #--- abs.s
 _abs = 42
