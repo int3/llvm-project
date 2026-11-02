@@ -552,6 +552,32 @@ TEST(StringRefTest, Find) {
   EXPECT_EQ(0U, Str.rfind("hello"));
   EXPECT_EQ(1U, Str.rfind("ello"));
   EXPECT_EQ(StringRef::npos, Str.rfind("zz"));
+  EXPECT_EQ(10U, Str.rfind(""));
+  EXPECT_EQ(4U, Str.rfind("o"));
+  EXPECT_EQ(3U, Str.rfind("lo"));
+  EXPECT_EQ(StringRef::npos, Str.rfind("hellp"));
+  EXPECT_EQ(StringRef::npos, Str.rfind("ohell"));
+  EXPECT_EQ(0U, StringRef().rfind(""));
+  EXPECT_EQ(StringRef::npos, StringRef().rfind("a"));
+  EXPECT_EQ(0U, StringRef("a").rfind("a"));
+  EXPECT_EQ(StringRef::npos, StringRef("a").rfind("b"));
+  EXPECT_EQ(4U, StringRef("aaaaaa").rfind("aa"));
+  EXPECT_EQ(3U, StringRef("abababa").rfind("bab"));
+  EXPECT_EQ(3U, StringRef("abcabcab").rfind("abc"));
+  EXPECT_EQ(StringRef::npos, StringRef("abcabcab").rfind("abd"));
+  EXPECT_EQ(3U, StringRef("foo.llvm.123").rfind(".llvm."));
+  EXPECT_EQ(StringRef::npos, StringRef("foo.llvm").rfind(".llvm."));
+
+  // Compare against std::string::rfind for every haystack and needle of up to
+  // six characters over {a, b}.
+  std::vector<std::string> AB = {""};
+  for (size_t I = 0; I != AB.size() && AB[I].size() < 6; ++I) {
+    AB.push_back(AB[I] + "a");
+    AB.push_back(AB[I] + "b");
+  }
+  for (const std::string &H : AB)
+    for (const std::string &N : AB)
+      EXPECT_EQ(H.rfind(N), StringRef(H).rfind(N)) << H << " " << N;
 
   EXPECT_EQ(8U, Str.rfind_insensitive('l'));
   EXPECT_EQ(8U, Str.rfind_insensitive('L'));

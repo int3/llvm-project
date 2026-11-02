@@ -211,7 +211,19 @@ size_t StringRef::rfind_insensitive(char C, size_t From) const {
 /// \return - The index of the last occurrence of \arg Str, or npos if not
 /// found.
 size_t StringRef::rfind(StringRef Str) const {
-  return std::string_view(*this).rfind(Str);
+  size_t N = Str.size();
+  if (N > size())
+    return npos;
+  if (N == 0)
+    return size();
+
+  // Scan backwards for the first character of Str and compare the rest only
+  // there. std::string_view::rfind is avoided because libstdc++ implements it
+  // as a memcmp call at every position.
+  for (size_t I = size() - N + 1; (I = rfind(Str.front(), I)) != npos;)
+    if (std::memcmp(data() + I + 1, Str.data() + 1, N - 1) == 0)
+      return I;
+  return npos;
 }
 
 size_t StringRef::rfind_insensitive(StringRef Str) const {
