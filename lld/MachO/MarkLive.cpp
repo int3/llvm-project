@@ -199,6 +199,9 @@ void WhyLiveMarkLive::drain() {
   }
 }
 
+// Set by markLive() when the link runs on one thread.
+static bool singleThreaded;
+
 // Sets `flag` and returns true if no other thread set it first. C++17 has no
 // std::atomic_ref, so the plain bool is accessed as an atomic.
 static bool tryClaim(bool &flag) {
@@ -277,10 +280,22 @@ private:
 
 // Visits the worklist one level at a time. Workers claim chunks of a level and
 // collect the sections they claim but don't visit in their own queues, which
-// together become the next level. Small levels, and every level when running
-// with one thread, are visited on this thread. The join orders all live-bit
-// updates before the next level and the live-support scan.
+// together become the next level. Small levels are visited on this thread. The
+// join orders all live-bit updates before the next level and the live-support
+// scan.
+//
+// With one thread, the worklist is instead used as a stack, without inline
+// visits, as WhyLiveMarkLive does; that order is faster than going level by
+// level.
 void ParallelMarkLive::drain() {
+  if (singleThreaded) {
+    while (!worklist.empty()) {
+      ConcatInputSection *isec = worklist.pop_back_val();
+      // Visiting at maxInlineDepth queues every section it reaches.
+      visitParallel(*isec, maxInlineDepth, worklist);
+    }
+    return;
+  }
   while (!worklist.empty()) {
     SectionQueue level = std::move(worklist);
     worklist.clear();
@@ -312,6 +327,7 @@ void ParallelMarkLive::drain() {
 // from the final output.
 void markLive() {
   TimeTraceScope timeScope("markLive");
+  singleThreaded = parallel::strategy.ThreadsRequested == 1;
   MarkLive *marker;
   if (config->whyLive.empty())
     marker = make<ParallelMarkLive>();
