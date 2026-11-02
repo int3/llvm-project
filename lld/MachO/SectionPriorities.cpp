@@ -22,8 +22,11 @@
 #include "lld/Common/CommonLinkerContext.h"
 #include "lld/Common/ErrorHandler.h"
 #include "lld/Common/Utils.h"
+#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/Support/MathExtras.h"
+#include "llvm/Support/Parallel.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/raw_ostream.h"
@@ -396,24 +399,72 @@ macho::PriorityBuilder::buildInputSectionPriorities() {
   if (priorities.empty())
     return sectionPriorities;
 
-  auto addSym = [&](const Defined *sym) {
-    std::optional<int> symbolPriority = getSymbolPriority(sym);
-    if (!symbolPriority)
-      return;
-    auto *isec = sym->isec();
+  // The keys are root symbols, and getRootSymbol() only strips suffixes, so a
+  // symbol can only match a key whose first prefixLen bytes it starts with.
+  // Checking a bitmap of those prefixes rejects most symbols without computing
+  // their root or hashing their whole name. Collisions fall through to the
+  // exact lookup. Keys shorter than 4 bytes would make the filter too coarse.
+  size_t prefixLen = 8;
+  for (const auto &[key, entry] : priorities)
+    prefixLen = std::min(prefixLen, key.size());
+  BitVector prefixes;
+  auto prefixBit = [&](StringRef name) {
+    return xxh3_64bits(name.take_front(prefixLen)) & (prefixes.size() - 1);
+  };
+  if (prefixLen >= 4) {
+    prefixes.resize(PowerOf2Ceil(priorities.size() * 8));
+    for (const auto &[key, entry] : priorities)
+      prefixes.set(prefixBit(key));
+  }
+
+  auto findEntry = [&](const Defined *sym) -> const SymbolPriorityEntry * {
+    if (sym->isAbsolute())
+      return nullptr;
+    StringRef name = sym->getName();
+    if (!prefixes.empty() &&
+        (name.size() < prefixLen || !prefixes.test(prefixBit(name))))
+      return nullptr;
+    auto it = priorities.find(utils::getRootSymbol(name));
+    return it == priorities.end() ? nullptr : &it->second;
+  };
+
+  using Match = std::pair<const Defined *, const SymbolPriorityEntry *>;
+  // TODO: Make sure this handles weak symbols correctly.
+  auto findMatches = [&](ArrayRef<InputFile *> files, auto fn) {
+    for (const InputFile *file : files)
+      if (isa<ObjFile>(file))
+        for (Symbol *sym : file->symbols)
+          if (auto *d = dyn_cast_or_null<Defined>(sym))
+            if (const SymbolPriorityEntry *entry = findEntry(d))
+              fn(Match(d, entry));
+  };
+
+  // getPriority() may call saver(), so apply the matches serially.
+  auto applyMatch = [&](const Match &match) {
+    auto *isec = match.first->isec();
     int &priority = sectionPriorities[isec];
-    priority = std::min(priority, *symbolPriority);
+    priority = std::min(priority, match.second->getPriority(isec->getFile()));
     // Order file takes precedence over cold partitioning.
     isec->isCold = false;
   };
 
-  // TODO: Make sure this handles weak symbols correctly.
-  for (const InputFile *file : inputFiles) {
-    if (isa<ObjFile>(file))
-      for (Symbol *sym : file->symbols)
-        if (auto *d = dyn_cast_or_null<Defined>(sym))
-          addSym(d);
+  // Every symbol of every object file is checked, so find the matches in
+  // parallel. Apply them in file order, as a serial walk would.
+  ArrayRef<InputFile *> files = inputFiles.getArrayRef();
+  constexpr size_t filesPerChunk = 64;
+  size_t numChunks = divideCeil(files.size(), filesPerChunk);
+  if (numChunks <= 1 || parallel::strategy.ThreadsRequested == 1) {
+    findMatches(files, applyMatch);
+    return sectionPriorities;
   }
+  std::vector<SmallVector<Match, 0>> chunkMatches(numChunks);
+  parallelFor(0, numChunks, [&](size_t i) {
+    findMatches(files.slice(i * filesPerChunk).take_front(filesPerChunk),
+                [&](const Match &match) { chunkMatches[i].push_back(match); });
+  });
+  for (const SmallVector<Match, 0> &matches : chunkMatches)
+    for (const Match &match : matches)
+      applyMatch(match);
 
   return sectionPriorities;
 }
