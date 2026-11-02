@@ -128,6 +128,15 @@
 # LITERAL-DAG: singleton
 # LITERAL-NOT: globby_only
 
+## Check the same with more than eight literals, which are matched by hash
+## lookup rather than one by one
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-macos \
+# RUN:     %t/extra-symdefs.s -o %t/extra-symdefs.o
+# RUN: %lld -dylib %t/symdefs.o %t/extra-symdefs.o -o %t/many-literals \
+# RUN:     -exported_symbols_list %t/many-literals.txt
+# RUN: llvm-objdump --macho --exports-trie %t/many-literals | \
+# RUN:     FileCheck --check-prefix=LITERAL %s
+
 ## Check that only glob patterns match
 ## Check that comments and blank lines are stripped from symbol list
 # RUN: %lld -dylib %t/symdefs.o -o %t/globby \
@@ -266,6 +275,27 @@ singleton:
 
 # globby_only
   globby_also
+
+#--- many-literals.txt
+literal_only
+literal_also
+globby_also
+singleton
+extra_1
+extra_2
+extra_3
+extra_4
+extra_5
+
+#--- extra-symdefs.s
+
+.globl extra_1, extra_2, extra_3, extra_4, extra_5
+extra_1:
+extra_2:
+extra_3:
+extra_4:
+extra_5:
+  retq
 
 #--- globbys.txt
 
