@@ -1,7 +1,8 @@
 # REQUIRES: x86
 
-## Fan out beyond the parallel frontier threshold. Workers share literal words
-## and symbols, claim new unwind entries, and queue sections beyond the DFS limit.
+## Fan out from a single root, so that busy workers must move sections to the
+## next level for idle ones. Workers share literal words and symbols and claim
+## new unwind entries.
 ## The live-support chain requires another traversal after the support scan.
 # RUN: rm -rf %t; split-file %s %t
 # RUN: %python %t/generate.py > %t/input.s

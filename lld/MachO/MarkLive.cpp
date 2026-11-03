@@ -211,61 +211,22 @@ static bool tryClaim(bool &flag) {
 
 using SectionQueue = SmallVector<ConcatInputSection *, 0>;
 
-// A thread visits the sections it claims directly, up to this depth of
-// recursion, which keeps chains of references on one thread. Deeper sections
-// go to the next level of the traversal.
-static constexpr int maxInlineDepth = 3;
-
-static void visitParallel(ConcatInputSection &isec, int depth,
-                          SectionQueue &queue);
-
-// Marks `isec` (at `off`) live. Safe to call from several threads at once.
-static void enqueueParallel(InputSection *isec, uint64_t off, int depth,
-                            SectionQueue &queue) {
-  if (auto *s = dyn_cast<ConcatInputSection>(isec)) {
-    if (!tryClaim(s->live))
-      return;
-    assert(!s->isCoalescedWeak());
-    if (depth < maxInlineDepth)
-      visitParallel(*s, depth + 1, queue);
-    else
-      queue.push_back(s);
-  } else if (auto *s = dyn_cast<CStringInputSection>(isec)) {
-    s->getStringPiece(off).markLiveAtomic();
-  } else {
-    // Word literals are marked with an atomic store.
-    isec->markLive(off);
-  }
-}
-
-static void addSymParallel(Symbol *s, int depth, SectionQueue &queue) {
-  if (!tryClaim(s->used))
-    return;
-  forEachSymbolSection(s, [&](InputSection *isec, uint64_t off) {
-    enqueueParallel(isec, off, depth, queue);
-  });
-}
-
-static void visitParallel(ConcatInputSection &isec, int depth,
-                          SectionQueue &queue) {
-  forEachReferent(
-      isec, [&](Symbol *s) { addSymParallel(s, depth, queue); },
-      [&](InputSection *referent, uint64_t off) {
-        enqueueParallel(referent, off, depth, queue);
-      });
-}
-
 // Marks liveness level by level, on as many threads as are available.
 class ParallelMarkLive : public MarkLive {
 public:
   void enqueue(InputSection *isec, uint64_t off) override {
-    enqueueParallel(isec, off, maxInlineDepth, worklist);
+    enqueue(isec, off, worklist);
   }
-  void addSym(Symbol *s) override {
-    addSymParallel(s, maxInlineDepth, worklist);
-  }
+  void addSym(Symbol *s) override { addSym(s, worklist); }
 
 private:
+  // These are safe to call from several threads at once. Each thread passes
+  // its own queue, which receives the sections it claims.
+  void enqueue(InputSection *isec, uint64_t off, SectionQueue &queue);
+  void addSym(Symbol *s, SectionQueue &queue);
+  void enqueueSymbolSections(Symbol *s, SectionQueue &queue);
+  void visit(ConcatInputSection &isec, SectionQueue &queue);
+
   void drain() override;
   void enqueueLiveSupport(ConcatInputSection *isec, InputSection *) override {
     enqueue(isec, 0);
@@ -275,32 +236,85 @@ private:
   SectionQueue worklist;
 };
 
-// Visits the worklist one level at a time. Workers claim chunks of a level and
-// collect the sections they claim but don't visit in their own queues, which
-// together become the next level. Small levels, and every level when running
-// with one thread, are visited on this thread. The join orders all live-bit
-// updates before the next level and the live-support scan.
+// Marks `isec` (at `off`) live, and queues it to be visited if this thread
+// claimed it. Safe to call from several threads at once.
+void ParallelMarkLive::enqueue(InputSection *isec, uint64_t off,
+                               SectionQueue &queue) {
+  if (auto *s = dyn_cast<ConcatInputSection>(isec)) {
+    if (!tryClaim(s->live))
+      return;
+    assert(!s->isCoalescedWeak());
+    queue.push_back(s);
+  } else if (auto *s = dyn_cast<CStringInputSection>(isec)) {
+    s->getStringPiece(off).markLiveAtomic();
+  } else {
+    // Word literals are marked with an atomic store.
+    isec->markLive(off);
+  }
+}
+
+// Marks the sections that the newly claimed symbol `s` keeps alive.
+void ParallelMarkLive::enqueueSymbolSections(Symbol *s, SectionQueue &queue) {
+  forEachSymbolSection(
+      s, [&](InputSection *isec, uint64_t off) { enqueue(isec, off, queue); });
+}
+
+void ParallelMarkLive::addSym(Symbol *s, SectionQueue &queue) {
+  if (tryClaim(s->used))
+    enqueueSymbolSections(s, queue);
+}
+
+void ParallelMarkLive::visit(ConcatInputSection &isec, SectionQueue &queue) {
+  forEachReferent(
+      isec,
+      [&](Symbol *s) {
+        // Most references find the symbol already claimed, so the claim is
+        // checked here rather than behind a call.
+        if (tryClaim(s->used))
+          enqueueSymbolSections(s, queue);
+      },
+      [&](InputSection *referent, uint64_t off) {
+        enqueue(referent, off, queue);
+      });
+}
+
+// Visits the worklist one level at a time. Workers take chunks of a level,
+// small enough that every worker gets some, and visit them depth-first: the
+// sections a visit claims go on the worker's own stack and are visited next,
+// while they and the relocations that reached them are still in cache. Once
+// one worker has run out of chunks, the others finish their current visit and
+// move the rest of their stacks to their queues for the next level, so that
+// the level ends and all workers share the rest in the next one. With one
+// thread no worker runs out early, and the whole traversal is one depth-first
+// walk. The join orders all live-bit updates before the next level and the
+// live-support scan.
 void ParallelMarkLive::drain() {
+  const size_t numThreads = parallel::getThreadCount();
   while (!worklist.empty()) {
     SectionQueue level = std::move(worklist);
     worklist.clear();
-    if (level.size() < 1024) {
-      for (ConcatInputSection *isec : level)
-        visitParallel(*isec, 0, worklist);
-      continue;
-    }
-    const size_t numThreads = parallel::getThreadCount();
     auto queues = std::make_unique<SectionQueue[]>(numThreads);
     std::atomic<size_t> next{0};
+    std::atomic<bool> workerIdle{false};
+    size_t chunkSize =
+        std::clamp<size_t>(level.size() / (4 * numThreads), 1, 64);
     parallelFor(0, numThreads, [&](size_t shard) {
+      SectionQueue stack;
       for (;;) {
-        size_t begin = next.fetch_add(64, std::memory_order_relaxed);
+        size_t begin = next.fetch_add(chunkSize, std::memory_order_relaxed);
         if (begin >= level.size())
           break;
-        size_t end = std::min(begin + 64, level.size());
-        for (size_t i = begin; i != end; ++i)
-          visitParallel(*level[i], 0, queues[shard]);
+        size_t end = std::min(begin + chunkSize, level.size());
+        stack.append(level.begin() + begin, level.begin() + end);
+        while (!stack.empty()) {
+          visit(*stack.pop_back_val(), stack);
+          if (workerIdle.load(std::memory_order_relaxed)) {
+            queues[shard].append(stack.begin(), stack.end());
+            stack.clear();
+          }
+        }
       }
+      workerIdle.store(true, std::memory_order_relaxed);
     });
     for (size_t shard = 0; shard != numThreads; ++shard)
       worklist.append(queues[shard].begin(), queues[shard].end());
