@@ -16,10 +16,13 @@
 #include "lld/Common/LLVM.h"
 #include "lld/Common/Memory.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/CachedHashString.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/BinaryFormat/MachO.h"
+#include "llvm/Support/SwapByteOrder.h"
+
+#include <atomic>
+#include <memory>
 
 namespace lld {
 namespace macho {
@@ -190,6 +193,16 @@ struct StringPiece {
 
   StringPiece(uint64_t off, uint32_t hash)
       : inSecOff(off), live(!config->deadStrip), hash(hash) {}
+
+  // Marks the piece live; safe to call from several threads at once. `live`
+  // shares its 32-bit word with `hash`, so this sets its bit with an atomic OR
+  // on the whole word. The bit is the word's lowest on little-endian hosts and
+  // its highest on big-endian ones.
+  void markLiveAtomic() {
+    auto *word = reinterpret_cast<std::atomic<uint32_t> *>(&inSecOff + 1);
+    constexpr uint32_t liveBit = llvm::sys::IsBigEndianHost ? (1U << 31) : 1U;
+    word->fetch_or(liveBit, std::memory_order_relaxed);
+  }
 };
 
 static_assert(sizeof(StringPiece) == 16, "StringPiece is too big!");
@@ -259,10 +272,10 @@ public:
                           uint32_t align);
   uint64_t getOffset(uint64_t off) const override;
   bool isLive(uint64_t off) const override {
-    return live[off >> power2LiteralSize];
+    return live[off >> power2LiteralSize].load(std::memory_order_relaxed);
   }
   void markLive(uint64_t off) override {
-    live[off >> power2LiteralSize] = true;
+    live[off >> power2LiteralSize].store(true, std::memory_order_relaxed);
   }
 
   static bool classof(const InputSection *isec) {
@@ -272,7 +285,8 @@ public:
 private:
   unsigned power2LiteralSize;
   // The liveness of data[off] is tracked by live[off >> power2LiteralSize].
-  llvm::BitVector live;
+  // Atomic so that parallel markLive() can mark literals from several threads.
+  std::unique_ptr<std::atomic<bool>[]> live;
 };
 
 inline uint8_t sectionType(uint32_t flags) {
