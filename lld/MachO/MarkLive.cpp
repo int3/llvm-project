@@ -108,9 +108,8 @@ void MarkLiveImpl<RecordWhyLive>::addSym(
   if constexpr (RecordWhyLive)
     if (!config->whyLive.empty() && config->whyLive.match(s->getName()))
       printWhyLive(s, prev);
-  if (ObjCStubsSection::isObjCClassStubSymbol(s))
-    if (auto *classSym = in.objcStubs->lookupClassSymbol(s))
-      addSym(classSym, prev);
+  if (auto *classSym = in.objcStubs->lookupClassSymbol(s))
+    addSym(classSym, prev);
   if (auto *d = dyn_cast<Defined>(s)) {
     if (d->isec())
       enqueue(d->isec(), d->value, prev);
@@ -159,13 +158,15 @@ void MarkLiveImpl<RecordWhyLive>::markTransitively() {
 
       // Mark all symbols listed in the relocation table for this section.
       for (const Relocation &r : isec->relocs) {
-        if (auto *s = dyn_cast<Symbol *>(r.referent))
-          addSym(s, entry);
-        else
+        if (auto *s = dyn_cast<Symbol *>(r.referent)) {
+          if (!s->used)
+            addSym(s, entry);
+        } else
           enqueue(cast<InputSection *>(r.referent), r.getAddend(), entry);
       }
       for (Defined *d : getInputSection(entry)->symbols)
-        addSym(d, entry);
+        if (!d->used)
+          addSym(d, entry);
     }
 
     // S_ATTR_LIVE_SUPPORT sections are live if they point _to_ a live
