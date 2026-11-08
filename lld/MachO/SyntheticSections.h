@@ -374,7 +374,9 @@ public:
   static std::optional<ObjCClassStubNames>
   parseObjCClassStubSymbol(Symbol *sym);
   void recordClassSymbol(Symbol *stubSym, Symbol *classSym);
-  Symbol *lookupClassSymbol(Symbol *stubSym) const;
+  Symbol *lookupClassSymbol(Symbol *stubSym) const {
+    return classSymbols.lookup(stubSym);
+  }
 
   /// Stably sort the stubs by \p priorities and reassign their offsets. Must
   /// run before addresses are assigned.

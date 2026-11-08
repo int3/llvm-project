@@ -1075,9 +1075,6 @@ void ObjCStubsSection::recordClassSymbol(Symbol *stubSym, Symbol *classSym) {
   classSymbols[stubSym] = classSym;
 }
 
-Symbol *ObjCStubsSection::lookupClassSymbol(Symbol *stubSym) const {
-  return classSymbols.lookup(stubSym);
-}
 
 size_t ObjCStubsSection::getStubSize(Symbol *sym) const {
   if (config->objcStubsMode == ObjCStubsMode::fast)
