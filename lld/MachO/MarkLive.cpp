@@ -102,20 +102,34 @@ template <bool RecordWhyLive>
 void MarkLiveImpl<RecordWhyLive>::addSym(
     Symbol *s,
     const typename MarkLiveImpl<RecordWhyLive>::WorklistEntry *prev) {
+  auto markUsed = [&](Symbol *sym) {
+    sym->used = true;
+    if constexpr (RecordWhyLive)
+      if (!config->whyLive.empty() && config->whyLive.match(sym->getName()))
+        printWhyLive(sym, prev);
+  };
+  auto enqueueSections = [&](Symbol *sym) {
+    if (auto *d = dyn_cast<Defined>(sym)) {
+      if (d->isec())
+        enqueue(d->isec(), d->value, prev);
+      if (d->unwindEntry())
+        enqueue(d->unwindEntry(), 0, prev);
+    }
+  };
+
   if (s->used)
     return;
-  s->used = true;
-  if constexpr (RecordWhyLive)
-    if (!config->whyLive.empty() && config->whyLive.match(s->getName()))
-      printWhyLive(s, prev);
-  if (auto *classSym = in.objcStubs->lookupClassSymbol(s))
-    addSym(classSym, prev);
-  if (auto *d = dyn_cast<Defined>(s)) {
-    if (d->isec())
-      enqueue(d->isec(), d->value, prev);
-    if (d->unwindEntry())
-      enqueue(d->unwindEntry(), 0, prev);
+  markUsed(s);
+  // A class stub keeps its class symbol live. Class symbols are never stubs
+  // themselves, so this is written out rather than calling addSym()
+  // recursively, which would keep addSym() from being inlined.
+  if (auto *classSym = in.objcStubs->lookupClassSymbol(s)) {
+    if (!classSym->used) {
+      markUsed(classSym);
+      enqueueSections(classSym);
+    }
   }
+  enqueueSections(s);
 }
 
 template <bool RecordWhyLive>
