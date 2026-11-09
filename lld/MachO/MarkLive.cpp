@@ -255,38 +255,28 @@ void MarkLiveImpl<RecordWhyLive>::markTransitively() {
     drain();
 
     // S_ATTR_LIVE_SUPPORT sections are live if they point _to_ a live
-    // section. Process them in a second pass. The scan only reads live bits
-    // and marks what it found afterwards, so a section that refers only to
-    // another one found by the same scan is found by the next iteration.
-    SmallVector<std::pair<ConcatInputSection *, InputSection *>, 0> found;
-    forEachParallel(
-        inputSections.size(), 256, found, [&](size_t i, auto &chunkFound) {
-          ConcatInputSection *isec = inputSections[i];
-          // FIXME: Check if copying all S_ATTR_LIVE_SUPPORT sections into a
-          // separate vector and only walking that here is faster.
-          if (!(isec->getFlags() & S_ATTR_LIVE_SUPPORT) || isec->live)
-            return;
+    // section. Process them in a second pass.
+    for (ConcatInputSection *isec : inputSections) {
+      // FIXME: Check if copying all S_ATTR_LIVE_SUPPORT sections into a
+      // separate vector and only walking that here is faster.
+      if (!(isec->getFlags() & S_ATTR_LIVE_SUPPORT) || isec->live)
+        continue;
 
-          for (const Relocation &r : isec->relocs) {
-            if (auto *s = dyn_cast<Symbol *>(r.referent)) {
-              if (s->isLive()) {
-                InputSection *referentIsec = nullptr;
-                if (auto *d = dyn_cast<Defined>(s))
-                  referentIsec = d->isec();
-                chunkFound.emplace_back(isec, referentIsec);
-                return;
-              }
-            } else {
-              auto *referentIsec = cast<InputSection *>(r.referent);
-              if (referentIsec->isLive(r.getAddend())) {
-                chunkFound.emplace_back(isec, referentIsec);
-                return;
-              }
-            }
+      for (const Relocation &r : isec->relocs) {
+        if (auto *s = dyn_cast<Symbol *>(r.referent)) {
+          if (s->isLive()) {
+            InputSection *referentIsec = nullptr;
+            if (auto *d = dyn_cast<Defined>(s))
+              referentIsec = d->isec();
+            enqueue(isec, 0, makeEntry(referentIsec, nullptr), nextLevel);
           }
-        });
-    for (auto [isec, referentIsec] : found)
-      enqueue(isec, 0, makeEntry(referentIsec, nullptr), nextLevel);
+        } else {
+          auto *referentIsec = cast<InputSection *>(r.referent);
+          if (referentIsec->isLive(r.getAddend()))
+            enqueue(isec, 0, makeEntry(referentIsec, nullptr), nextLevel);
+        }
+      }
+    }
 
     // S_ATTR_LIVE_SUPPORT could have marked additional sections live,
     // which in turn could mark additional S_ATTR_LIVE_SUPPORT sections live.
