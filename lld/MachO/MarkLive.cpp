@@ -44,28 +44,23 @@ static bool tryClaim(bool &flag) {
          !atomicFlag.exchange(true, std::memory_order_relaxed);
 }
 
-// Calls fn(i, out) for each i in [0, size) on all threads, in chunks of
-// `chunkSize`. Each chunk passes its own vector and appends it to `out` when it
-// is done.
-template <class T, class Fn>
-static void forEachParallel(size_t size, size_t chunkSize,
-                            SmallVector<T, 0> &out, Fn fn) {
-  std::mutex outMutex;
-  parallelFor(0, divideCeil(size, chunkSize), [&](size_t chunk) {
-    SmallVector<T, 0> chunkOut;
-    size_t end = std::min((chunk + 1) * chunkSize, size);
-    for (size_t i = chunk * chunkSize; i != end; ++i)
-      fn(i, chunkOut);
-    if (!chunkOut.empty()) {
-      std::lock_guard<std::mutex> lock(outMutex);
-      out.append(chunkOut.begin(), chunkOut.end());
-    }
-  });
-}
+// Type-erased interface to MarkLiveImpl. Used for adding roots to the liveness
+// graph.
+class MarkLive {
+public:
+  // Adds `n` shards, which are worklists for roots, and returns the index of
+  // the first. Several threads can add roots at once if each uses its own
+  // shard. The shards are visited in the order they were added.
+  virtual size_t addShards(size_t n) = 0;
+  virtual void enqueue(InputSection *isec, uint64_t off, size_t shard) = 0;
+  virtual void addSym(Symbol *s, size_t shard) = 0;
+  virtual void markTransitively() = 0;
+  virtual ~MarkLive() = default;
+};
 
 // Marks liveness on as many threads as are available. -why_live output is
 // deterministic only with --threads=1.
-template <bool RecordWhyLive> class MarkLiveImpl {
+template <bool RecordWhyLive> class MarkLiveImpl : public MarkLive {
 public:
   // -why_live is a rarely used option, so we don't want support for that flag
   // to slow down the main -dead_strip code path. As such, we employ templates
@@ -75,14 +70,19 @@ public:
       std::conditional_t<RecordWhyLive, WhyLiveEntry, InputSection>;
   using Worklist = SmallVector<WorklistEntry *, 0>;
 
-  void markLive() {
-    addRoots();
-    markTransitively();
+  size_t addShards(size_t n) override {
+    shards.resize(shards.size() + n);
+    return shards.size() - n;
   }
+  void enqueue(InputSection *isec, uint64_t off, size_t shard) override {
+    enqueue(isec, off, nullptr, shards[shard]);
+  }
+  void addSym(Symbol *s, size_t shard) override {
+    addSym(s, nullptr, shards[shard]);
+  }
+  void markTransitively() override;
 
 private:
-  void addRoots();
-  void markTransitively();
   // Several threads call these at once, each passing its own worklist to
   // receive the sections it claims.
   void enqueue(InputSection *isec, uint64_t off, const WorklistEntry *prev,
@@ -98,6 +98,7 @@ private:
   const InputSection *getInputSection(const WorklistEntry *) const;
   WorklistEntry *makeEntry(InputSection *, const WorklistEntry *prev) const;
 
+  std::vector<Worklist> shards;
   // Sections that have been marked live and that the next level of drain() will
   // visit. Literal sections cannot contain references to other sections, so we
   // only store ConcatInputSections here.
@@ -250,6 +251,9 @@ MarkLiveImpl<RecordWhyLive>::makeEntry(
 
 template <bool RecordWhyLive>
 void MarkLiveImpl<RecordWhyLive>::markTransitively() {
+  for (Worklist &shard : shards)
+    nextLevel.append(shard.begin(), shard.end());
+  shards.clear();
   do {
     // Mark things reachable from GC roots as live.
     drain();
@@ -285,80 +289,18 @@ void MarkLiveImpl<RecordWhyLive>::markTransitively() {
   } while (!nextLevel.empty());
 }
 
-template <bool RecordWhyLive> void MarkLiveImpl<RecordWhyLive>::addRoots() {
-  if (config->entry)
-    addSym(config->entry, nullptr, nextLevel);
-  ArrayRef<Symbol *> symbols = symtab->getSymbols();
-  forEachParallel(
-      symbols.size(), 256, nextLevel, [&](size_t i, Worklist &worklist) {
-        auto *defined = dyn_cast<Defined>(symbols[i]);
-        if (!defined)
-          return;
-        // -exported_symbol(s_list)
-        if (!config->exportedSymbols.empty() &&
-            config->exportedSymbols.match(defined->getName())) {
-          // NOTE: Even though exporting private externs is an ill-defined
-          // operation, we are purposely not checking for privateExtern in
-          // order to follow ld64's behavior of treating all exported private
-          // extern symbols as live, irrespective of whether they are autohide.
-          addSym(defined, nullptr, worklist);
-          return;
-        }
-
-        // public symbols explicitly marked .no_dead_strip
-        if (defined->referencedDynamically || defined->noDeadStrip) {
-          addSym(defined, nullptr, worklist);
-          return;
-        }
-
-        // FIXME: When we implement these flags, make symbols from them GC
-        // roots:
-        // * -reexported_symbol(s_list)
-        // * -alias_list
-        // * -init
-
-        // In dylibs and bundles and in executables with -export_dynamic,
-        // all external functions are GC roots.
-        bool externsAreRoots =
-            config->outputType != MH_EXECUTE || config->exportDynamic;
-        if (externsAreRoots && !defined->privateExtern)
-          addSym(defined, nullptr, worklist);
-      });
-  // -u symbols
-  for (Symbol *sym : config->explicitUndefineds)
-    addSym(sym, nullptr, nextLevel);
-  // local symbols explicitly marked .no_dead_strip
-  forEachParallel(inputFiles.size(), 1, nextLevel,
-                  [&](size_t i, Worklist &worklist) {
-                    if (auto *objFile = dyn_cast<ObjFile>(inputFiles[i]))
-                      for (Symbol *sym : objFile->symbols)
-                        if (auto *defined = dyn_cast_or_null<Defined>(sym))
-                          if (!defined->isExternal() && defined->noDeadStrip)
-                            addSym(defined, nullptr, worklist);
-                  });
-  if (auto *stubBinder =
-          dyn_cast_or_null<DylibSymbol>(symtab->find("dyld_stub_binder")))
-    addSym(stubBinder, nullptr, nextLevel);
-  forEachParallel(
-      inputSections.size(), 256, nextLevel, [&](size_t i, Worklist &worklist) {
-        ConcatInputSection *isec = inputSections[i];
-        // Sections marked no_dead_strip
-        if (isec->getFlags() & S_ATTR_NO_DEAD_STRIP) {
-          enqueue(isec, 0, nullptr, worklist);
-          return;
-        }
-
-        // mod_init_funcs, mod_term_funcs sections
-        if (sectionType(isec->getFlags()) == S_MOD_INIT_FUNC_POINTERS ||
-            sectionType(isec->getFlags()) == S_MOD_TERM_FUNC_POINTERS) {
-          assert(!config->emitInitOffsets ||
-                 sectionType(isec->getFlags()) != S_MOD_INIT_FUNC_POINTERS);
-          enqueue(isec, 0, nullptr, worklist);
-        }
-      });
-
-  for (ConcatInputSection *isec : in.initOffsets->inputs())
-    enqueue(isec, 0, nullptr, nextLevel);
+// Calls fn(i, shard) for each i in [0, size) on all threads, with a new shard
+// for each chunk of `chunkSize` items.
+template <class Fn>
+static void forEachShard(MarkLive *marker, size_t size, size_t chunkSize,
+                         Fn fn) {
+  size_t numChunks = divideCeil(size, chunkSize);
+  size_t first = marker->addShards(numChunks);
+  parallelFor(0, numChunks, [&](size_t chunk) {
+    size_t end = std::min((chunk + 1) * chunkSize, size);
+    for (size_t i = chunk * chunkSize; i != end; ++i)
+      fn(i, first + chunk);
+  });
 }
 
 // Set live bit on for each reachable chunk. Unmarked (unreachable)
@@ -366,10 +308,86 @@ template <bool RecordWhyLive> void MarkLiveImpl<RecordWhyLive>::addRoots() {
 // from the final output.
 void markLive() {
   TimeTraceScope timeScope("markLive");
+  MarkLive *marker;
   if (config->whyLive.empty())
-    MarkLiveImpl<false>().markLive();
+    marker = make<MarkLiveImpl<false>>();
   else
-    MarkLiveImpl<true>().markLive();
+    marker = make<MarkLiveImpl<true>>();
+  // Add GC roots.
+  if (config->entry)
+    marker->addSym(config->entry, marker->addShards(1));
+  ArrayRef<Symbol *> symbols = symtab->getSymbols();
+  forEachShard(marker, symbols.size(), 256, [&](size_t i, size_t shard) {
+    auto *defined = dyn_cast<Defined>(symbols[i]);
+    if (!defined)
+      return;
+    // -exported_symbol(s_list)
+    if (!config->exportedSymbols.empty() &&
+        config->exportedSymbols.match(defined->getName())) {
+      // NOTE: Even though exporting private externs is an ill-defined
+      // operation, we are purposely not checking for privateExtern in
+      // order to follow ld64's behavior of treating all exported private
+      // extern symbols as live, irrespective of whether they are autohide.
+      marker->addSym(defined, shard);
+      return;
+    }
+
+    // public symbols explicitly marked .no_dead_strip
+    if (defined->referencedDynamically || defined->noDeadStrip) {
+      marker->addSym(defined, shard);
+      return;
+    }
+
+    // FIXME: When we implement these flags, make symbols from them GC
+    // roots:
+    // * -reexported_symbol(s_list)
+    // * -alias_list
+    // * -init
+
+    // In dylibs and bundles and in executables with -export_dynamic,
+    // all external functions are GC roots.
+    bool externsAreRoots =
+        config->outputType != MH_EXECUTE || config->exportDynamic;
+    if (externsAreRoots && !defined->privateExtern)
+      marker->addSym(defined, shard);
+  });
+  // -u symbols
+  size_t serialShard = marker->addShards(1);
+  for (Symbol *sym : config->explicitUndefineds)
+    marker->addSym(sym, serialShard);
+  // local symbols explicitly marked .no_dead_strip
+  forEachShard(marker, inputFiles.size(), 1, [&](size_t i, size_t shard) {
+    if (auto *objFile = dyn_cast<ObjFile>(inputFiles[i]))
+      for (Symbol *sym : objFile->symbols)
+        if (auto *defined = dyn_cast_or_null<Defined>(sym))
+          if (!defined->isExternal() && defined->noDeadStrip)
+            marker->addSym(defined, shard);
+  });
+  if (auto *stubBinder =
+          dyn_cast_or_null<DylibSymbol>(symtab->find("dyld_stub_binder")))
+    marker->addSym(stubBinder, marker->addShards(1));
+  forEachShard(marker, inputSections.size(), 256, [&](size_t i, size_t shard) {
+    ConcatInputSection *isec = inputSections[i];
+    // Sections marked no_dead_strip
+    if (isec->getFlags() & S_ATTR_NO_DEAD_STRIP) {
+      marker->enqueue(isec, 0, shard);
+      return;
+    }
+
+    // mod_init_funcs, mod_term_funcs sections
+    if (sectionType(isec->getFlags()) == S_MOD_INIT_FUNC_POINTERS ||
+        sectionType(isec->getFlags()) == S_MOD_TERM_FUNC_POINTERS) {
+      assert(!config->emitInitOffsets ||
+             sectionType(isec->getFlags()) != S_MOD_INIT_FUNC_POINTERS);
+      marker->enqueue(isec, 0, shard);
+    }
+  });
+
+  serialShard = marker->addShards(1);
+  for (ConcatInputSection *isec : in.initOffsets->inputs())
+    marker->enqueue(isec, 0, serialShard);
+
+  marker->markTransitively();
 }
 
 } // namespace lld::macho
