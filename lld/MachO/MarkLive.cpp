@@ -18,6 +18,8 @@
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/TimeProfiler.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -313,6 +315,7 @@ template <bool RecordWhyLive> void MarkLiveImpl<RecordWhyLive>::drain() {
   // its own deque before it stops counting itself, so once this is zero there
   // is nothing left to visit.
   std::atomic<size_t> active{0};
+  std::atomic<size_t> statSteals{0}, statAttempts{0}, statYields{0};
 
   parallelFor(0, numThreads, [&](size_t shard) {
     StealDeque<WorklistEntry> &deque = deques[shard];
@@ -339,6 +342,7 @@ template <bool RecordWhyLive> void MarkLiveImpl<RecordWhyLive>::drain() {
     }
     active.fetch_sub(1);
 
+    size_t steals = 0, attempts = 0, yields = 0;
     while (active.load() != 0) {
       bool stole = false;
       for (size_t i = 1; i != numThreads; ++i) {
@@ -348,16 +352,29 @@ template <bool RecordWhyLive> void MarkLiveImpl<RecordWhyLive>::drain() {
         // Count ourselves before taking the entry, so that no one sees zero
         // while we hold it.
         active.fetch_add(1);
+        ++attempts;
         if (WorklistEntry *entry = victim.steal()) {
+          ++steals;
           visitAll(entry);
           stole = true;
         }
         active.fetch_sub(1);
       }
-      if (!stole)
+      if (!stole) {
+        ++yields;
         std::this_thread::yield();
+      }
     }
+    statSteals += steals;
+    statAttempts += attempts;
+    statYields += yields;
   });
+  if (getenv("LLD_MARKLIVE_STATS"))
+    fprintf(stderr,
+            "marklive-stats impl=steal threads=%zu roots=%zu steals=%zu "
+            "steal_attempts=%zu idle_yields=%zu\n",
+            numThreads, roots.size(), statSteals.load(), statAttempts.load(),
+            statYields.load());
 }
 
 template <bool RecordWhyLive>
