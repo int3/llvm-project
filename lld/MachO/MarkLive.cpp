@@ -212,6 +212,7 @@ void MarkLiveImpl<RecordWhyLive>::visit(WorklistEntry *entry,
 // TaskGroup's wait orders every live bit set here before the code that runs
 // after drain().
 template <bool RecordWhyLive> void MarkLiveImpl<RecordWhyLive>::drain() {
+  TimeTraceScope timeScope("markLive drain");
   const size_t numThreads = parallel::getThreadCount();
   Worklist roots = std::move(toVisit);
   toVisit.clear();
