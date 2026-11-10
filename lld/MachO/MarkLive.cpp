@@ -18,6 +18,8 @@
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/TimeProfiler.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <mutex>
 
@@ -220,6 +222,7 @@ template <bool RecordWhyLive> void MarkLiveImpl<RecordWhyLive>::drain() {
   std::atomic<size_t> nextRoot{0};
   // Tasks that have been spawned and have not finished.
   std::atomic<size_t> pending{0};
+  std::atomic<size_t> statTasks{0}, statDonated{0};
 
   // Moves `stack` into a new task.
   std::function<void(Worklist)> spawn;
@@ -229,17 +232,31 @@ template <bool RecordWhyLive> void MarkLiveImpl<RecordWhyLive>::drain() {
       if (stack.size() >= 2 &&
           pending.load(std::memory_order_relaxed) < numThreads) {
         auto mid = stack.begin() + stack.size() / 2;
+        statDonated.fetch_add(stack.size() / 2, std::memory_order_relaxed);
         spawn(Worklist(stack.begin(), mid));
         stack.erase(stack.begin(), mid);
       }
     }
   };
 
+  // Prints after the TaskGroup below has waited for every task.
+  struct PrintStats {
+    std::function<void()> f;
+    ~PrintStats() { f(); }
+  } printStats{[&] {
+    if (getenv("LLD_MARKLIVE_STATS"))
+      fprintf(stderr,
+              "marklive-stats impl=split threads=%zu roots=%zu split_tasks=%zu "
+              "donated=%zu\n",
+              numThreads, roots.size(), statTasks.load(), statDonated.load());
+  }};
+
   // Declared after everything the tasks use, so that its destructor, which
   // waits for them, runs first.
   parallel::TaskGroup tasks;
   spawn = [&](Worklist stack) {
     pending.fetch_add(1, std::memory_order_relaxed);
+    statTasks.fetch_add(1, std::memory_order_relaxed);
     tasks.spawn([&, stack = std::move(stack)]() mutable {
       walk(stack);
       pending.fetch_sub(1, std::memory_order_relaxed);
