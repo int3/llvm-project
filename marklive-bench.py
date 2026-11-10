@@ -23,11 +23,14 @@ from pathlib import Path
 
 REPO = 'https://github.com/int3/llvm-project.git'
 BENCH_REPO = 'https://github.com/int3/macho-linker-bench.git'
-# name: (branch to time, branch with LLD_MARKLIVE_STATS counters)
+# name: (branch to time, branch with LLD_MARKLIVE_STATS counters). `levels` is
+# #15 (parallel roots, level-synchronous drain); `split` (#22) and `steal` (#23)
+# replace its drain. Each timed branch is its PR plus one commit that adds a
+# "markLive drain" time-trace scope.
 VARIANTS = {
-    'levels': ('macho-parallel-marklive-merged', 'macho-parallel-marklive-stats'),
-    'split': ('macho-marklive-split', 'macho-marklive-split-stats'),
-    'steal': ('macho-marklive-steal', 'macho-marklive-steal-stats'),
+    'levels': ('macho-marklive-parallel-roots-v2-bench', 'macho-marklive-parallel-roots-v2-stats'),
+    'split': ('macho-marklive-split-bench', 'macho-marklive-split-stats'),
+    'steal': ('macho-marklive-steal-bench', 'macho-marklive-steal-stats'),
 }
 BASE = 'levels'
 # LinkerBench workload -> extra link arguments. rust-debug-ed adds
@@ -109,13 +112,14 @@ def link(binary, d, extra, threads, scratch, env=None):
     rss_mib = ru.ru_maxrss / (1 << 20 if sys.platform == 'darwin' else 1 << 10)
     ev = json.load(open(trace))['traceEvents']
     ml = sum(e['dur'] for e in ev if e.get('name') == 'markLive' and e.get('ph') == 'X') / 1000
+    drain = sum(e['dur'] for e in ev if e.get('name') == 'markLive drain' and e.get('ph') == 'X') / 1000
     h = hashlib.sha256()
     with open(out, 'rb') as f:
         while b := f.read(1 << 22):
             h.update(b)
     out.unlink()
     trace.unlink()
-    return dict(wall=wall, ml=ml, cpu=cpu, rss=rss_mib, hash=h.hexdigest()), stderr
+    return dict(wall=wall, ml=ml, drain=drain, cpu=cpu, rss=rss_mib, hash=h.hexdigest()), stderr
 
 
 def ci(base, new, rng):
@@ -226,8 +230,11 @@ def main():
         hashes = {s['hash'] for s in samples if s['w'] == w}
         out += [f'## {w}', '', f'Distinct output hashes: {len(hashes)}'
                 + ('' if len(hashes) == 1 else ' (OUTPUT DIFFERS)'), '']
-        for metric, label, scale, unit in (('ml', 'markLive', 1, 'ms'), ('wall', 'wall', 1, 's'),
+        for metric, label, scale, unit in (('drain', 'markLive drain', 1, 'ms'), ('ml', 'markLive', 1, 'ms'),
+                                           ('wall', 'wall', 1, 's'),
                                            ('cpu', 'CPU (user+sys)', 1, 's'), ('rss', 'peak RSS', 1, 'MiB')):
+            if not all(metric in s for s in samples if s['w'] == w):
+                continue
             out += [f'{label}, median {unit} (change vs {BASE}):', '',
                     '| threads | ' + ' | '.join(VARIANTS) + ' |',
                     '|---|' + '---|' * len(VARIANTS)]
