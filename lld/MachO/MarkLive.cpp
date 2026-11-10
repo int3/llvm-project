@@ -301,6 +301,7 @@ void MarkLiveImpl<RecordWhyLive>::visit(WorklistEntry *entry,
 // is empty steals the oldest entries of other workers' deques. With one thread
 // nothing is stolen, so this is a single depth-first walk.
 template <bool RecordWhyLive> void MarkLiveImpl<RecordWhyLive>::drain() {
+  TimeTraceScope timeScope("markLive drain");
   const size_t numThreads = parallel::getThreadCount();
   Worklist roots = std::move(toVisit);
   toVisit.clear();
