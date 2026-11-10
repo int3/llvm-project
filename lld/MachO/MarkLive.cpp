@@ -18,7 +18,10 @@
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/TimeProfiler.h"
 
+#include <memory>
 #include <mutex>
+#include <thread>
+#include <vector>
 
 namespace lld::macho {
 
@@ -41,11 +44,11 @@ public:
   // These add roots to worklist `shard`. We have one shard per thread.
   virtual void enqueue(InputSection *isec, uint64_t off, size_t shard = 0) = 0;
   virtual void addSym(Symbol *s, size_t shard = 0) = 0;
-  // Moves the roots in `shard` into `nextLevel`. Exposed as a performance
+  // Moves the roots in `shard` into `toVisit`. Exposed as a performance
   // optimization; flushing shortly after the worklist is populated means its
   // entries are likely still in cache.
   virtual void flush(size_t shard) = 0;
-  // Flushes all the shards into `nextLevel` before doing the marking.
+  // Flushes all the shards into `toVisit` before doing the marking.
   virtual void markTransitively() = 0;
   virtual ~MarkLive() = default;
 };
@@ -76,6 +79,96 @@ static void parallelForChunks(ArrayRef<T> items, size_t chunkSize, Fn fn) {
       fn(worker, items.slice(begin, std::min(chunkSize, items.size() - begin)));
   });
 }
+
+namespace {
+// A Chase-Lev work-stealing deque of non-null pointers, as in "Correct and
+// Efficient Work-Stealing for Weak Memory Models" (Le et al., PPoPP 2013). Its
+// owner pushes and pops at the bottom; other threads steal from the top.
+template <class T> class StealDeque {
+  struct Buffer {
+    explicit Buffer(int64_t cap)
+        : cap(cap), slots(std::make_unique<std::atomic<T *>[]>(cap)) {}
+    T *get(int64_t i) const {
+      return slots[i & (cap - 1)].load(std::memory_order_relaxed);
+    }
+    void put(int64_t i, T *x) {
+      slots[i & (cap - 1)].store(x, std::memory_order_relaxed);
+    }
+    int64_t cap;
+    std::unique_ptr<std::atomic<T *>[]> slots;
+  };
+
+  std::atomic<int64_t> top{0};
+  std::atomic<int64_t> bottom{0};
+  std::atomic<Buffer *> buffer;
+  // Thieves may still be reading a buffer that push() has outgrown, so every
+  // buffer lives as long as the deque.
+  std::vector<std::unique_ptr<Buffer>> buffers;
+
+public:
+  StealDeque() {
+    buffers.push_back(std::make_unique<Buffer>(1024));
+    buffer.store(buffers.back().get(), std::memory_order_relaxed);
+  }
+
+  void push(T *x) {
+    int64_t b = bottom.load(std::memory_order_relaxed);
+    int64_t t = top.load(std::memory_order_acquire);
+    Buffer *a = buffer.load(std::memory_order_relaxed);
+    if (b - t >= a->cap) {
+      auto grown = std::make_unique<Buffer>(a->cap * 2);
+      for (int64_t i = t; i != b; ++i)
+        grown->put(i, a->get(i));
+      a = grown.get();
+      buffers.push_back(std::move(grown));
+      buffer.store(a, std::memory_order_release);
+    }
+    a->put(b, x);
+    bottom.store(b + 1, std::memory_order_release);
+  }
+
+  // Returns nullptr if the deque is empty.
+  T *pop() {
+    int64_t b = bottom.load(std::memory_order_relaxed) - 1;
+    Buffer *a = buffer.load(std::memory_order_relaxed);
+    bottom.store(b, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    int64_t t = top.load(std::memory_order_relaxed);
+    if (t > b) {
+      bottom.store(b + 1, std::memory_order_relaxed);
+      return nullptr;
+    }
+    T *x = a->get(b);
+    if (t == b) {
+      // The last entry: race any thieves for it.
+      if (!top.compare_exchange_strong(t, t + 1, std::memory_order_seq_cst,
+                                       std::memory_order_relaxed))
+        x = nullptr;
+      bottom.store(b + 1, std::memory_order_relaxed);
+    }
+    return x;
+  }
+
+  // Returns nullptr if the deque is empty or another thread took the entry.
+  T *steal() {
+    int64_t t = top.load(std::memory_order_acquire);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    int64_t b = bottom.load(std::memory_order_acquire);
+    if (t >= b)
+      return nullptr;
+    T *x = buffer.load(std::memory_order_acquire)->get(t);
+    if (!top.compare_exchange_strong(t, t + 1, std::memory_order_seq_cst,
+                                     std::memory_order_relaxed))
+      return nullptr;
+    return x;
+  }
+
+  bool mayHaveWork() const {
+    return top.load(std::memory_order_relaxed) <
+           bottom.load(std::memory_order_relaxed);
+  }
+};
+} // namespace
 
 // Marks liveness on as many threads as are available. -why_live output is
 // deterministic only with --threads=1.
@@ -116,11 +209,11 @@ private:
   WorklistEntry *makeEntry(InputSection *, const WorklistEntry *prev) const;
 
   std::vector<Worklist> shards;
-  std::mutex nextLevelMutex;
-  // Sections that have been marked live and that the next level of drain() will
-  // visit. Literal sections cannot contain references to other sections, so we
-  // only store ConcatInputSections here.
-  Worklist nextLevel;
+  std::mutex toVisitMutex;
+  // Sections that have been marked live and that the next drain() will visit.
+  // Literal sections cannot contain references to other sections, so we only
+  // store ConcatInputSections here.
+  Worklist toVisit;
 };
 
 // Marks `isec` (at `off`) live. Only the thread whose claim succeeds queues a
@@ -202,44 +295,68 @@ void MarkLiveImpl<RecordWhyLive>::visit(WorklistEntry *entry,
     addSym(d, entry, worklist);
 }
 
-// Visits the sections in nextLevel, one level at a time. Workers take chunks of
-// a level, small enough that every worker gets some, and visit them depth-first
-// to take advantage of memory locality. Once one worker has run out of chunks,
-// the others finish their current visit and move the rest of their stacks to
-// nextLevel, so that the level ends and all workers share the rest in the next
-// one. With one thread, this reduces to a single depth-first walk. The last
-// join makes every live bit visible to the live-support scan, which reads them
-// with plain loads.
+// Visits the sections in toVisit and everything they reach. Each worker takes
+// chunks of toVisit and visits them depth-first from its own deque, to take
+// advantage of memory locality. Once toVisit is used up, a worker whose deque
+// is empty steals the oldest entries of other workers' deques. With one thread
+// nothing is stolen, so this is a single depth-first walk.
 template <bool RecordWhyLive> void MarkLiveImpl<RecordWhyLive>::drain() {
   const size_t numThreads = parallel::getThreadCount();
-  while (!nextLevel.empty()) {
-    Worklist level = std::move(nextLevel);
-    nextLevel.clear();
-    std::mutex nextLevelMutex;
-    std::atomic<bool> anyWorkerIdle{false};
-    size_t chunkSize =
-        std::clamp<size_t>(level.size() / (4 * numThreads), 1, 64);
-    // Each worker starts with the chunk at its own index and then claims the
-    // chunks after the first numThreads.
-    std::atomic<size_t> next{numThreads * chunkSize};
-    parallelFor(0, numThreads, [&](size_t shard) {
-      Worklist stack;
-      for (size_t begin = shard * chunkSize; begin < level.size();
-           begin = next.fetch_add(chunkSize, std::memory_order_relaxed)) {
-        size_t end = std::min(begin + chunkSize, level.size());
-        stack.append(level.begin() + begin, level.begin() + end);
-        while (!stack.empty()) {
-          visit(stack.pop_back_val(), stack);
-          if (anyWorkerIdle.load(std::memory_order_relaxed)) {
-            std::lock_guard<std::mutex> lock(nextLevelMutex);
-            nextLevel.append(stack.begin(), stack.end());
-            stack.clear();
-          }
-        }
+  Worklist roots = std::move(toVisit);
+  toVisit.clear();
+  size_t chunkSize = std::clamp<size_t>(roots.size() / (4 * numThreads), 1, 64);
+  std::atomic<size_t> nextRoot{0};
+  std::vector<StealDeque<WorklistEntry>> deques(numThreads);
+  // Workers that may hold work: those taking chunks of roots, and those
+  // visiting what they stole. Only these push onto a deque, and each empties
+  // its own deque before it stops counting itself, so once this is zero there
+  // is nothing left to visit.
+  std::atomic<size_t> active{0};
+
+  parallelFor(0, numThreads, [&](size_t shard) {
+    StealDeque<WorklistEntry> &deque = deques[shard];
+    Worklist found;
+    // Visits `entry`, if any, and then everything in our deque.
+    auto visitAll = [&](WorklistEntry *entry) {
+      for (; entry; entry = deque.pop()) {
+        visit(entry, found);
+        for (WorklistEntry *e : found)
+          deque.push(e);
+        found.clear();
       }
-      anyWorkerIdle.store(true, std::memory_order_relaxed);
-    });
-  }
+    };
+
+    active.fetch_add(1);
+    while (true) {
+      size_t begin = nextRoot.fetch_add(chunkSize, std::memory_order_relaxed);
+      if (begin >= roots.size())
+        break;
+      size_t end = std::min(begin + chunkSize, roots.size());
+      for (size_t i = begin; i != end; ++i)
+        deque.push(roots[i]);
+      visitAll(deque.pop());
+    }
+    active.fetch_sub(1);
+
+    while (active.load() != 0) {
+      bool stole = false;
+      for (size_t i = 1; i != numThreads; ++i) {
+        StealDeque<WorklistEntry> &victim = deques[(shard + i) % numThreads];
+        if (!victim.mayHaveWork())
+          continue;
+        // Count ourselves before taking the entry, so that no one sees zero
+        // while we hold it.
+        active.fetch_add(1);
+        if (WorklistEntry *entry = victim.steal()) {
+          visitAll(entry);
+          stole = true;
+        }
+        active.fetch_sub(1);
+      }
+      if (!stole)
+        std::this_thread::yield();
+    }
+  });
 }
 
 template <bool RecordWhyLive>
@@ -272,8 +389,8 @@ void MarkLiveImpl<RecordWhyLive>::flush(size_t shard) {
   Worklist &worklist = shards[shard];
   if (worklist.empty())
     return;
-  std::lock_guard<std::mutex> lock(nextLevelMutex);
-  nextLevel.append(worklist.begin(), worklist.end());
+  std::lock_guard<std::mutex> lock(toVisitMutex);
+  toVisit.append(worklist.begin(), worklist.end());
   worklist.clear();
 }
 
@@ -319,7 +436,7 @@ void MarkLiveImpl<RecordWhyLive>::markTransitively() {
     // which in turn could mark additional S_ATTR_LIVE_SUPPORT sections live.
     // Iterate. In practice, the second iteration won't mark additional
     // S_ATTR_LIVE_SUPPORT sections live.
-  } while (!nextLevel.empty());
+  } while (!toVisit.empty());
 }
 
 // Set live bit on for each reachable chunk. Unmarked (unreachable)
