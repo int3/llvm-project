@@ -18,6 +18,8 @@
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/TimeProfiler.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 
 namespace lld::macho {
@@ -213,7 +215,11 @@ void MarkLiveImpl<RecordWhyLive>::visit(WorklistEntry *entry,
 template <bool RecordWhyLive> void MarkLiveImpl<RecordWhyLive>::drain() {
   TimeTraceScope timeScope("markLive drain");
   const size_t numThreads = parallel::getThreadCount();
+  size_t statRoots = nextLevel.size(), statLevels = 0, statSmallLevels = 0;
+  std::atomic<size_t> statHandedBack{0};
   while (!nextLevel.empty()) {
+    ++statLevels;
+    statSmallLevels += nextLevel.size() < numThreads;
     Worklist level = std::move(nextLevel);
     nextLevel.clear();
     std::mutex nextLevelMutex;
@@ -233,6 +239,7 @@ template <bool RecordWhyLive> void MarkLiveImpl<RecordWhyLive>::drain() {
           visit(stack.pop_back_val(), stack);
           if (anyWorkerIdle.load(std::memory_order_relaxed)) {
             std::lock_guard<std::mutex> lock(nextLevelMutex);
+            statHandedBack += stack.size();
             nextLevel.append(stack.begin(), stack.end());
             stack.clear();
           }
@@ -241,6 +248,12 @@ template <bool RecordWhyLive> void MarkLiveImpl<RecordWhyLive>::drain() {
       anyWorkerIdle.store(true, std::memory_order_relaxed);
     });
   }
+  if (getenv("LLD_MARKLIVE_STATS"))
+    fprintf(stderr,
+            "marklive-stats impl=levels threads=%zu roots=%zu levels=%zu "
+            "levels_below_threads=%zu handed_back=%zu\n",
+            numThreads, statRoots, statLevels, statSmallLevels,
+            statHandedBack.load());
 }
 
 template <bool RecordWhyLive>
