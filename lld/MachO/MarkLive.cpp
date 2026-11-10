@@ -211,6 +211,7 @@ void MarkLiveImpl<RecordWhyLive>::visit(WorklistEntry *entry,
 // join makes every live bit visible to the live-support scan, which reads them
 // with plain loads.
 template <bool RecordWhyLive> void MarkLiveImpl<RecordWhyLive>::drain() {
+  TimeTraceScope timeScope("markLive drain");
   const size_t numThreads = parallel::getThreadCount();
   while (!nextLevel.empty()) {
     Worklist level = std::move(nextLevel);
