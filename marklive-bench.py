@@ -3,6 +3,7 @@
 
 usage: marklive-bench.py [--work DIR] [--threads 1,8,...] [--rounds N]
                          [--workloads a,b,...] [--jobs N] [--skip-build]
+                         [--resume] [--report-only]
 
 Builds ld64.lld from int3/llvm-project for each variant, fetches public
 Mach-O LinkerBench captures, then links every workload with every
@@ -11,7 +12,8 @@ time, the --time-trace markLive total and an output hash. A separate pass
 runs each variant's stats build once per workload and thread count and
 records what its drain did (levels, task splits or steals).
 
-Writes DIR/report.md (paste it back) and DIR/samples.jsonl. Needs Python 3,
+Writes DIR/report.md (paste it back), DIR/samples.jsonl and DIR/stats.jsonl.
+If the run is interrupted, rerun with --resume: finished workloads are kept. Needs Python 3,
 git, cmake, ninja, a C++17 compiler, curl and zstd. Python standard library
 only.
 """
@@ -138,49 +140,72 @@ def main():
     ap.add_argument('--jobs', type=int, default=ncpu)
     ap.add_argument('--skip-build', action='store_true')
     ap.add_argument('--scratch', type=Path, help='output directory for links; default: a tmpfs under /dev/shm on Linux')
+    ap.add_argument('--resume', action='store_true',
+                    help='keep earlier results in --work and redo only unfinished workloads')
+    ap.add_argument('--report-only', action='store_true', help='rewrite report.md from saved results')
     a = ap.parse_args()
     work = a.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
     threads = [int(t) for t in a.threads.split(',')]
     workloads = a.workloads.split(',')
-    if not a.skip_build:
-        build(work, a.jobs)
-    dirs = fetch(work, workloads)
-    scratch = a.scratch or (Path('/dev/shm') / f'marklive-bench-{os.getpid()}'
-                            if Path('/dev/shm').is_dir() else work / 'scratch')
-    scratch.mkdir(parents=True, exist_ok=True)
     bins = work / 'bin'
-    rows = work / 'samples.jsonl'
-    rows.unlink(missing_ok=True)
+    rows, statsf, donef = work / 'samples.jsonl', work / 'stats.jsonl', work / 'done.txt'
     rng = random.Random(20261110)
-    combos = [(v, t) for v in VARIANTS for t in threads]
-    samples, stats = [], []
-    try:
-        for w in workloads:
-            extra = WORKLOADS.get(w, [])
-            for v, t in combos * a.warmups:
-                link(bins / f'ld64.lld-{v}', dirs[w], extra, t, scratch)
-            for i in range(a.rounds):
-                order = combos[:]
-                rng.shuffle(order)
-                for v, t in order:
-                    m, _ = link(bins / f'ld64.lld-{v}', dirs[w], extra, t, scratch)
-                    r = dict(w=w, v=v, t=t, round=i, **m)
-                    samples.append(r)
-                    with open(rows, 'a') as f:
-                        f.write(json.dumps(r) + '\n')
-                print(f'{w} round {i + 1}/{a.rounds} {time.strftime("%H:%M:%S")}', flush=True)
-            env = dict(os.environ, LLD_MARKLIVE_STATS='1')
-            for v, t in combos:
-                _, err = link(bins / f'ld64.lld-{v}-stats', dirs[w], extra, t, scratch, env)
-                for line in err.splitlines():
-                    if line.startswith('marklive-stats '):
-                        stats.append(dict(w=w, v=v, t=t, **dict(kv.split('=', 1) for kv in line.split()[1:])))
-            print(f'{w} done {time.strftime("%H:%M:%S")}', flush=True)
-    finally:
-        if not a.scratch:
-            shutil.rmtree(scratch, ignore_errors=True)
-    (work / 'stats.json').write_text(json.dumps(stats, indent=1))
+
+    def load(path):
+        return [json.loads(l) for l in open(path)] if path.exists() else []
+
+    if not a.report_only:
+        if not a.resume:
+            for f in (rows, statsf, donef):
+                f.unlink(missing_ok=True)
+        done = set(donef.read_text().split()) if donef.exists() else set()
+        # A workload whose timing was interrupted is redone from scratch.
+        kept = [r for r in load(rows) if r['w'] in done]
+        rows.write_text(''.join(json.dumps(r) + '\n' for r in kept))
+        have_stats = {s['w'] for s in load(statsf)}
+        if not a.skip_build:
+            build(work, a.jobs)
+        dirs = fetch(work, workloads)
+        scratch = a.scratch or (Path('/dev/shm') / f'marklive-bench-{os.getpid()}'
+                                if Path('/dev/shm').is_dir() else work / 'scratch')
+        scratch.mkdir(parents=True, exist_ok=True)
+        combos = [(v, t) for v in VARIANTS for t in threads]
+        try:
+            for w in workloads:
+                extra = WORKLOADS.get(w, [])
+                if w not in done:
+                    for v, t in combos * a.warmups:
+                        link(bins / f'ld64.lld-{v}', dirs[w], extra, t, scratch)
+                    for i in range(a.rounds):
+                        order = combos[:]
+                        rng.shuffle(order)
+                        for v, t in order:
+                            m, _ = link(bins / f'ld64.lld-{v}', dirs[w], extra, t, scratch)
+                            with open(rows, 'a') as f:
+                                f.write(json.dumps(dict(w=w, v=v, t=t, round=i, **m)) + '\n')
+                        print(f'{w} round {i + 1}/{a.rounds} {time.strftime("%H:%M:%S")}', flush=True)
+                    with open(donef, 'a') as f:
+                        f.write(w + '\n')
+                if w not in have_stats:
+                    env = dict(os.environ, LLD_MARKLIVE_STATS='1')
+                    for v, t in combos:
+                        _, err = link(bins / f'ld64.lld-{v}-stats', dirs[w], extra, t, scratch, env)
+                        for line in err.splitlines():
+                            if line.startswith('marklive-stats '):
+                                kv = dict(x.split('=', 1) for x in line.split()[1:])
+                                with open(statsf, 'a') as f:
+                                    f.write(json.dumps(dict(w=w, v=v, t=t, **kv)) + '\n')
+                print(f'{w} done {time.strftime("%H:%M:%S")}', flush=True)
+        finally:
+            if not a.scratch:
+                shutil.rmtree(scratch, ignore_errors=True)
+
+    samples, stats = load(rows), load(statsf)
+    order = list(WORKLOADS) + sorted({s['w'] for s in samples} - set(WORKLOADS))
+    workloads = [w for w in order if any(s['w'] == w for s in samples)]
+    threads = sorted({s['t'] for s in samples})
+    rounds = max((s['round'] for s in samples), default=-1) + 1
 
     def cpu_model():
         try:
@@ -195,7 +220,7 @@ def main():
     out = [f'# markLive drains: {", ".join(VARIANTS)}', '',
            f'- Machine: {cpu_model()}, {ncpu} logical CPUs, {platform.platform()}',
            f'- Revisions: ' + ', '.join(f'{v} `{r[:12]}`' for v, r in revs.items()),
-           f'- {a.rounds} rounds, {a.warmups} warmups; CIs are 95% bootstrap intervals of the '
+           f'- {rounds} rounds; CIs are 95% bootstrap intervals of the '
            f'difference of means against `{BASE}`.', '']
     for w in workloads:
         hashes = {s['hash'] for s in samples if s['w'] == w}
@@ -217,7 +242,6 @@ def main():
                     else:
                         lo, hi = ci(cell[BASE], cell[v], rng)
                         row.append((f'{m:.3f}' if unit == 's' else f'{m:.1f}') + f' ({lo:+.1f}..{hi:+.1f}%)')
-                    del m
                 out.append(f'| {t} | ' + ' | '.join(row) + ' |')
             out.append('')
         out += ['Drain stats (stats builds, one link each):', '']
