@@ -224,13 +224,18 @@ template <bool RecordWhyLive> void MarkLiveImpl<RecordWhyLive>::drain() {
     std::atomic<size_t> next{numThreads * chunkSize};
     parallelFor(0, numThreads, [&](size_t shard) {
       Worklist stack;
+      // Visits this worker has made in this level. Handing back work only
+      // after a minimum number of visits keeps the levels near the end of the
+      // drain from shrinking to a visit or two per worker.
+      size_t visited = 0;
       for (size_t begin = shard * chunkSize; begin < level.size();
            begin = next.fetch_add(chunkSize, std::memory_order_relaxed)) {
         size_t end = std::min(begin + chunkSize, level.size());
         stack.append(level.begin() + begin, level.begin() + end);
         while (!stack.empty()) {
           visit(stack.pop_back_val(), stack);
-          if (anyWorkerIdle.load(std::memory_order_relaxed)) {
+          if (++visited >= 256 && !stack.empty() &&
+              anyWorkerIdle.load(std::memory_order_relaxed)) {
             std::lock_guard<std::mutex> lock(nextLevelMutex);
             nextLevel.append(stack.begin(), stack.end());
             stack.clear();
