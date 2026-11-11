@@ -2,27 +2,23 @@
 """Compare lld-macho's parallel markLive drains on a many-core machine.
 
 usage: marklive-bench.py [--work DIR] [--threads 1,8,...] [--rounds N]
-                         [--workloads a,b,...] [--jobs N] [--skip-build]
-                         [--resume] [--report-only]
+                         [--workloads a,b,...] [--resume] [--report-only]
 
-Builds ld64.lld from int3/llvm-project for each variant, fetches public
-Mach-O LinkerBench captures, then links every workload with every
+Downloads prebuilt static x86_64 Linux ld64.lld binaries for each variant and
+the public Mach-O LinkerBench captures, then links every workload with every
 (variant, thread count) pair in shuffled rounds. Each link records wall
 time, the --time-trace markLive total and an output hash. A separate pass
 runs each variant's stats build once per workload and thread count and
 records what its drain did (levels, task splits or steals).
 
 Writes DIR/report.md (paste it back), DIR/samples.jsonl and DIR/stats.jsonl.
-If the run is interrupted, rerun with --resume: finished workloads are kept. Needs Python 3,
-cmake, ninja, a C++17 compiler, curl and zstd. git is optional: without it,
-sources come from GitHub tarballs. Python standard library only.
+If the run is interrupted, rerun with --resume: finished workloads are kept.
+Needs Python 3, curl and tar; the download includes a static zstd.
 """
 import argparse, hashlib, json, os, platform, random, re, shlex, shutil
 import statistics, subprocess, sys, tarfile, time, urllib.request
 from pathlib import Path
 
-REPO = 'https://github.com/int3/llvm-project.git'
-BENCH_REPO = 'https://github.com/int3/macho-linker-bench.git'
 # name: (branch to time, branch with LLD_MARKLIVE_STATS counters). `levels` is
 # #15 (parallel roots, level-synchronous drain); `split` (#22) and `steal` (#23)
 # replace its drain. Each timed branch is its PR plus one commit that adds a
@@ -49,97 +45,42 @@ def run(argv, **kw):
     return subprocess.run(argv, check=True, **kw)
 
 
-def github_tarball(repo, ref):
-    """Returns an open tar stream of int3/<repo> at `ref` and the commit it names."""
-    req = urllib.request.Request(f'https://api.github.com/repos/int3/{repo}/commits/{ref}',
-                                 headers={'Accept': 'application/vnd.github.sha'})
-    with urllib.request.urlopen(req) as r:
-        sha = r.read().decode().strip()
-    print(f'+ download {repo}@{sha}', flush=True)
-    resp = urllib.request.urlopen(f'https://codeload.github.com/int3/{repo}/tar.gz/{sha}')
-    return tarfile.open(fileobj=resp, mode='r|gz'), sha
+BUNDLE_URL = ('https://github.com/int3/llvm-project/releases/download/'
+              'marklive-repro-v1/marklive-repro-linux-x86_64.tar.gz')
+BUNDLE_SHA256 = 'e95eea5c95473f99e826cb4e9b2feaf2e06381b48de0cf41c35e397adbfe67cb'
 
 
-def sync_tarball(repo, ref, dest):
-    """Makes `dest` match int3/<repo> at `ref` without git.
-
-    Only files whose contents differ are rewritten, so switching between
-    branches keeps the mtimes Ninja uses and rebuilds only what changed.
-    """
-    tar, sha = github_tarball(repo, ref)
-    seen = set()
-    with tar:
-        for m in tar:
-            parts = m.name.split('/', 1)
-            if len(parts) < 2 or not parts[1]:
-                continue
-            path = dest / parts[1]
-            seen.add(parts[1].rstrip('/'))
-            if m.isdir():
-                path.mkdir(parents=True, exist_ok=True)
-            elif m.issym():
-                if not path.is_symlink() or os.readlink(path) != m.linkname:
-                    path.unlink(missing_ok=True)
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.symlink_to(m.linkname)
-            elif m.isfile():
-                data = tar.extractfile(m).read()
-                if path.is_symlink() or not path.is_file() or path.read_bytes() != data:
-                    path.unlink(missing_ok=True)
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_bytes(data)
-                    path.chmod(m.mode & 0o777)
-    for root, dirs, files in os.walk(dest):
-        for f in files:
-            rel = os.path.relpath(os.path.join(root, f), dest)
-            if rel not in seen:
-                os.unlink(os.path.join(root, f))
-    return sha
-
-
-def checkout(src, branch):
-    """Puts `branch` of int3/llvm-project in `src` and returns its commit."""
-    if not shutil.which('git'):
-        src.mkdir(parents=True, exist_ok=True)
-        return sync_tarball('llvm-project', branch, src)
-    if not (src / '.git').exists():
-        run(['git', 'clone', '--filter=blob:none', '--no-checkout', REPO, src])
-    run(['git', '-C', src, 'fetch', '--force', 'origin',
-         f'+refs/heads/{branch}:refs/remotes/origin/{branch}'])
-    run(['git', '-C', src, 'checkout', '--force', '--detach', f'origin/{branch}'])
-    return subprocess.run(['git', '-C', src, 'rev-parse', 'HEAD'], capture_output=True,
-                          text=True, check=True).stdout.strip()
-
-
-def build(work, jobs):
-    src, bld, bins = work / 'llvm-project', work / 'build', work / 'bin'
+def download_bundle(work):
+    """Unpacks the binaries, a static zstd and LinkerBench's fetch.py into work/bin."""
+    bins = work / 'bin'
+    if (bins / 'fetch.py').exists():
+        return
+    if platform.system() != 'Linux' or platform.machine() != 'x86_64':
+        sys.exit(f'the binaries are x86_64 Linux only, not {platform.system()} {platform.machine()}')
+    tgz = work / 'marklive-repro.tar.gz'
+    print(f'+ download {BUNDLE_URL}', flush=True)
+    with urllib.request.urlopen(BUNDLE_URL) as r, open(tgz, 'wb') as f:
+        shutil.copyfileobj(r, f)
+    digest = hashlib.sha256(tgz.read_bytes()).hexdigest()
+    if digest != BUNDLE_SHA256:
+        sys.exit(f'{tgz}: sha256 {digest}, expected {BUNDLE_SHA256}')
     bins.mkdir(parents=True, exist_ok=True)
-    for name, pair in VARIANTS.items():
-        for branch, suffix in zip(pair, ('', '-stats')):
-            rev = checkout(src, branch)
-            if not (bld / 'build.ninja').exists():
-                run(['cmake', '-G', 'Ninja', '-S', src / 'llvm', '-B', bld,
-                     '-DCMAKE_BUILD_TYPE=Release', '-DLLVM_ENABLE_ASSERTIONS=OFF',
-                     '-DLLVM_ENABLE_PROJECTS=lld', '-DLLVM_TARGETS_TO_BUILD=AArch64;X86',
-                     '-DLLVM_INCLUDE_TESTS=OFF', '-DLLVM_INCLUDE_BENCHMARKS=OFF'])
-            run(['ninja', '-C', bld, f'-j{jobs}', 'lld'])
-            shutil.copy2(bld / 'bin' / 'lld', bins / f'ld64.lld-{name}{suffix}')
-            (bins / f'ld64.lld-{name}{suffix}.rev').write_text(rev + '\n')
+    with tarfile.open(tgz) as t:
+        for m in t.getmembers():
+            if m.isfile():
+                dst = bins / Path(m.name).name
+                dst.write_bytes(t.extractfile(m).read())
+                dst.chmod(0o755)
+    tgz.unlink()
 
 
 def fetch(work, workloads):
-    bench, corpora = work / 'macho-linker-bench', work / 'corpora'
-    if not bench.exists():
-        if shutil.which('git'):
-            run(['git', 'clone', BENCH_REPO, bench])
-        else:
-            bench.mkdir(parents=True)
-            sync_tarball('macho-linker-bench', 'main', bench)
+    bins, corpora = work / 'bin', work / 'corpora'
     dirs = {}
     for w in workloads:
         cap = w.removesuffix('-ed')
         if not (corpora / cap).exists() or not list((corpora / cap).rglob('response.txt')):
-            run([sys.executable, bench / 'fetch.py', '--public', '--extract', '--no-cache',
+            run([sys.executable, bins / 'fetch.py', '--public', '--extract', '--no-cache',
                  '--dir', corpora, cap])
         found = list((corpora / cap).rglob('response.txt'))
         if len(found) != 1:
@@ -200,8 +141,6 @@ def main():
     ap.add_argument('--rounds', type=int, default=15)
     ap.add_argument('--warmups', type=int, default=2)
     ap.add_argument('--workloads', default=','.join(WORKLOADS))
-    ap.add_argument('--jobs', type=int, default=ncpu)
-    ap.add_argument('--skip-build', action='store_true')
     ap.add_argument('--scratch', type=Path, help='output directory for links; default: a tmpfs under /dev/shm on Linux')
     ap.add_argument('--resume', action='store_true',
                     help='keep earlier results in --work and redo only unfinished workloads')
@@ -227,8 +166,9 @@ def main():
         kept = [r for r in load(rows) if r['w'] in done]
         rows.write_text(''.join(json.dumps(r) + '\n' for r in kept))
         have_stats = {s['w'] for s in load(statsf)}
-        if not a.skip_build:
-            build(work, a.jobs)
+        download_bundle(work)
+        # fetch.py runs zstd; use the bundled static one.
+        os.environ['PATH'] = f'{bins}{os.pathsep}{os.environ.get("PATH", "")}'
         dirs = fetch(work, workloads)
         scratch = a.scratch or (Path('/dev/shm') / f'marklive-bench-{os.getpid()}'
                                 if Path('/dev/shm').is_dir() else work / 'scratch')
