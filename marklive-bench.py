@@ -14,11 +14,11 @@ records what its drain did (levels, task splits or steals).
 
 Writes DIR/report.md (paste it back), DIR/samples.jsonl and DIR/stats.jsonl.
 If the run is interrupted, rerun with --resume: finished workloads are kept. Needs Python 3,
-git, cmake, ninja, a C++17 compiler, curl and zstd. Python standard library
-only.
+cmake, ninja, a C++17 compiler, curl and zstd. git is optional: without it,
+sources come from GitHub tarballs. Python standard library only.
 """
 import argparse, hashlib, json, os, platform, random, re, shlex, shutil
-import statistics, subprocess, sys, time
+import statistics, subprocess, sys, tarfile, time, urllib.request
 from pathlib import Path
 
 REPO = 'https://github.com/int3/llvm-project.git'
@@ -49,17 +49,74 @@ def run(argv, **kw):
     return subprocess.run(argv, check=True, **kw)
 
 
+def github_tarball(repo, ref):
+    """Returns an open tar stream of int3/<repo> at `ref` and the commit it names."""
+    req = urllib.request.Request(f'https://api.github.com/repos/int3/{repo}/commits/{ref}',
+                                 headers={'Accept': 'application/vnd.github.sha'})
+    with urllib.request.urlopen(req) as r:
+        sha = r.read().decode().strip()
+    print(f'+ download {repo}@{sha}', flush=True)
+    resp = urllib.request.urlopen(f'https://codeload.github.com/int3/{repo}/tar.gz/{sha}')
+    return tarfile.open(fileobj=resp, mode='r|gz'), sha
+
+
+def sync_tarball(repo, ref, dest):
+    """Makes `dest` match int3/<repo> at `ref` without git.
+
+    Only files whose contents differ are rewritten, so switching between
+    branches keeps the mtimes Ninja uses and rebuilds only what changed.
+    """
+    tar, sha = github_tarball(repo, ref)
+    seen = set()
+    with tar:
+        for m in tar:
+            parts = m.name.split('/', 1)
+            if len(parts) < 2 or not parts[1]:
+                continue
+            path = dest / parts[1]
+            seen.add(parts[1].rstrip('/'))
+            if m.isdir():
+                path.mkdir(parents=True, exist_ok=True)
+            elif m.issym():
+                if not path.is_symlink() or os.readlink(path) != m.linkname:
+                    path.unlink(missing_ok=True)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.symlink_to(m.linkname)
+            elif m.isfile():
+                data = tar.extractfile(m).read()
+                if path.is_symlink() or not path.is_file() or path.read_bytes() != data:
+                    path.unlink(missing_ok=True)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(data)
+                    path.chmod(m.mode & 0o777)
+    for root, dirs, files in os.walk(dest):
+        for f in files:
+            rel = os.path.relpath(os.path.join(root, f), dest)
+            if rel not in seen:
+                os.unlink(os.path.join(root, f))
+    return sha
+
+
+def checkout(src, branch):
+    """Puts `branch` of int3/llvm-project in `src` and returns its commit."""
+    if not shutil.which('git'):
+        src.mkdir(parents=True, exist_ok=True)
+        return sync_tarball('llvm-project', branch, src)
+    if not (src / '.git').exists():
+        run(['git', 'clone', '--filter=blob:none', '--no-checkout', REPO, src])
+    run(['git', '-C', src, 'fetch', '--force', 'origin',
+         f'+refs/heads/{branch}:refs/remotes/origin/{branch}'])
+    run(['git', '-C', src, 'checkout', '--force', '--detach', f'origin/{branch}'])
+    return subprocess.run(['git', '-C', src, 'rev-parse', 'HEAD'], capture_output=True,
+                          text=True, check=True).stdout.strip()
+
+
 def build(work, jobs):
     src, bld, bins = work / 'llvm-project', work / 'build', work / 'bin'
     bins.mkdir(parents=True, exist_ok=True)
-    if not src.exists():
-        run(['git', 'clone', '--filter=blob:none', '--no-checkout', REPO, src])
-    branches = [b for pair in VARIANTS.values() for b in pair]
-    run(['git', '-C', src, 'fetch', '--force', 'origin',
-         *[f'+refs/heads/{b}:refs/remotes/origin/{b}' for b in branches]])
     for name, pair in VARIANTS.items():
         for branch, suffix in zip(pair, ('', '-stats')):
-            run(['git', '-C', src, 'checkout', '--force', '--detach', f'origin/{branch}'])
+            rev = checkout(src, branch)
             if not (bld / 'build.ninja').exists():
                 run(['cmake', '-G', 'Ninja', '-S', src / 'llvm', '-B', bld,
                      '-DCMAKE_BUILD_TYPE=Release', '-DLLVM_ENABLE_ASSERTIONS=OFF',
@@ -67,15 +124,17 @@ def build(work, jobs):
                      '-DLLVM_INCLUDE_TESTS=OFF', '-DLLVM_INCLUDE_BENCHMARKS=OFF'])
             run(['ninja', '-C', bld, f'-j{jobs}', 'lld'])
             shutil.copy2(bld / 'bin' / 'lld', bins / f'ld64.lld-{name}{suffix}')
-            rev = subprocess.run(['git', '-C', src, 'rev-parse', 'HEAD'], capture_output=True,
-                                 text=True, check=True).stdout.strip()
             (bins / f'ld64.lld-{name}{suffix}.rev').write_text(rev + '\n')
 
 
 def fetch(work, workloads):
     bench, corpora = work / 'macho-linker-bench', work / 'corpora'
     if not bench.exists():
-        run(['git', 'clone', BENCH_REPO, bench])
+        if shutil.which('git'):
+            run(['git', 'clone', BENCH_REPO, bench])
+        else:
+            bench.mkdir(parents=True)
+            sync_tarball('macho-linker-bench', 'main', bench)
     dirs = {}
     for w in workloads:
         cap = w.removesuffix('-ed')
