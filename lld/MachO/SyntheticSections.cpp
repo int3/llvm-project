@@ -1312,9 +1312,8 @@ uint32_t LazyBindingSection::encode(const Symbol &sym) {
 ExportSection::ExportSection()
     : LinkEditSection(segment_names::linkEdit, section_names::export_) {}
 
-void ExportSection::finalizeContents() {
-  trieBuilder.setImageBase(in.header->addr);
-  for (const Symbol *sym : symtab->getSymbols()) {
+void ExportSection::prepare(ArrayRef<Symbol *> syms) {
+  for (const Symbol *sym : syms) {
     if (const auto *defined = dyn_cast<Defined>(sym)) {
       if (defined->privateExtern || !defined->isLive())
         continue;
@@ -1325,7 +1324,14 @@ void ExportSection::finalizeContents() {
         trieBuilder.addSymbol(*dysym);
     }
   }
-  size = trieBuilder.build();
+  trieBuilder.buildNodes();
+  prepared = true;
+}
+
+void ExportSection::finalizeContents() {
+  if (!prepared)
+    prepare(symtab->getSymbols());
+  size = trieBuilder.assignOffsets(in.header->addr);
 }
 
 void ExportSection::writeTo(uint8_t *buf) const { trieBuilder.writeTo(buf); }
@@ -1399,9 +1405,7 @@ void DataInCodeSection::writeTo(uint8_t *buf) const {
 FunctionStartsSection::FunctionStartsSection()
     : LinkEditSection(segment_names::linkEdit, section_names::functionStarts) {}
 
-void FunctionStartsSection::finalizeContents() {
-  raw_svector_ostream os{contents};
-  std::vector<uint64_t> addrs;
+template <class Fn> static void forEachFunctionStart(Fn fn) {
   for (const InputFile *file : inputFiles) {
     if (auto *objFile = dyn_cast<ObjFile>(file)) {
       for (const Symbol *sym : objFile->symbols) {
@@ -1409,10 +1413,30 @@ void FunctionStartsSection::finalizeContents() {
           if (!defined->isec() || !isCodeSection(defined->isec()) ||
               !defined->isLive())
             continue;
-          addrs.push_back(defined->getVA());
+          fn(defined);
         }
       }
     }
+  }
+}
+
+void FunctionStartsSection::prepare() {
+  forEachFunctionStart([&](const Defined *d) { starts.push_back(d); });
+  prepared = true;
+}
+
+void FunctionStartsSection::finalizeContents() {
+  raw_svector_ostream os{contents};
+  std::vector<uint64_t> addrs;
+  // Without prepare(), a single walk avoids materializing `starts`.
+  if (prepared) {
+    addrs.reserve(starts.size());
+    for (const Defined *d : starts)
+      addrs.push_back(d->getVA());
+    starts = {};
+  } else {
+    forEachFunctionStart(
+        [&](const Defined *d) { addrs.push_back(d->getVA()); });
   }
   llvm::sort(addrs);
   uint64_t addr = in.header->addr;
@@ -1585,7 +1609,8 @@ void SymtabSection::emitStabs() {
     emitEndSourceStab();
 }
 
-void SymtabSection::finalizeContents() {
+void SymtabSection::collectSymbols(ArrayRef<Symbol *> syms,
+                                   bool includeLocals) {
   auto addSymbol = [&](std::vector<SymtabEntry> &symbols, Symbol *sym) {
     uint32_t strx = stringTableSection.addString(sym->getName());
     symbols.push_back({sym, strx});
@@ -1618,7 +1643,7 @@ void SymtabSection::finalizeContents() {
   // But if `-x` is set, then we don't need to. localSymbolsHandler() will do
   // the right thing regardless, but this check is a perf optimization because
   // iterating through all the input files and their symbols is expensive.
-  if (config->localSymbolsPresence != SymtabPresence::None) {
+  if (includeLocals && config->localSymbolsPresence != SymtabPresence::None) {
     for (const InputFile *file : inputFiles) {
       if (auto *objFile = dyn_cast<ObjFile>(file)) {
         for (Symbol *sym : objFile->symbols) {
@@ -1635,10 +1660,10 @@ void SymtabSection::finalizeContents() {
 
   // __dyld_private is a local symbol too. It's linker-created and doesn't
   // exist in any object file.
-  if (in.stubHelper && in.stubHelper->dyldPrivate)
+  if (includeLocals && in.stubHelper && in.stubHelper->dyldPrivate)
     localSymbolsHandler(in.stubHelper->dyldPrivate);
 
-  for (Symbol *sym : symtab->getSymbols()) {
+  for (Symbol *sym : syms) {
     if (!sym->isLive())
       continue;
     if (auto *defined = dyn_cast<Defined>(sym)) {
@@ -1654,6 +1679,22 @@ void SymtabSection::finalizeContents() {
         addSymbol(undefinedSymbols, sym);
     }
   }
+}
+
+void SymtabSection::prepare(ArrayRef<Symbol *> syms) {
+  collectSymbols(syms, /*includeLocals=*/true);
+  numPreparedSymbols = syms.size();
+  prepared = true;
+}
+
+void SymtabSection::finalizeContents() {
+  if (!prepared)
+    prepare(symtab->getSymbols());
+  // Symbols appended after prepare() (branch-range extension thunks) are
+  // collected last, so their strings are interned in the same order as in a
+  // single walk.
+  collectSymbols(symtab->getSymbols().drop_front(numPreparedSymbols),
+                 /*includeLocals=*/false);
 
   emitStabs();
   uint32_t symtabIndex = stabs.size();

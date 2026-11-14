@@ -1418,7 +1418,23 @@ template <class LP> void Writer::run() {
   // the ordinary __TEXT,_text InputSections.
   sortSegmentsAndSections();
   createLoadCommands<LP>();
-  finalizeAddresses();
+  {
+    // These __LINKEDIT sections do most of their work without addresses, so
+    // start it now and overlap it with address assignment. The only symbols
+    // created in between are branch-range extension thunks. They are appended
+    // to the symbol table, which can reallocate it, so the tasks walk a copy.
+    // Thunks are private extern, so only the symbol table adds them later.
+    std::vector<Symbol *> syms;
+    parallel::TaskGroup tg;
+    if (tg.isParallel()) {
+      syms.assign(symtab->getSymbols().begin(), symtab->getSymbols().end());
+      tg.spawn([&] { symtabSection->prepare(syms); });
+      tg.spawn([&] { in.exports->prepare(syms); });
+      if (functionStartsSection)
+        tg.spawn([&] { functionStartsSection->prepare(); });
+    }
+    finalizeAddresses();
+  }
 
   llvm::thread mapFileWriter([&] {
     if (LLVM_ENABLE_THREADS && config->timeTraceEnabled)

@@ -427,6 +427,8 @@ private:
 class ExportSection final : public LinkEditSection {
 public:
   ExportSection();
+  // Selects the exported symbols and builds the trie without reading addresses.
+  void prepare(ArrayRef<Symbol *> syms);
   void finalizeContents() override;
   uint64_t getRawSize() const override { return size; }
   bool isNeeded() const override { return size; }
@@ -437,6 +439,7 @@ public:
 private:
   TrieBuilder trieBuilder;
   size_t size = 0;
+  bool prepared = false;
 };
 
 // Stores 'data in code' entries that describe the locations of data regions
@@ -459,12 +462,16 @@ private:
 class FunctionStartsSection final : public LinkEditSection {
 public:
   FunctionStartsSection();
+  // Collects the function-start symbols without reading their addresses.
+  void prepare();
   void finalizeContents() override;
   uint64_t getRawSize() const override { return contents.size(); }
   void writeTo(uint8_t *buf) const override;
 
 private:
   SmallVector<char, 128> contents;
+  std::vector<const Defined *> starts;
+  bool prepared = false;
 };
 
 // Stores the strings referenced by the symbol table.
@@ -509,6 +516,8 @@ struct StabsEntry {
 // range (start index and total number) of those symbols in the symbol table.
 class SymtabSection : public LinkEditSection {
 public:
+  // Collects the entries and interns their names without reading addresses.
+  void prepare(ArrayRef<Symbol *> syms);
   void finalizeContents() override;
   uint32_t getNumSymbols() const;
   uint32_t getNumLocalSymbols() const {
@@ -524,6 +533,10 @@ private:
   void emitEndFunStab(Defined *);
   Defined *getFuncBodySym(Defined *);
   void emitStabs();
+  void collectSymbols(ArrayRef<Symbol *> syms, bool includeLocals);
+
+  size_t numPreparedSymbols = 0;
+  bool prepared = false;
 
 protected:
   SymtabSection(StringTableSection &);
