@@ -57,11 +57,12 @@ struct Edge {
 };
 
 struct ExportInfo {
-  uint64_t address;
+  const Symbol *sym;
+  // Filled in by TrieBuilder::assignOffsets(), once addresses are final.
+  uint64_t address = 0;
   uint64_t ordinal = 0;
   uint8_t flags = 0;
-  ExportInfo(const Symbol &sym, uint64_t imageBase)
-      : address(sym.getVA() - imageBase) {
+  explicit ExportInfo(const Symbol &sym) : sym(&sym) {
     using namespace llvm::MachO;
     if (sym.isWeakDef())
       flags |= EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION;
@@ -235,7 +236,7 @@ tailcall:
       node->edges.emplace_back(suffix, newNode);
       node = newNode;
     }
-    node->info = ExportInfo(*sym, imageBase);
+    node->info = ExportInfo(*sym);
     return;
   }
 
@@ -271,7 +272,7 @@ tailcall:
 
   if (isTerminal) {
     assert(j - i == 1); // no duplicate symbols
-    node->info = ExportInfo(*pivotSymbol, imageBase);
+    node->info = ExportInfo(*pivotSymbol);
   } else {
     // This is the tail-call-optimized version of the following:
     // sortAndBuild(vec.slice(i, j - i), node, lastPos, pos + 1);
@@ -296,12 +297,18 @@ tailcall:
   }
 }
 
-size_t TrieBuilder::build() {
+void TrieBuilder::buildNodes() {
   if (exported.empty())
-    return 0;
-
+    return;
   TrieNode *root = makeNode();
   sortAndBuild(exported, root, 0, 0);
+}
+
+size_t TrieBuilder::assignOffsets(uint64_t imageBase) {
+  for (TrieNode *node : nodes)
+    if (node->info &&
+        !(node->info->flags & MachO::EXPORT_SYMBOL_FLAGS_REEXPORT))
+      node->info->address = node->info->sym->getVA() - imageBase;
 
   // Assign each node in the vector an offset in the trie stream, iterating
   // until all uleb128 sizes have stabilized.
