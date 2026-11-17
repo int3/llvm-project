@@ -34,6 +34,8 @@
 #include "llvm/Support/xxhash.h"
 
 #include <algorithm>
+#include <atomic>
+#include <deque>
 
 using namespace llvm;
 using namespace llvm::MachO;
@@ -43,6 +45,57 @@ using namespace lld::macho;
 
 namespace {
 class LCUuid;
+
+// A task that runs once all the tasks it depends on are done. Whichever thread
+// finishes the last of them spawns it, so no thread blocks waiting for another.
+class DependentTask {
+public:
+  DependentTask(parallel::TaskGroup &tg, StringRef name, StringRef detail,
+                std::function<void()> fn)
+      : tg(tg), name(name), detail(detail), fn(std::move(fn)) {}
+
+  // Must not be called once any task in the graph has started.
+  void dependsOn(DependentTask &task) {
+    ++numPending;
+    task.dependents.push_back(this);
+  }
+
+  void start() { dependencyDone(); }
+
+private:
+  void dependencyDone() {
+    if (numPending.fetch_sub(1, std::memory_order_acq_rel) == 1)
+      tg.spawn([this] { run(); });
+  }
+
+  void run();
+
+  parallel::TaskGroup &tg;
+  StringRef name;
+  StringRef detail;
+  std::function<void()> fn;
+  std::vector<DependentTask *> dependents;
+  // One per dependency, plus one that start() releases.
+  std::atomic<unsigned> numPending = 1;
+};
+
+void DependentTask::run() {
+  // Pool workers have no time-trace profiler. A worker that already has one is
+  // running this task inside another, while that one waits on a nested
+  // TaskGroup.
+  bool ownProfiler =
+      config->timeTraceEnabled && !getTimeTraceProfilerInstance();
+  if (ownProfiler)
+    timeTraceProfilerInitialize(config->timeTraceGranularity, name);
+  {
+    TimeTraceScope timeScope(name, detail);
+    fn();
+  }
+  if (ownProfiler)
+    timeTraceProfilerFinishThread();
+  for (DependentTask *task : dependents)
+    task->dependencyDone();
+}
 
 class Writer {
 public:
@@ -1160,7 +1213,6 @@ template <class LP> void Writer::createOutputSections() {
 }
 
 void Writer::finalizeAddresses() {
-  TimeTraceScope timeScope("Finalize addresses");
   uint64_t pageSize = target->getPageSize();
 
   // We could parallelize this loop, but local benchmarking indicates it is
@@ -1203,21 +1255,6 @@ void Writer::finalizeAddresses() {
 
 void Writer::finalizeLinkEditSegment() {
   TimeTraceScope timeScope("Finalize __LINKEDIT segment");
-  // Fill __LINKEDIT contents.
-  std::array<LinkEditSection *, 10> linkEditSections{
-      in.rebase,         in.binding,
-      in.weakBinding,    in.lazyBinding,
-      in.exports,        in.chainedFixups,
-      symtabSection,     indirectSymtabSection,
-      dataInCodeSection, functionStartsSection,
-  };
-
-  parallelForEach(linkEditSections.begin(), linkEditSections.end(),
-                  [](LinkEditSection *osec) {
-                    if (osec)
-                      osec->finalizeContents();
-                  });
-
   // Now that __LINKEDIT is filled out, do a proper calculation of its
   // addresses and offsets.
   linkEditSegment->addr = addr;
@@ -1419,15 +1456,60 @@ template <class LP> void Writer::run() {
   // the ordinary __TEXT,_text InputSections.
   sortSegmentsAndSections();
   createLoadCommands<LP>();
-  finalizeAddresses();
+  llvm::thread mapFileWriter;
+  {
+    // Each __LINKEDIT section's finalizeContents() waits only for the final
+    // addresses and its own section's prepare(), which reads no addresses and
+    // so overlaps address assignment. prepare() can read the symbol table
+    // meanwhile because address assignment adds no symbols to it: the
+    // branch-range extension thunks it creates are kept out of it.
+    std::deque<DependentTask> tasks;
+    parallel::TaskGroup tg;
+    auto addTask = [&](StringRef name, StringRef detail,
+                       std::function<void()> fn) -> DependentTask & {
+      return tasks.emplace_back(tg, name, detail, std::move(fn));
+    };
 
-  llvm::thread mapFileWriter([&] {
-    if (LLVM_ENABLE_THREADS && config->timeTraceEnabled)
-      timeTraceProfilerInitialize(config->timeTraceGranularity, "writeMapFile");
-    writeMapFile();
-    if (LLVM_ENABLE_THREADS && config->timeTraceEnabled)
-      timeTraceProfilerFinishThread();
-  });
+    DependentTask &addresses =
+        addTask("Finalize addresses", "", [&] { finalizeAddresses(); });
+    addTask("Start map file writer", "", [&] {
+      mapFileWriter = llvm::thread([&] {
+        if (LLVM_ENABLE_THREADS && config->timeTraceEnabled)
+          timeTraceProfilerInitialize(config->timeTraceGranularity,
+                                      "writeMapFile");
+        writeMapFile();
+        if (LLVM_ENABLE_THREADS && config->timeTraceEnabled)
+          timeTraceProfilerFinishThread();
+      });
+    }).dependsOn(addresses);
+
+    auto addLinkEditTasks = [&](LinkEditSection *osec,
+                                std::function<void()> prepare = nullptr) {
+      if (!osec)
+        return;
+      DependentTask &finalize =
+          addTask("Finalize __LINKEDIT section", osec->name,
+                  [osec] { osec->finalizeContents(); });
+      finalize.dependsOn(addresses);
+      if (prepare)
+        finalize.dependsOn(
+            addTask("Prepare __LINKEDIT section", osec->name, prepare));
+    };
+    addLinkEditTasks(in.rebase);
+    addLinkEditTasks(in.binding);
+    addLinkEditTasks(in.weakBinding);
+    addLinkEditTasks(in.lazyBinding);
+    addLinkEditTasks(in.exports, [&] { in.exports->prepare(); });
+    addLinkEditTasks(in.chainedFixups);
+    addLinkEditTasks(symtabSection, [&] { symtabSection->prepare(); });
+    addLinkEditTasks(indirectSymtabSection);
+    addLinkEditTasks(dataInCodeSection);
+    addLinkEditTasks(functionStartsSection,
+                     [&] { functionStartsSection->prepare(); });
+
+    for (DependentTask &task : tasks)
+      task.start();
+  }
 
   finalizeLinkEditSegment();
   writeOutputFile();
