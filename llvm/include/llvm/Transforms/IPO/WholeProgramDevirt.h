@@ -280,7 +280,7 @@ LLVM_ABI void getVisibleToRegularObjVtableGUIDs(
 /// in case it is exported by cross module importing (in which case the
 /// devirtualized target name will need adjustment).
 LLVM_ABI void runWholeProgramDevirtOnIndex(
-    ModuleSummaryIndex &Summary, std::set<GlobalValue::GUID> &ExportedGUIDs,
+    ModuleSummaryIndex &Summary, DenseSet<GlobalValue::GUID> &ExportedGUIDs,
     std::map<ValueInfo, std::vector<VTableSlotSummary>> &LocalWPDTargetsMap,
     DenseSet<StringRef> *ExternallyVisibleSymbolNamesPtr,
     const LLVMContext *Ctx);

@@ -1084,7 +1084,7 @@ void ThinLTOCodeGenerator::run() {
   // no index entries in the typeIdMetadata map (e.g. if we are instead
   // performing IR-based WPD in hybrid regular/thin LTO mode).
   std::map<ValueInfo, std::vector<VTableSlotSummary>> LocalWPDTargetsMap;
-  std::set<GlobalValue::GUID> ExportedGUIDs;
+  DenseSet<GlobalValue::GUID> ExportedGUIDs;
   runWholeProgramDevirtOnIndex(*Index, ExportedGUIDs, LocalWPDTargetsMap,
                                nullptr, nullptr);
   GUIDPreservedSymbols.insert_range(ExportedGUIDs);
