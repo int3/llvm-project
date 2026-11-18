@@ -10,6 +10,16 @@
 # RUN: llvm-objdump --macho --section="__TEXT,__literals" --section="__DATA,ptrs" --syms %t/test | FileCheck %s
 # RUN: llvm-readobj --section-headers %t/test | FileCheck %s --check-prefix=HEADER
 
+## The input bytes can be unaligned even though each literal has a word size.
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/unaligned.s -o %t/unaligned.o
+# RUN: %lld -dylib %t/unaligned.o -o %t/unaligned
+# RUN: llvm-objdump --macho --section="__TEXT,__literals" %t/unaligned | FileCheck %s --check-prefix=UNALIGNED
+
+# UNALIGNED:      Contents of (__TEXT,__literals) section
+# UNALIGNED-NEXT: {{[0-9a-f]+}} 00 11 22 33 44 55 66 77 88 99 aa bb cc dd ee ff
+# UNALIGNED-NEXT: {{[0-9a-f]+}} 88 77 66 55 44 33 22 11 ef be ad de
+# UNALIGNED-NOT:  {{[0-9a-f]+}}
+
 # CHECK:      Contents of (__TEXT,__literals) section
 # CHECK-NEXT: [[#%.16x,DEADBEEF16:]] ef be ad de ef be ad de ef be ad de ef be ad de
 # CHECK-NEXT: [[#%.16x,FEEDFACE16:]] ce fa ed fe ce fa ed fe ce fa ed fe ce fa ed fe
@@ -112,3 +122,16 @@ _qux8:
 _qux16:
   .quad 0xdeadbeefdeadbeef
   .quad 0xdeadbeefdeadbeef
+
+#--- unaligned.s
+.text
+.byte 0
+.section __TEXT,__literal4,4byte_literals
+.long 0xdeadbeef
+.long 0xdeadbeef
+.section __TEXT,__literal8,8byte_literals
+.quad 0x1122334455667788
+.quad 0x1122334455667788
+.section __TEXT,__literal16,16byte_literals
+.quad 0x7766554433221100, 0xffeeddccbbaa9988
+.quad 0x7766554433221100, 0xffeeddccbbaa9988
