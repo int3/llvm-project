@@ -237,11 +237,24 @@ Symbol *SymbolTable::addUndefined(StringRef name, InputFile *file,
   if (wasInserted)
     replaceSymbol<Undefined>(s, name, file, refState,
                              /*wasBitcodeSymbol=*/false);
-  else if (auto *lazy = dyn_cast<LazyArchive>(s))
-    lazy->fetchArchiveMember();
-  else if (isa<LazyObject>(s))
-    extract(*s->getFile(), s->getName());
-  else if (auto *dynsym = dyn_cast<DylibSymbol>(s))
+  else if (s->isLazy()) {
+    if (auto *lazy = dyn_cast<LazyArchive>(s))
+      lazy->fetchArchiveMember();
+    else
+      extract(*s->getFile(), s->getName());
+
+    // Archive indexes and lazy objects can advertise labels that become local
+    // when their sections are parsed, leaving the global symbol undefined.
+    if (s->isLazy())
+      replaceSymbol<Undefined>(s, name, file, refState,
+                               /*wasBitcodeSymbol=*/false);
+    else if (auto *undefined = dyn_cast<Undefined>(s))
+      // Recursive extraction can create Undefined from a later, weaker
+      // reference before this outer reference returns.
+      replaceSymbol<Undefined>(s, name, file,
+                               std::max(undefined->refState, refState),
+                               undefined->wasBitcodeSymbol);
+  } else if (auto *dynsym = dyn_cast<DylibSymbol>(s))
     dynsym->reference(refState);
   else if (auto *undefined = dyn_cast<Undefined>(s))
     undefined->refState = std::max(undefined->refState, refState);
