@@ -1850,6 +1850,7 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     thunkMap.clear();
     unprocessedLCLinkerOptions.clear();
     ObjCSelRefsHelper::cleanup();
+    priorityBuilder.reset();
 
     firstTLVDataSection = nullptr;
     tar = nullptr;
