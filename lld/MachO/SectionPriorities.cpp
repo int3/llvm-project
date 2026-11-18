@@ -40,6 +40,12 @@ using namespace lld::macho;
 
 PriorityBuilder macho::priorityBuilder;
 
+void PriorityBuilder::reset() {
+  priorities.clear();
+  cStringPriorities.clear();
+  callGraphProfile.clear();
+}
+
 namespace {
 struct Edge {
   int from;

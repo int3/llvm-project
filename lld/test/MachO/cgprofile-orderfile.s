@@ -3,9 +3,9 @@
 # RUN: rm -rf %t; split-file %s %t
 # RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/test.s -o %t/test.o
 
-# RUN: %lld -e A %t/test.o -order_file %t/order_file -o %t/test 
+# RUN: env LLD_IN_TEST=2 %lld -e A %t/test.o -order_file %t/order_file -o %t/test
 # RUN: llvm-nm --numeric-sort %t/test | FileCheck %s
-# RUN: %lld -e A %t/test.o -o %t/test 
+# RUN: env LLD_IN_TEST=2 %lld -e A %t/test.o -o %t/test
 # RUN: llvm-nm --numeric-sort %t/test | FileCheck %s --check-prefix NO-ORDER
 
 

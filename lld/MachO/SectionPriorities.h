@@ -19,6 +19,9 @@ using SectionPair = std::pair<const InputSection *, const InputSection *>;
 
 class PriorityBuilder {
 public:
+  // Release references to the current link before its context is destroyed.
+  void reset();
+
   // Reads every input section's call graph profile, and combines them into
   // callGraphProfile. If an order file is present, any edges where one or both
   // of the vertices are specified in the order file are discarded.
