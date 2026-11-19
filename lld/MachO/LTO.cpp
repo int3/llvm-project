@@ -22,7 +22,9 @@
 #include "llvm/LTO/LTO.h"
 #include "llvm/Support/Caching.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Parallel.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/Process.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace lld;
@@ -226,10 +228,17 @@ std::vector<ObjFile *> BitcodeCompiler::compile() {
   // to cache native object files for ThinLTO incremental builds. If a path was
   // specified, configure LTO to use it as the cache directory.
   FileCache cache;
+  size_t pageSize = sys::Process::getPageSizeEstimate();
   if (!config->thinLTOCacheDir.empty())
     cache = check(localCache("ThinLTO", "Thin", config->thinLTOCacheDir,
                              [&](size_t task, const Twine &moduleName,
                                  std::unique_ptr<MemoryBuffer> mb) {
+                               // Page cached objects in here so serial ObjFile
+                               // parsing does not wait for each page fault.
+                               for (size_t off = 0; off < mb->getBufferSize();
+                                    off += pageSize)
+                                 (void)*static_cast<const volatile char *>(
+                                     mb->getBufferStart() + off);
                                files[task] = std::move(mb);
                              }));
 
@@ -296,36 +305,59 @@ std::vector<ObjFile *> BitcodeCompiler::compile() {
     check(
         pruneCache(config->thinLTOCacheDir, config->thinLTOCachePolicy, files));
 
-  std::vector<ObjFile *> ret;
+  struct NativeObject {
+    unsigned task;
+    StringRef contents;
+    std::optional<StringRef> cachePath;
+    StringRef path;
+    uint32_t modTime = 0;
+  };
+  std::vector<NativeObject> objs;
   for (unsigned i = 0; i < maxTasks; ++i) {
     // Get the native object contents either from the cache or from memory.  Do
     // not use the cached MemoryBuffer directly to ensure dsymutil does not
     // race with the cache pruner.
-    StringRef objBuf;
-    std::optional<StringRef> cachePath;
+    NativeObject obj;
+    obj.task = i;
     if (files[i]) {
-      objBuf = files[i]->getBuffer();
-      cachePath = files[i]->getBufferIdentifier();
+      obj.contents = files[i]->getBuffer();
+      obj.cachePath = files[i]->getBufferIdentifier();
     } else {
-      objBuf = buf[i];
+      obj.contents = buf[i];
     }
-    if (objBuf.empty())
+    if (obj.contents.empty())
       continue;
+    obj.path = saver().save(outputFilePath(i).str());
+    objs.push_back(obj);
+  }
 
-    // FIXME: should `saveTemps` and `ltoObjPath` use the same file name?
-    if (config->saveTemps)
-      saveBuffer(objBuf,
-                 config->outputFile + ((i == 0) ? "" : Twine(i)) + ".lto.o");
+  // Concurrent hardlinks contend in the kernel; limit the number of workers
+  // to avoid spending more time in kernel synchronization.
+  std::atomic<size_t> next = 0;
+  {
+    parallel::TaskGroup tg;
+    for (int t = 0; t < 4; ++t)
+      tg.spawn([&] {
+        for (size_t n = next++; n < objs.size(); n = next++) {
+          NativeObject &obj = objs[n];
+          // FIXME: should `saveTemps` and `ltoObjPath` use the same file name?
+          if (config->saveTemps)
+            saveBuffer(obj.contents,
+                       config->outputFile +
+                           ((obj.task == 0) ? "" : Twine(obj.task)) + ".lto.o");
+          if (!config->ltoObjPath.empty())
+            obj.modTime =
+                saveOrHardlinkBuffer(obj.contents, obj.path, obj.cachePath);
+        }
+      });
+  }
 
-    StringRef filePath = saver().save(outputFilePath(i).str());
-    uint32_t modTime = 0;
-    if (!config->ltoObjPath.empty())
-      modTime = saveOrHardlinkBuffer(objBuf, filePath, cachePath);
-    ret.push_back(make<ObjFile>(MemoryBufferRef(objBuf, filePath), modTime,
-                                /*archiveName=*/"", /*lazy=*/false,
+  std::vector<ObjFile *> ret;
+  for (const NativeObject &obj : objs)
+    ret.push_back(make<ObjFile>(MemoryBufferRef(obj.contents, obj.path),
+                                obj.modTime, /*archiveName=*/"", /*lazy=*/false,
                                 /*forceHidden=*/false, /*compatArch=*/true,
                                 /*builtFromBitcode=*/true));
-  }
 
   return ret;
 }
