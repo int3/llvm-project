@@ -918,6 +918,14 @@ template <> struct MappingTraits<const InterfaceFile *> {
             File->addReexportedLibrary(Lib, Target);
       }
 
+      size_t SymbolCount = 0;
+      for (const auto *Sections : {&Exports, &Reexports, &Undefineds})
+        for (const auto &Section : *Sections)
+          SymbolCount += Section.Symbols.size() + Section.Classes.size() +
+                         2 * Section.ClassEHs.size() + Section.Ivars.size() +
+                         Section.WeakSymbols.size() + Section.TlvSymbols.size();
+      File->reserveSymbols(SymbolCount);
+
       auto handleSymbols = [File](const SectionList &CurrentSections,
                                   SymbolFlags InputFlag = SymbolFlags::None) {
         // For older file formats, the segment where the symbol

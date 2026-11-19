@@ -89,6 +89,7 @@ public:
   LLVM_ABI Symbol *addGlobal(EncodeKind Kind, StringRef Name, SymbolFlags Flags,
                              const Target &Targ);
   size_t size() const { return Symbols.size(); }
+  void reserve(size_t Count) { Symbols.reserve(Count); }
 
   template <typename RangeT, typename ElT = std::remove_reference_t<
                                  decltype(*std::begin(std::declval<RangeT>()))>>
