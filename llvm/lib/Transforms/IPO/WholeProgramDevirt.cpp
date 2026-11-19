@@ -708,7 +708,7 @@ struct DevirtIndex {
   ModuleSummaryIndex &ExportSummary;
   // The set in which to record GUIDs exported from their module by
   // devirtualization, used by client to ensure they are not internalized.
-  std::set<GlobalValue::GUID> &ExportedGUIDs;
+  DenseSet<GlobalValue::GUID> &ExportedGUIDs;
   // A map in which to record the information necessary to locate the WPD
   // resolution for local targets in case they are exported by cross module
   // importing.
@@ -729,7 +729,7 @@ struct DevirtIndex {
 
   DevirtIndex(
       ModuleSummaryIndex &ExportSummary,
-      std::set<GlobalValue::GUID> &ExportedGUIDs,
+      DenseSet<GlobalValue::GUID> &ExportedGUIDs,
       std::map<ValueInfo, std::vector<VTableSlotSummary>> &LocalWPDTargetsMap,
       DenseSet<StringRef> *ExternallyVisibleSymbolNamesPtr)
       : ExportSummary(ExportSummary), ExportedGUIDs(ExportedGUIDs),
@@ -935,7 +935,7 @@ void llvm::updateVCallVisibilityInIndex(
 }
 
 void llvm::runWholeProgramDevirtOnIndex(
-    ModuleSummaryIndex &Summary, std::set<GlobalValue::GUID> &ExportedGUIDs,
+    ModuleSummaryIndex &Summary, DenseSet<GlobalValue::GUID> &ExportedGUIDs,
     std::map<ValueInfo, std::vector<VTableSlotSummary>> &LocalWPDTargetsMap,
     DenseSet<StringRef> *ExternallyVisibleSymbolNamesPtr,
     const LLVMContext *Ctx) {

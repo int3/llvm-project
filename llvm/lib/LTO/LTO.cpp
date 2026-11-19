@@ -2139,7 +2139,7 @@ Error LTO::runThinLTO(AddStreamFn AddStream, FileCache Cache,
   if (DumpThinCGSCCs)
     ThinLTO.CombinedIndex.dumpSCCs(outs());
 
-  std::set<GlobalValue::GUID> ExportedGUIDs;
+  DenseSet<GlobalValue::GUID> ExportedGUIDs;
 
   bool WholeProgramVisibilityEnabledInLTO =
       Conf.HasWholeProgramVisibility &&
