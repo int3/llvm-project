@@ -331,6 +331,14 @@ extern llvm::DenseMap<llvm::CachedHashStringRef, MemoryBufferRef> cachedReads;
 extern llvm::SmallVector<StringRef> unprocessedLCLinkerOptions;
 
 std::optional<MemoryBufferRef> readFile(StringRef path);
+void startInputReadAhead(ArrayRef<StringRef> paths);
+void stopInputReadAhead();
+struct InputReadAheadArchive {
+  std::unique_ptr<llvm::object::Archive> archive;
+  std::optional<std::vector<llvm::object::Archive::Child>> objcFiles;
+};
+std::optional<InputReadAheadArchive>
+takeInputReadAheadArchive(StringRef path, MemoryBufferRef buffer);
 
 void parseDeferredRelocations();
 

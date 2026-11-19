@@ -34,6 +34,7 @@
 #include "lld/Common/Version.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/BinaryFormat/MachO.h"
@@ -56,10 +57,6 @@
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TextAPI/Architecture.h"
 #include "llvm/TextAPI/PackedVersion.h"
-
-#if !_WIN32
-#include <sys/mman.h>
-#endif
 
 using namespace llvm;
 using namespace llvm::MachO;
@@ -279,136 +276,9 @@ static void saveThinArchiveToRepro(ArchiveFile const *file) {
           ": Archive::children failed: " + toString(std::move(e)));
 }
 
-struct DeferredFile {
-  StringRef path;
-  bool isLazy;
-  MemoryBufferRef buffer;
-  LoadType loadType = LoadType::CommandLine;
-  bool isNeeded = false;
-  bool isWeak = false;
-  bool isReexport = false;
-  bool isHidden = false;
-  bool isExplicit = true;
-};
-using DeferredFiles = std::vector<DeferredFile>;
-
-#if LLVM_ENABLE_THREADS
-class SerialBackgroundWorkQueue {
-  std::deque<std::function<void()>> queue;
-  std::thread *running;
-  std::mutex mutex;
-
-public:
-  std::atomic_bool stopAllWork = false;
-  void queueWork(std::function<void()> work) {
-    mutex.lock();
-    if (running && queue.empty()) {
-      mutex.unlock();
-      running->join();
-      mutex.lock();
-      delete running;
-      running = nullptr;
-    }
-
-    if (work) {
-      queue.emplace_back(std::move(work));
-      if (!running)
-        running = new std::thread([&]() {
-          while (!stopAllWork) {
-            mutex.lock();
-            if (queue.empty()) {
-              mutex.unlock();
-              break;
-            }
-            auto work = std::move(queue.front());
-            mutex.unlock();
-            work();
-            mutex.lock();
-            queue.pop_front();
-            mutex.unlock();
-          }
-        });
-    }
-    mutex.unlock();
-  }
-};
-
-static SerialBackgroundWorkQueue pageInQueue;
-
-// Most input files have been mapped but not yet paged in.
-// This code forces the page-ins on multiple threads so
-// the process is not stalled waiting on disk buffer i/o.
-void multiThreadedPageInBackground(DeferredFiles &deferred) {
-  static const size_t pageSize = Process::getPageSizeEstimate();
-  static const size_t largeArchive = 10 * 1024 * 1024;
-#ifndef NDEBUG
-  using namespace std::chrono;
-  static std::atomic_uint64_t totalBytes = 0;
-  std::atomic_int numDeferedFilesAdvised = 0;
-  auto t0 = high_resolution_clock::now();
-#endif
-
-  auto preloadDeferredFile = [&](const DeferredFile &deferredFile) {
-    const StringRef &buff = deferredFile.buffer.getBuffer();
-    if (buff.size() > largeArchive)
-      return;
-
-#ifndef NDEBUG
-    totalBytes += buff.size();
-    numDeferedFilesAdvised += 1;
-#endif
-#if _WIN32
-    // Reference all file's mmap'd pages to load them into memory.
-    for (const char *page = buff.data(), *end = page + buff.size();
-         page < end && !pageInQueue.stopAllWork; page += pageSize) {
-      [[maybe_unused]] volatile char t = *page;
-      (void)t;
-    }
-#else
-#define DEBUG_TYPE "lld-madvise"
-    auto aligned =
-        llvm::alignDown(reinterpret_cast<uintptr_t>(buff.data()), pageSize);
-    if (madvise((void *)aligned, buff.size(), MADV_WILLNEED) < 0)
-      LLVM_DEBUG(llvm::dbgs() << "madvise error: " << strerror(errno) << "\n");
-#undef DEBUG_TYPE
-#endif
-  };
-
-  { // Create scope for waiting for the taskGroup
-    std::atomic_size_t index = 0;
-    llvm::parallel::TaskGroup taskGroup;
-    for (int w = 0; w < config->readWorkers; w++)
-      taskGroup.spawn([&index, &preloadDeferredFile, &deferred]() {
-        while (!pageInQueue.stopAllWork) {
-          size_t localIndex = index.fetch_add(1);
-          if (localIndex >= deferred.size())
-            break;
-          preloadDeferredFile(deferred[localIndex]);
-        }
-      });
-  }
-
-#ifndef NDEBUG
-  auto dt = high_resolution_clock::now() - t0;
-  if (Process::GetEnv("LLD_MULTI_THREAD_PAGE"))
-    llvm::dbgs() << "multiThreadedPageIn " << totalBytes << "/"
-                 << numDeferedFilesAdvised << "/" << deferred.size() << "/"
-                 << duration_cast<milliseconds>(dt).count() / 1000. << "\n";
-#endif
-}
-
-static void multiThreadedPageIn(const DeferredFiles &deferred) {
-  pageInQueue.queueWork([=]() {
-    DeferredFiles files = deferred;
-    multiThreadedPageInBackground(files);
-  });
-}
-#endif
-
 static InputFile *processFile(std::optional<MemoryBufferRef> buffer,
-                              DeferredFiles *archiveContents, StringRef path,
-                              LoadType loadType, bool isLazy = false,
-                              bool isExplicit = true,
+                              StringRef path, LoadType loadType,
+                              bool isLazy = false, bool isExplicit = true,
                               bool isBundleLoader = false,
                               bool isForceHidden = false) {
   if (!buffer)
@@ -429,10 +299,14 @@ static InputFile *processFile(std::optional<MemoryBufferRef> buffer,
     auto entry = loadedArchives.find(path);
 
     ArchiveFile *file;
+    std::optional<InputReadAheadArchive> prepared;
     if (entry == loadedArchives.end()) {
       // No cached archive, we need to create a new one
-      std::unique_ptr<object::Archive> archive = CHECK(
-          object::Archive::create(mbref), path + ": failed to parse archive");
+      prepared = takeInputReadAheadArchive(path, mbref);
+      std::unique_ptr<object::Archive> archive =
+          prepared ? std::move(prepared->archive)
+                   : CHECK(object::Archive::create(mbref),
+                           path + ": failed to parse archive");
 
       file = make<ArchiveFile>(std::move(archive), isForceHidden);
 
@@ -488,7 +362,12 @@ static InputFile *processFile(std::optional<MemoryBufferRef> buffer,
 
       // TODO: no need to look for ObjC sections for a given archive member if
       // we already found that it contains an ObjC symbol.
-      if (readFile(path)) {
+      if (prepared && prepared->objcFiles) {
+        for (const object::Archive::Child &child : *prepared->objcFiles)
+          if (Error e = file->fetch(child, "-ObjC"))
+            error(toString(file) + ": -ObjC failed to load archive member: " +
+                  toString(std::move(e)));
+      } else if (readFile(path)) {
         Error e = Error::success();
         for (const object::Archive::Child &c : file->getArchive().children(e)) {
           Expected<MemoryBufferRef> mb = c.getMemoryBufferRef();
@@ -503,8 +382,6 @@ static InputFile *processFile(std::optional<MemoryBufferRef> buffer,
             continue;
           }
 
-          if (config->readWorkers && archiveContents)
-            archiveContents->push_back({path, isLazy, *mb});
           if (!hasObjCSection(*mb))
             continue;
           if (Error e = file->fetch(c, "-ObjC"))
@@ -516,8 +393,7 @@ static InputFile *processFile(std::optional<MemoryBufferRef> buffer,
                 ": Archive::children failed: " + toString(std::move(e)));
       }
     }
-    if (!archiveContents)
-      file->addLazySymbols();
+    file->addLazySymbols();
     loadedArchives[path] = ArchiveFileInfo{file, isCommandLineLoad};
     newFile = file;
     break;
@@ -572,8 +448,8 @@ static InputFile *addFile(StringRef path, LoadType loadType,
                           bool isLazy = false, bool isExplicit = true,
                           bool isBundleLoader = false,
                           bool isForceHidden = false) {
-  return processFile(readFile(path), nullptr, path, loadType, isLazy,
-                     isExplicit, isBundleLoader, isForceHidden);
+  return processFile(readFile(path), path, loadType, isLazy, isExplicit,
+                     isBundleLoader, isForceHidden);
 }
 
 static DenseSet<StringRef> loadedObjectFrameworks;
@@ -597,36 +473,29 @@ static void checkAndCacheFramework(InputFile *file, StringRef path) {
   }
 }
 
-static void deferFile(StringRef path, bool isLazy, DeferredFiles &deferred,
-                      LoadType loadType = LoadType::CommandLine,
-                      bool isNeeded = false, bool isWeak = false,
-                      bool isReexport = false, bool isHidden = false,
-                      bool isExplicit = true) {
+static void addFileWithMetadata(StringRef path, bool isLazy,
+                                LoadType loadType = LoadType::CommandLine,
+                                bool isNeeded = false, bool isWeak = false,
+                                bool isReexport = false, bool isHidden = false,
+                                bool isExplicit = true) {
   std::optional<MemoryBufferRef> buffer = readFile(path);
   if (!buffer)
     return;
-  if (config->readWorkers)
-    deferred.push_back({path, isLazy, *buffer, loadType, isNeeded, isWeak,
-                        isReexport, isHidden, isExplicit});
-  else {
-    if (loadedObjectFrameworks.contains(path))
-      return;
-
-    InputFile *file =
-        processFile(buffer, nullptr, path, loadType, isLazy, isExplicit,
-                    /*isBundleLoader=*/false, isHidden);
-    applyDylibMetadata(file, isNeeded, isWeak, isReexport);
-    checkAndCacheFramework(file, path);
-  }
+  if (loadedObjectFrameworks.contains(path))
+    return;
+  InputFile *file = processFile(buffer, path, loadType, isLazy, isExplicit,
+                                /*isBundleLoader=*/false, isHidden);
+  applyDylibMetadata(file, isNeeded, isWeak, isReexport);
+  checkAndCacheFramework(file, path);
 }
 
 static std::vector<StringRef> missingAutolinkWarnings;
 static void addLibrary(StringRef name, bool isNeeded, bool isWeak,
                        bool isReexport, bool isHidden, bool isExplicit,
-                       LoadType loadType, DeferredFiles &deferred) {
+                       LoadType loadType) {
   if (std::optional<StringRef> path = findLibrary(name)) {
-    deferFile(*path, /*isLazy=*/false, deferred, loadType, isNeeded, isWeak,
-              isReexport, isHidden, isExplicit);
+    addFileWithMetadata(*path, /*isLazy=*/false, loadType, isNeeded, isWeak,
+                        isReexport, isHidden, isExplicit);
     return;
   }
   if (loadType == LoadType::LCLinkerOption) {
@@ -638,14 +507,13 @@ static void addLibrary(StringRef name, bool isNeeded, bool isWeak,
 }
 
 static void addFramework(StringRef name, bool isNeeded, bool isWeak,
-                         bool isReexport, bool isExplicit, LoadType loadType,
-                         DeferredFiles &deferred) {
+                         bool isReexport, bool isExplicit, LoadType loadType) {
   if (std::optional<StringRef> path = findFramework(name)) {
     if (loadedObjectFrameworks.contains(*path))
       return;
 
-    deferFile(*path, /*isLazy=*/false, deferred, loadType, isNeeded, isWeak,
-              isReexport, /*isHidden=*/false, isExplicit);
+    addFileWithMetadata(*path, /*isLazy=*/false, loadType, isNeeded, isWeak,
+                        isReexport, /*isHidden=*/false, isExplicit);
     return;
   }
   if (loadType == LoadType::LCLinkerOption) {
@@ -695,7 +563,6 @@ void macho::resolveLCLinkerOptions() {
     SmallVector<StringRef> LCLinkerOptions(unprocessedLCLinkerOptions);
     unprocessedLCLinkerOptions.clear();
 
-    DeferredFiles deferred;
     SmallVector<StringRef> frameworks;
     SmallVector<StringRef> libraries;
 
@@ -724,37 +591,24 @@ void macho::resolveLCLinkerOptions() {
     for (const StringRef framework : frameworks) {
       addFramework(framework, /*isNeeded=*/false, /*isWeak=*/false,
                    /*isReexport=*/false, /*isExplicit=*/false,
-                   LoadType::LCLinkerOption, deferred);
+                   LoadType::LCLinkerOption);
     }
 
     for (const StringRef library : libraries) {
       addLibrary(library, /*isNeeded=*/false, /*isWeak=*/false,
                  /*isReexport=*/false, /*isHidden=*/false,
-                 /*isExplicit=*/false, LoadType::LCLinkerOption, deferred);
-    }
-
-    for (auto &file : deferred) {
-      if (loadedObjectFrameworks.contains(file.path))
-        continue;
-
-      auto inputFile = processFile(file.buffer, nullptr, file.path,
-                                   file.loadType, file.isLazy, file.isExplicit,
-                                   /*isBundleLoader=*/false, file.isHidden);
-      applyDylibMetadata(inputFile, file.isNeeded, file.isWeak,
-                         file.isReexport);
-      checkAndCacheFramework(inputFile, file.path);
+                 /*isExplicit=*/false, LoadType::LCLinkerOption);
     }
   }
 }
 
-static void addFileList(StringRef path, bool isLazy,
-                        DeferredFiles &deferredFiles) {
+static void addFileList(StringRef path, bool isLazy) {
   std::optional<MemoryBufferRef> buffer = readFile(path);
   if (!buffer)
     return;
   MemoryBufferRef mbref = *buffer;
   for (StringRef path : args::getLines(mbref))
-    deferFile(rerootPath(path), isLazy, deferredFiles);
+    addFileWithMetadata(rerootPath(path), isLazy);
 }
 
 // We expect sub-library names of the form "libfoo", which will match a dylib
@@ -1445,6 +1299,25 @@ static void handleSymbolPatterns(InputArgList &args,
     parseSymbolPatternsFile(arg, symbolPatterns);
 }
 
+static std::vector<StringRef> collectReadAheadPaths(const InputArgList &args) {
+  std::vector<StringRef> paths;
+  for (const Arg *arg : args) {
+    switch (arg->getOption().getID()) {
+    case OPT_INPUT:
+    case OPT_needed_library:
+    case OPT_reexport_library:
+    case OPT_weak_library:
+    case OPT_force_load:
+    case OPT_load_hidden:
+      paths.push_back(rerootPath(arg->getValue()));
+      break;
+    default:
+      break;
+    }
+  }
+  return paths;
+}
+
 static void createFiles(const InputArgList &args) {
   TimeTraceScope timeScope("Load input files");
   // This loop should be reserved for options whose exact ordering matters.
@@ -1452,7 +1325,10 @@ static void createFiles(const InputArgList &args) {
   bool isLazy = false;
   // If we've processed an opening --start-lib, without a matching --end-lib
   bool inLib = false;
-  DeferredFiles deferredFiles;
+  auto readAheadPaths = collectReadAheadPaths(args);
+  if (config->inputReadAhead)
+    startInputReadAhead(readAheadPaths);
+  auto stopReadAhead = llvm::scope_exit([] { stopInputReadAhead(); });
 
   for (const Arg *arg : args) {
     const Option &opt = arg->getOption();
@@ -1461,32 +1337,35 @@ static void createFiles(const InputArgList &args) {
 
     switch (opt.getID()) {
     case OPT_INPUT:
-      deferFile(rerootPath(arg->getValue()), isLazy, deferredFiles);
+      addFileWithMetadata(rerootPath(arg->getValue()), isLazy);
       break;
     case OPT_needed_library:
-      deferFile(rerootPath(arg->getValue()), /*isLazy=*/false, deferredFiles,
-                LoadType::CommandLine, /*isNeeded=*/true);
+      addFileWithMetadata(rerootPath(arg->getValue()), /*isLazy=*/false,
+                          LoadType::CommandLine, /*isNeeded=*/true);
       break;
     case OPT_reexport_library:
-      deferFile(rerootPath(arg->getValue()), /*isLazy=*/false, deferredFiles,
-                LoadType::CommandLine, /*isNeeded=*/false, /*isWeak=*/false,
-                /*isReexport=*/true);
+      addFileWithMetadata(rerootPath(arg->getValue()), /*isLazy=*/false,
+                          LoadType::CommandLine, /*isNeeded=*/false,
+                          /*isWeak=*/false,
+                          /*isReexport=*/true);
       break;
     case OPT_weak_library:
-      deferFile(rerootPath(arg->getValue()), /*isLazy=*/false, deferredFiles,
-                LoadType::CommandLine, /*isNeeded=*/false, /*isWeak=*/true);
+      addFileWithMetadata(rerootPath(arg->getValue()), /*isLazy=*/false,
+                          LoadType::CommandLine, /*isNeeded=*/false,
+                          /*isWeak=*/true);
       break;
     case OPT_filelist:
-      addFileList(arg->getValue(), isLazy, deferredFiles);
+      addFileList(arg->getValue(), isLazy);
       break;
     case OPT_force_load:
-      deferFile(rerootPath(arg->getValue()), /*isLazy=*/false, deferredFiles,
-                LoadType::CommandLineForce);
+      addFileWithMetadata(rerootPath(arg->getValue()), /*isLazy=*/false,
+                          LoadType::CommandLineForce);
       break;
     case OPT_load_hidden:
-      deferFile(rerootPath(arg->getValue()), /*isLazy=*/false, deferredFiles,
-                LoadType::CommandLine, /*isNeeded=*/false, /*isWeak=*/false,
-                /*isReexport=*/false, /*isHidden=*/true);
+      addFileWithMetadata(rerootPath(arg->getValue()), /*isLazy=*/false,
+                          LoadType::CommandLine, /*isNeeded=*/false,
+                          /*isWeak=*/false,
+                          /*isReexport=*/false, /*isHidden=*/true);
       break;
     case OPT_l:
     case OPT_needed_l:
@@ -1496,7 +1375,7 @@ static void createFiles(const InputArgList &args) {
       addLibrary(arg->getValue(), opt.getID() == OPT_needed_l,
                  opt.getID() == OPT_weak_l, opt.getID() == OPT_reexport_l,
                  opt.getID() == OPT_hidden_l,
-                 /*isExplicit=*/true, LoadType::CommandLine, deferredFiles);
+                 /*isExplicit=*/true, LoadType::CommandLine);
       break;
     case OPT_framework:
     case OPT_needed_framework:
@@ -1505,7 +1384,7 @@ static void createFiles(const InputArgList &args) {
       addFramework(arg->getValue(), opt.getID() == OPT_needed_framework,
                    opt.getID() == OPT_weak_framework,
                    opt.getID() == OPT_reexport_framework, /*isExplicit=*/true,
-                   LoadType::CommandLine, deferredFiles);
+                   LoadType::CommandLine);
       break;
     case OPT_start_lib:
       if (inLib)
@@ -1524,33 +1403,6 @@ static void createFiles(const InputArgList &args) {
       break;
     }
   }
-
-#if LLVM_ENABLE_THREADS
-  if (config->readWorkers) {
-    multiThreadedPageIn(deferredFiles);
-
-    DeferredFiles archiveContents;
-    for (auto &file : deferredFiles) {
-      if (loadedObjectFrameworks.contains(file.path))
-        continue;
-
-      auto inputFile = processFile(file.buffer, &archiveContents, file.path,
-                                   file.loadType, file.isLazy, file.isExplicit,
-                                   /*isBundleLoader=*/false, file.isHidden);
-      applyDylibMetadata(inputFile, file.isNeeded, file.isWeak,
-                         file.isReexport);
-      checkAndCacheFramework(inputFile, file.path);
-
-      if (ArchiveFile *archive = dyn_cast<ArchiveFile>(inputFile))
-        archive->addLazySymbols();
-    }
-
-    if (!archiveContents.empty())
-      multiThreadedPageIn(archiveContents);
-
-    pageInQueue.stopAllWork = true;
-  }
-#endif
 }
 
 static void gatherInputSections() {
@@ -1829,10 +1681,13 @@ static void computeColdness() {
 
 namespace lld {
 namespace macho {
+struct InputReadAheadContext : CommonLinkerContext {
+  ~InputReadAheadContext() override { stopInputReadAhead(); }
+};
 bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
           llvm::raw_ostream &stderrOS, bool exitEarly, bool disableOutput) {
   // This driver-specific context will be freed later by lldMain().
-  auto *ctx = new CommonLinkerContext;
+  auto *ctx = new InputReadAheadContext;
 
   ctx->e.initialize(stdoutOS, stderrOS, exitEarly, disableOutput);
   ctx->e.cleanupCallback = []() {
@@ -1983,7 +1838,7 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
       error(arg->getSpelling() +
             ": expected a non-negative integer, but got '" + arg->getValue() +
             "'");
-    config->readWorkers = workers;
+    config->inputReadAhead = workers != 0;
 #else
     warn(arg->getSpelling() +
          ": option unavailable because lld was not built with thread support");
