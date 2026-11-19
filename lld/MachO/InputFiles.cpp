@@ -863,8 +863,11 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
                            const char *strtab, bool subsectionsViaSymbols) {
   using NList = typename LP::nlist;
 
-  // Groups indices of the symbols by the sections that contain them.
-  std::vector<std::vector<uint32_t>> symbolsBySection(sections.size());
+  SmallVector<uint32_t, 16> sectionSymbolOffsets(sections.size(), 0);
+  auto isSectionSymbol = [&](const NList &sym) {
+    return !(sym.n_type & N_STAB) && (sym.n_type & N_TYPE) == N_SECT &&
+           !sections[sym.n_sect - 1]->subsections.empty();
+  };
   symbols.resize(nList.size());
   SmallVector<unsigned, 32> undefineds;
   for (uint32_t i = 0; i < nList.size(); ++i) {
@@ -891,7 +894,7 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
       // parseSections() may have chosen not to parse this section.
       if (subsections.empty())
         continue;
-      symbolsBySection[sym.n_sect - 1].push_back(i);
+      ++sectionSymbolOffsets[sym.n_sect - 1];
     } else if (isUndef(sym)) {
       undefineds.push_back(i);
     } else {
@@ -899,11 +902,24 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
     }
   }
 
+  // Preserve nlist order within each section without allocating per section.
+  uint32_t numSectionSymbols = 0;
+  for (uint32_t &end : sectionSymbolOffsets)
+    end = numSectionSymbols += end;
+  std::unique_ptr<uint32_t[]> sectionSymbols(new uint32_t[numSectionSymbols]);
+  for (uint32_t i = nList.size(); i-- != 0;)
+    if (isSectionSymbol(nList[i]))
+      sectionSymbols[--sectionSymbolOffsets[nList[i].n_sect - 1]] = i;
+
   for (size_t i = 0; i < sections.size(); ++i) {
     Subsections &subsections = sections[i]->subsections;
     if (subsections.empty())
       continue;
-    std::vector<uint32_t> &symbolIndices = symbolsBySection[i];
+    MutableArrayRef<uint32_t> symbolIndices(
+        sectionSymbols.get() + sectionSymbolOffsets[i],
+        (i + 1 < sections.size() ? sectionSymbolOffsets[i + 1]
+                                 : numSectionSymbols) -
+            sectionSymbolOffsets[i]);
     uint64_t sectionAddr = sectionHeaders[i].addr;
     uint32_t sectionAlign = 1u << sectionHeaders[i].align;
 
@@ -929,6 +945,9 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
       continue;
     }
     sections[i]->doneSplitting = true;
+    // Nearly every symbol starts a subsection.
+    if (subsectionsViaSymbols && isa<ConcatInputSection>(subsections[0].isec))
+      subsections.reserve(subsections.size() + symbolIndices.size());
 
     auto getSymName = [strtab](const NList& sym) -> StringRef {
       return StringRef(strtab + sym.n_strx);
