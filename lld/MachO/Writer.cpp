@@ -1410,6 +1410,7 @@ template <class LP> void Writer::run() {
 
   // At this point, we should know exactly which output sections are needed,
   // courtesy of scanSymbols() and scanRelocations().
+  symtab->finishTapi();
   createOutputSections<LP>();
 
   // After this point, we create no new segments; HOWEVER, we might

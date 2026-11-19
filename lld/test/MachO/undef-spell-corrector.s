@@ -19,6 +19,14 @@
 # RUN: %lld %t/test.o -dylib -o %t.dylib
 # RUN: not %lld %t.dylib %t/bcde-abcd-abde.o -o /dev/null 2>&1 | FileCheck --check-prefix=INSERT %s -DFILE=%t.dylib
 
+## Unused TBD exports participate in spelling corrections too.
+# RUN: not %lld -dylib %t/exports.tbd %t/bcde-abcd-abde.o -o /dev/null 2>&1 | FileCheck --check-prefix=INSERT %s -DFILE=%t/exports.tbd
+# RUN: not %lld -dylib %t/exports.tbd %t/bbcde-abcdd.o -o /dev/null 2>&1 | FileCheck --check-prefix=SUBST %s
+# RUN: not %lld -dylib %t/exports.tbd %t/aabcde-abcdee.o -o /dev/null 2>&1 | FileCheck --check-prefix=DELETE %s
+# RUN: not %lld -dylib %t/exports.tbd %t/bacde.o -o /dev/null 2>&1 | FileCheck --check-prefix=TRANSPOSE %s
+# RUN: not %lld -dylib %t/exports.tbd %t/__Z3fooPi.o -demangle -o /dev/null 2>&1 | FileCheck --check-prefix=CONST %s
+# RUN: not %lld -dylib %t/exports.tbd %t/__Z3FOOPKi.o -demangle -o /dev/null 2>&1 | FileCheck --check-prefix=CASE %s
+
 # INSERT:      error: undefined symbol: abde
 # INSERT-NEXT: >>> referenced by {{.*}}
 # INSERT-NEXT: >>> did you mean: abcde
@@ -115,3 +123,13 @@ call __Z3FOOPKi
 
 #--- __Z3fooPKi-__Z3FOOPKi.s
 __Z3fooPKi: call __Z3FOOPKi
+
+#--- exports.tbd
+--- !tapi-tbd-v3
+archs: [ x86_64 ]
+platform: macosx
+install-name: /usr/lib/libexports.dylib
+exports:
+  - archs: [ x86_64 ]
+    symbols: [ abcde, __Z3fooPKi ]
+...

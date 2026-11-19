@@ -11,11 +11,16 @@
 #include "Config.h"
 #include "InputFiles.h"
 #include "InputSection.h"
+#include "ObjC.h"
 #include "Symbols.h"
 #include "SyntheticSections.h"
+#include "lld/Common/CommonLinkerContext.h"
 #include "lld/Common/ErrorHandler.h"
 #include "lld/Common/Memory.h"
 #include "llvm/Demangle/Demangle.h"
+#include "llvm/Support/TimeProfiler.h"
+#include "llvm/TextAPI/InterfaceFile.h"
+#include <numeric>
 
 using namespace llvm;
 using namespace lld;
@@ -23,14 +28,23 @@ using namespace lld::macho;
 
 Symbol *SymbolTable::find(CachedHashStringRef cachedName) {
   auto it = symMap.find(cachedName);
-  if (it == symMap.end())
-    return nullptr;
-  return symVector[it->second];
+  if (it != symMap.end())
+    return symVector[it->second];
+  if (!finishedTapi)
+    materializeTapi(cachedName.val(),
+                    DylibFile::tapiFilterHash(cachedName.hash()));
+  it = symMap.find(cachedName);
+  return it == symMap.end() ? nullptr : symVector[it->second];
 }
 
 std::pair<Symbol *, bool> SymbolTable::insert(StringRef name,
                                               const InputFile *file) {
-  auto p = symMap.insert({CachedHashStringRef(name), (int)symVector.size()});
+  CachedHashStringRef cachedName(name);
+  uint64_t hash = DylibFile::tapiFilterHash(cachedName.hash());
+  if (!resolvingTapi && !tapiFiles.empty() && mayHaveTapiExport(hash) &&
+      !symMap.contains(cachedName))
+    materializeTapi(name, hash);
+  auto p = symMap.insert({cachedName, (int)symVector.size()});
 
   Symbol *sym;
   if (!p.second) {
@@ -40,6 +54,10 @@ std::pair<Symbol *, bool> SymbolTable::insert(StringRef name,
     // Name is a new symbol.
     sym = reinterpret_cast<Symbol *>(make<SymbolUnion>());
     symVector.push_back(sym);
+    if (resolvingTapi && finishedTapi)
+      tapiOrderDirty = true;
+    publications.push_back(resolvingTapi ? activeTapiPublication
+                                         : Publication{nextEpoch++, {}});
   }
 
   sym->isUsedInRegularObj |= !file || isa<ObjFile>(file);
@@ -97,6 +115,32 @@ static void transplantSymbolsAtOffset(InputSection *fromIsec,
     d->originalUnwindEntry = nullptr;
     return true;
   });
+}
+
+void SymbolTable::materializeTapi(StringRef name, uint64_t hash) {
+  if (resolvingTapi || !mayHaveTapiExport(hash))
+    return;
+  resolvingTapi = true;
+  bool first = true;
+  StringRef savedName;
+  for (DylibFile *file : tapiFiles) {
+    if (!file->mayHaveTapiExport(hash))
+      continue;
+    StringRef orderName;
+    auto symbol = file->findTapiExport(name, &orderName);
+    if (!symbol)
+      continue;
+    if (first) {
+      first = false;
+      savedName = saver().save(name);
+      activeTapiPublication = {file->tapiEpoch, orderName};
+    }
+    addDylib(savedName, file->exportingFile, symbol->isWeakDefined(),
+             symbol->isThreadLocalValue());
+    if (!symbol->isWeakDefined())
+      break;
+  }
+  resolvingTapi = false;
 }
 
 Defined *SymbolTable::addDefined(StringRef name, InputFile *file,
@@ -234,10 +278,12 @@ Symbol *SymbolTable::addUndefined(StringRef name, InputFile *file,
 
   RefState refState = isWeakRef ? RefState::Weak : RefState::Strong;
 
-  if (wasInserted)
+  if (wasInserted) {
     replaceSymbol<Undefined>(s, name, file, refState,
                              /*wasBitcodeSymbol=*/false);
-  else if (auto *lazy = dyn_cast<LazyArchive>(s))
+    tapiCandidates.push_back(
+        {s, DylibFile::tapiFilterHash(CachedHashStringRef(name).hash())});
+  } else if (auto *lazy = dyn_cast<LazyArchive>(s))
     lazy->fetchArchiveMember();
   else if (isa<LazyObject>(s))
     extract(*s->getFile(), s->getName());
@@ -284,6 +330,9 @@ Symbol *SymbolTable::addDylib(StringRef name, DylibFile *file, bool isWeakDef,
   }
 
   bool isDynamicLookup = file == nullptr;
+  if (wasInserted && (isWeakDef || isDynamicLookup))
+    tapiCandidates.push_back(
+        {s, DylibFile::tapiFilterHash(CachedHashStringRef(name).hash())});
   if (wasInserted || isa<Undefined>(s) ||
       (isa<DylibSymbol>(s) &&
        ((!isWeakDef && s->isWeakDef()) ||
@@ -294,6 +343,96 @@ Symbol *SymbolTable::addDylib(StringRef name, DylibFile *file, bool isWeakDef,
   }
 
   return s;
+}
+
+void SymbolTable::addTapi(DylibFile *file) {
+  file->tapiEpoch = nextEpoch++;
+  llvm::erase_if(tapiCandidates, [&](const TapiCandidate &candidate) {
+    Symbol *sym = candidate.symbol;
+    if (!isa<Undefined, DylibSymbol>(sym))
+      return true;
+    if (auto *dysym = dyn_cast<DylibSymbol>(sym))
+      if (!dysym->isWeakDef() && !dysym->isDynamicLookup())
+        return true;
+    if (!file->mayHaveTapiExport(candidate.hash))
+      return false;
+    if (auto symbol = file->findTapiExport(sym->getName()))
+      addDylib(sym->getName(), file->exportingFile, symbol->isWeakDefined(),
+               symbol->isThreadLocalValue());
+    auto *dysym = dyn_cast<DylibSymbol>(sym);
+    return dysym && !dysym->isWeakDef() && !dysym->isDynamicLookup();
+  });
+  tapiFiles.push_back(file);
+}
+
+void SymbolTable::markTapiWeak(StringRef name) {
+  auto it = symMap.find(CachedHashStringRef(name));
+  if (it != symMap.end())
+    if (auto *defined = dyn_cast<Defined>(symVector[it->second]))
+      if (!defined->isWeakDef())
+        defined->overridesWeakDef = true;
+}
+
+void SymbolTable::finishTapi() {
+  finishedTapi = true;
+  if (tapiFiles.empty() || !tapiOrderDirty)
+    return;
+  tapiOrderDirty = false;
+  TimeTraceScope scope("Restore TBD symbol order");
+  std::vector<size_t> order(symVector.size());
+  std::iota(order.begin(), order.end(), 0);
+  llvm::sort(order, [&](size_t a, size_t b) {
+    const auto &pa = publications[a];
+    const auto &pb = publications[b];
+    return std::make_tuple(pa.epoch, pa.rawName, symVector[a]->getName()) <
+           std::make_tuple(pb.epoch, pb.rawName, symVector[b]->getName());
+  });
+  std::vector<Publication> sortedPublications;
+  sortedPublications.reserve(order.size());
+  std::vector<Symbol *> sorted;
+  sorted.reserve(order.size());
+  std::vector<size_t> position(order.size());
+  for (size_t i : order) {
+    position[i] = sorted.size();
+    sorted.push_back(symVector[i]);
+    sortedPublications.push_back(publications[i]);
+  }
+  for (auto &kv : symMap)
+    kv.second = position[kv.second];
+  symVector.swap(sorted);
+  publications.swap(sortedPublications);
+}
+
+void SymbolTable::materializeTapiForDiagnostics() {
+  // Case-insensitive and extern-C suggestions scan the entire symbol table.
+  for (DylibFile *file : tapiFiles) {
+    for (const auto *symbol : file->tapi->symbols()) {
+      auto publish = [&](const Twine &name) {
+        SmallString<128> storage;
+        StringRef fullName = name.toStringRef(storage);
+        CachedHashStringRef cachedName(fullName);
+        if (!symMap.contains(cachedName))
+          materializeTapi(fullName,
+                          DylibFile::tapiFilterHash(cachedName.hash()));
+      };
+      switch (symbol->getKind()) {
+      case llvm::MachO::EncodeKind::GlobalSymbol:
+        publish(symbol->getName());
+        break;
+      case llvm::MachO::EncodeKind::ObjectiveCClass:
+        publish(objc::symbol_names::klass + symbol->getName());
+        publish(objc::symbol_names::metaclass + symbol->getName());
+        break;
+      case llvm::MachO::EncodeKind::ObjectiveCClassEHType:
+        publish(objc::symbol_names::ehtype + symbol->getName());
+        break;
+      case llvm::MachO::EncodeKind::ObjectiveCInstanceVariable:
+        publish(objc::symbol_names::ivar + symbol->getName());
+        break;
+      }
+    }
+  }
+  finishTapi();
 }
 
 Symbol *SymbolTable::addDynamicLookup(StringRef name) {
@@ -670,6 +809,9 @@ static void reportUndefinedSymbol(const Undefined &sym,
 }
 
 void macho::reportPendingUndefinedSymbols() {
+  if (!undefs.empty())
+    symtab->materializeTapiForDiagnostics();
+
   // Enable spell corrector for the first 2 diagnostics.
   for (const auto &[i, undef] : llvm::enumerate(undefs))
     reportUndefinedSymbol(*undef.first, undef.second, i < 2);

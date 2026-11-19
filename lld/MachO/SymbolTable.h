@@ -52,6 +52,18 @@ public:
 
   Symbol *addDylib(StringRef name, DylibFile *file, bool isWeakDef, bool isTlv);
   Symbol *addDynamicLookup(StringRef name);
+  void addTapi(DylibFile *file);
+  void addTapiFilter(uint64_t hash) {
+    if (tapiUniverse.empty())
+      tapiUniverse.resize(1u << 16);
+    uint64_t a = hash & ((1u << 22) - 1);
+    uint64_t b = (hash >> 32) & ((1u << 22) - 1);
+    tapiUniverse[a / 64] |= uint64_t(1) << (a % 64);
+    tapiUniverse[b / 64] |= uint64_t(1) << (b % 64);
+  }
+  void markTapiWeak(StringRef name);
+  void finishTapi();
+  void materializeTapiForDiagnostics();
 
   Symbol *addLazyArchive(StringRef name, ArchiveFile *file,
                          const llvm::object::Archive::Symbol &sym);
@@ -69,6 +81,33 @@ private:
   std::pair<Symbol *, bool> insert(StringRef name, const InputFile *);
   llvm::DenseMap<llvm::CachedHashStringRef, int> symMap;
   std::vector<Symbol *> symVector;
+  // Preserve the position at which eager loading would first publish a name.
+  struct Publication {
+    uint64_t epoch;
+    StringRef rawName;
+  };
+  std::vector<Publication> publications;
+  std::vector<DylibFile *> tapiFiles;
+  struct TapiCandidate {
+    Symbol *symbol;
+    uint64_t hash;
+  };
+  std::vector<TapiCandidate> tapiCandidates;
+  uint64_t nextEpoch = 0;
+  bool resolvingTapi = false;
+  bool finishedTapi = false;
+  bool tapiOrderDirty = true;
+  Publication activeTapiPublication;
+  std::vector<uint64_t> tapiUniverse;
+  bool mayHaveTapiExport(uint64_t hash) const {
+    if (tapiUniverse.empty())
+      return false;
+    uint64_t a = hash & ((1u << 22) - 1);
+    uint64_t b = (hash >> 32) & ((1u << 22) - 1);
+    return (tapiUniverse[a / 64] & (uint64_t(1) << (a % 64))) &&
+           (tapiUniverse[b / 64] & (uint64_t(1) << (b % 64)));
+  }
+  void materializeTapi(StringRef name, uint64_t hash);
 };
 
 void reportPendingUndefinedSymbols();

@@ -25,6 +25,7 @@
 #include "llvm/Support/Threading.h"
 #include "llvm/TextAPI/TextAPIReader.h"
 #include <atomic>
+#include <optional>
 
 #include <vector>
 
@@ -234,6 +235,29 @@ public:
 
   void parseLoadCommands(MemoryBufferRef mb);
   void parseReexports(const llvm::MachO::InterfaceFile &interface);
+  struct TapiExport {
+    bool weakDef;
+    bool tlv;
+    bool isWeakDefined() const { return weakDef; }
+    bool isThreadLocalValue() const { return tlv; }
+  };
+  std::optional<TapiExport>
+  findTapiExport(StringRef name, StringRef *orderName = nullptr) const;
+  const llvm::MachO::InterfaceFile *tapi = nullptr;
+  uint64_t tapiEpoch = 0;
+  static uint64_t tapiFilterHash(uint32_t hash) {
+    return uint64_t(hash) * 0x9e3779b97f4a7c15ULL;
+  }
+  std::vector<uint64_t> tapiBloom;
+  uint64_t tapiBloomMask = 0;
+  bool mayHaveTapiExport(uint64_t hash) const {
+    uint64_t a = hash & tapiBloomMask;
+    uint64_t b = (hash >> 32) & tapiBloomMask;
+    return (tapiBloom[a / 64] & (uint64_t(1) << (a % 64))) &&
+           (tapiBloom[b / 64] & (uint64_t(1) << (b % 64)));
+  }
+  llvm::DenseSet<llvm::CachedHashStringRef> tapiHiddenSymbols;
+
   bool isReferenced() const { return numReferencedSymbols > 0; }
   bool isExplicitlyLinked() const;
   void setExplicitlyLinked() { explicitlyLinked = true; }
