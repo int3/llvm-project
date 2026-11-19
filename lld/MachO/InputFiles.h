@@ -43,6 +43,7 @@ namespace macho {
 
 struct PlatformInfo;
 class ConcatInputSection;
+class ConcatOutputSection;
 class Symbol;
 class Defined;
 class AliasSymbol;
@@ -72,6 +73,7 @@ public:
   uint32_t flags;
   uint64_t addr;
   Subsections subsections;
+  mutable ConcatOutputSection *outputSection = nullptr;
 
   Section(InputFile *file, StringRef segname, StringRef name, uint32_t flags,
           uint64_t addr)

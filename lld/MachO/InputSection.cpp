@@ -59,8 +59,12 @@ void lld::macho::addInputSection(InputSection *inputSection) {
       return;
     }
     isec->outSecOff = inputSectionsOrder++;
-    auto *osec = ConcatOutputSection::getOrCreateForInput(isec);
-    isec->parent = osec;
+    // The output section depends only on the segment and section names, which
+    // all subsections of a Section share.
+    const Section &section = isec->section;
+    if (!section.outputSection)
+      section.outputSection = ConcatOutputSection::getOrCreateForInput(isec);
+    isec->parent = section.outputSection;
     inputSections.push_back(isec);
   } else if (auto *isec = dyn_cast<CStringInputSection>(inputSection)) {
     bool useSectionName = config->separateCstringLiteralSections ||
