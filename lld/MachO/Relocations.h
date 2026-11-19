@@ -13,9 +13,14 @@
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/Support/Endian.h"
+#include "llvm/Support/MemAlloc.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <memory>
+#include <utility>
 
 namespace lld::macho {
 LLVM_ENABLE_BITMASK_ENUMS_IN_NAMESPACE();
@@ -130,6 +135,99 @@ private:
     int64_t addend = 0;
     AuthReloc authData; // Valid when hasAuth.
   };
+};
+
+// Borrow relocation storage from the input Section to avoid allocating per
+// subsection. Growing a borrowed slice moves it to a buffer of its own.
+class RelocArray {
+public:
+  using value_type = Relocation;
+  using iterator = Relocation *;
+  using const_iterator = const Relocation *;
+
+  RelocArray() = default;
+  RelocArray(const RelocArray &) = delete;
+  RelocArray &operator=(const RelocArray &) = delete;
+  ~RelocArray() {
+    if (cap)
+      free(ptr);
+  }
+
+  iterator begin() { return ptr; }
+  iterator end() { return ptr + len; }
+  const_iterator begin() const { return ptr; }
+  const_iterator end() const { return ptr + len; }
+  size_t size() const { return len; }
+  bool empty() const { return len == 0; }
+  Relocation &operator[](size_t i) {
+    assert(i < len);
+    return ptr[i];
+  }
+  const Relocation &operator[](size_t i) const {
+    assert(i < len);
+    return ptr[i];
+  }
+  Relocation &front() { return (*this)[0]; }
+  const Relocation &front() const { return (*this)[0]; }
+  Relocation &back() { return (*this)[len - 1]; }
+
+  void push_back(const Relocation &r) {
+    // r may be an element of this array.
+    Relocation copy = r;
+    // A slice has no capacity: the array after it belongs to other subsections.
+    if (len >= cap)
+      grow();
+    new (ptr + len++) Relocation(copy);
+  }
+  template <class... Args> Relocation &emplace_back(Args &&...args) {
+    push_back(Relocation(std::forward<Args>(args)...));
+    return back();
+  }
+  template <class It> void insert(iterator pos, It first, It last) {
+    assert(pos == end() && "only appending is supported");
+    for (; first != last; ++first)
+      push_back(*first);
+  }
+  iterator erase(iterator it) { return erase(it, it + 1); }
+  iterator erase(iterator first, iterator last) {
+    len = std::move(last, end(), first) - ptr;
+    return first;
+  }
+
+  // The parser reverses the Section buffer to put slices in subsection order.
+  // Preserve the order within each slice; separately grown arrays are
+  // unaffected.
+  void restoreOrderAfterBufferReverse(Relocation *begin, Relocation *end) {
+    if (cap || empty())
+      return;
+    ptr = begin + (end - (ptr + len));
+    std::reverse(ptr, ptr + len);
+  }
+
+  void appendInPlace(Relocation *slot) {
+    assert(cap == 0 && "slice has its own buffer");
+    assert(len == 0 || ptr + len == slot);
+    if (len == 0)
+      ptr = slot;
+    ++len;
+  }
+
+private:
+  void grow() {
+    uint32_t newCap = std::max<uint32_t>(4, 2 * len);
+    auto *buf = static_cast<Relocation *>(
+        llvm::safe_malloc(newCap * sizeof(Relocation)));
+    std::uninitialized_copy(ptr, ptr + len, buf);
+    if (cap)
+      free(ptr);
+    ptr = buf;
+    cap = newCap;
+  }
+
+  Relocation *ptr = nullptr;
+  uint32_t len = 0;
+  // Zero while this is a slice of the Section's array.
+  uint32_t cap = 0;
 };
 
 bool validateSymbolRelocation(const Symbol *, const InputSection *,

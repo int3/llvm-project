@@ -567,6 +567,25 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
   auto *buf = reinterpret_cast<const uint8_t *>(mb.getBufferStart());
   ArrayRef<relocation_info> relInfos(
       reinterpret_cast<const relocation_info *>(buf + sec.reloff), sec.nreloc);
+  if (relInfos.empty())
+    return;
+
+  // Every relocation_info yields at most one Relocation.
+  assert(!section.relocBuf);
+  section.relocBuf = static_cast<Relocation *>(
+      safe_malloc(relInfos.size() * sizeof(Relocation)));
+  Relocation *nextSlot = section.relocBuf;
+  InputSection *tail = nullptr;
+  auto append = [&](InputSection *subsec, const Relocation &r) {
+    // Unsorted relocations can return to a subsection whose slice has ended.
+    if (subsec != tail && !subsec->relocs.empty()) {
+      subsec->relocs.push_back(r);
+      return;
+    }
+    new (nextSlot) Relocation(r);
+    subsec->relocs.appendInPlace(nextSlot++);
+    tail = subsec;
+  };
 
   Subsections &subsections = section.subsections;
   auto subsecIt = subsections.rbegin();
@@ -671,7 +690,7 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
       subsec = subsecIt->isec;
       r.offset -= subsecIt->offset;
     }
-    subsec->relocs.push_back(r);
+    append(subsec, r);
 
     if (isSubtrahend) {
       relocation_info minuendInfo = relInfos[++i];
@@ -694,9 +713,14 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
             *sections[minuendInfo.r_symbolnum - 1], &referentOffset);
         p.setAddend(referentOffset);
       }
-      subsec->relocs.push_back(p);
+      append(subsec, p);
     }
   }
+  // Let forward subsection walks read a forward stream, without changing the
+  // relocation order within any subsection.
+  std::reverse(section.relocBuf, nextSlot);
+  for (auto sub : subsections)
+    sub.isec->relocs.restoreOrderAfterBufferReverse(section.relocBuf, nextSlot);
 }
 
 // ld64 never turns these labels into named atoms or symbol table entries.
@@ -1488,7 +1512,7 @@ static CIE parseCIE(const InputSection *isec, const EhReader &reader,
 template <bool Invert = false>
 Defined *
 targetSymFromCanonicalSubtractor(const InputSection *isec,
-                                 std::vector<Relocation>::iterator relocIt) {
+                                 RelocArray::iterator relocIt) {
   Relocation &subtrahend = *relocIt;
   Relocation &minuend = *std::next(relocIt);
   assert(target->hasAttr(subtrahend.type, RelocAttrBits::SUBTRAHEND));
