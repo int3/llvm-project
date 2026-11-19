@@ -1015,8 +1015,7 @@ void Scanner::scan_ns_uri_char() {
     if ((*Current == '%' && Current + 2 < End &&
          is_ns_hex_digit(*(Current + 1)) && is_ns_hex_digit(*(Current + 2))) ||
         is_ns_word_char(*Current) ||
-        StringRef(Current, 1).find_first_of("#;/?:@&=+$,_.!~*'()[]") !=
-            StringRef::npos) {
+        StringRef("#;/?:@&=+$,_.!~*'()[]").contains(*Current)) {
       ++Current;
       ++Column;
     } else {
@@ -1060,9 +1059,16 @@ bool Scanner::isBlankOrBreak(StringRef::iterator Position) {
 bool Scanner::isPlainSafeNonBlank(StringRef::iterator Position) {
   if (Position == End || isBlankOrBreak(Position))
     return false;
-  if (FlowLevel &&
-      StringRef(Position, 1).find_first_of(",[]{}") != StringRef::npos)
-    return false;
+  if (FlowLevel) {
+    switch (*Position) {
+    case ',':
+    case '[':
+    case ']':
+    case '{':
+    case '}':
+      return false;
+    }
+  }
   return true;
 }
 
@@ -1411,6 +1417,13 @@ bool Scanner::scanFlowScalar(bool IsDoubleQuoted) {
   } else {
     skip(1);
     while (Current != End) {
+      const char *RunStart = Current;
+      while (Current != End && static_cast<unsigned char>(*Current) >= 0x20 &&
+             static_cast<unsigned char>(*Current) < 0x7f && *Current != '\'')
+        ++Current;
+      Column += Current - RunStart;
+      if (Current == End)
+        break;
       // Skip a ' followed by another '.
       if (Current + 1 < End && *Current == '\'' && *(Current + 1) == '\'') {
         skip(2);
@@ -1901,11 +1914,9 @@ bool Scanner::fetchMoreTokens() {
     return scanFlowScalar(true);
 
   // Get a plain scalar.
-  StringRef FirstChar(Current, 1);
   if ((!isBlankOrBreak(Current) &&
-       FirstChar.find_first_of("-?:,[]{}#&*!|>'\"%@`") == StringRef::npos) ||
-      (FirstChar.find_first_of("?:-") != StringRef::npos &&
-       isPlainSafeNonBlank(Current + 1)))
+       !StringRef("-?:,[]{}#&*!|>'\"%@`").contains(*Current)) ||
+      (StringRef("?:-").contains(*Current) && isPlainSafeNonBlank(Current + 1)))
     return scanPlainScalar();
 
   setError("Unrecognized character while tokenizing.", Current);

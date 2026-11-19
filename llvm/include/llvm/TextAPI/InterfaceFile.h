@@ -358,6 +358,7 @@ public:
   /// Get size of symbol set.
   /// \return The number of symbols the file holds.
   size_t symbolsCount() const { return SymbolsSet->size(); }
+  void reserveSymbols(size_t Count) { SymbolsSet->reserve(Count); }
 
   using const_symbol_range = SymbolSet::const_symbol_range;
   using const_filtered_symbol_range = SymbolSet::const_filtered_symbol_range;
