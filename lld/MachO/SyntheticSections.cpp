@@ -2472,29 +2472,16 @@ void ObjCMethListSection::writeTo(uint8_t *bufStart) const {
          "Written size does not match expected section size");
 }
 
-// Check if an InputSection is a method list. To do this we scan the
-// InputSection for any symbols who's names match the patterns we expect clang
-// to generate for method lists.
 bool ObjCMethListSection::isMethodList(const ConcatInputSection *isec) {
-  const char *symPrefixes[] = {objc::symbol_names::classMethods,
-                               objc::symbol_names::instanceMethods,
-                               objc::symbol_names::categoryInstanceMethods,
-                               objc::symbol_names::categoryClassMethods};
   if (!isec)
     return false;
-  for (const Symbol *sym : isec->symbols) {
-    auto *def = dyn_cast_or_null<Defined>(sym);
-    if (!def)
-      continue;
-    for (const char *prefix : symPrefixes) {
-      if (def->getName().starts_with(prefix)) {
-        assert(def->size == isec->data.size() &&
-               "Invalid ObjC method list symbol size: expected symbol size to "
-               "match isec size");
-        assert(def->value == 0 &&
-               "Offset of ObjC method list symbol must be 0");
-        return true;
-      }
+  for (const Defined *def : isec->symbols) {
+    if (def->isObjCMethodList) {
+      assert(def->size == isec->data.size() &&
+             "Invalid ObjC method list symbol size: expected symbol size to "
+             "match isec size");
+      assert(def->value == 0 && "Offset of ObjC method list symbol must be 0");
+      return true;
     }
   }
 

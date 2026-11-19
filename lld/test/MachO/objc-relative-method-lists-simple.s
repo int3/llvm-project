@@ -25,6 +25,15 @@
 # RUN: %lld a64_rel_dylib.o -o a64_rel_dylib.dylib -map a64_rel_dylib.map -dylib -arch arm64 -platform_version macOS 10.15 10.15
 # RUN: llvm-objdump --macho --objc-meta-data a64_rel_dylib.dylib  | FileCheck %s --check-prefix=CHK_NO_REL
 
+## A local method-list symbol follows a coalesced weak definition into a
+## section that did not originally contain a method list. The YAML puts the
+## local alias last so it has the full list size instead of zero.
+# RUN: yaml2obj weak-list.yaml -o weak-list.o
+# RUN: llvm-mc -filetype=obj -triple=arm64-apple-macos -o strong-list.o strong-list.s
+# RUN: %no-lsystem-lld -dylib -arch arm64 weak-list.o strong-list.o -o coalesced.dylib
+# RUN: llvm-nm -m coalesced.dylib | FileCheck %s --check-prefix=COALESCED
+# COALESCED: (__TEXT,__objc_methlist) non-external __OBJC_$_INSTANCE_METHODS_Coalesced
+
 
 CHK_REL:       Contents of (__DATA_CONST,__objc_classlist) section
 CHK_REL-NEXT:  _OBJC_CLASS_$_MyClass
@@ -255,4 +264,74 @@ l_OBJC_LABEL_CLASS_$:
 L_OBJC_IMAGE_INFO:
 	.long	0
 	.long	64
+.subsections_via_symbols
+
+#--- weak-list.yaml
+--- !mach-o
+IsLittleEndian: true
+FileHeader:
+  magic: 0xFEEDFACF
+  cputype: 0x100000C
+  cpusubtype: 0
+  filetype: 1
+  ncmds: 2
+  sizeofcmds: 176
+  flags: 0x2000
+  reserved: 0
+LoadCommands:
+  - cmd: LC_SEGMENT_64
+    cmdsize: 152
+    segname: ''
+    vmaddr: 0
+    vmsize: 8
+    fileoff: 208
+    filesize: 8
+    maxprot: 7
+    initprot: 7
+    nsects: 1
+    flags: 0
+    Sections:
+      - sectname: __objc_const
+        segname: __DATA
+        addr: 0
+        size: 8
+        offset: 208
+        align: 3
+        reloff: 0
+        nreloc: 0
+        flags: 0
+        reserved1: 0
+        reserved2: 0
+        reserved3: 0
+        content: '1800000000000000'
+  - cmd: LC_SYMTAB
+    cmdsize: 24
+    symoff: 216
+    nsyms: 2
+    stroff: 248
+    strsize: 43
+LinkEditData:
+  NameList:
+    - n_strx: 1
+      n_type: 0xF
+      n_sect: 1
+      n_desc: 0x80
+      n_value: 0
+    - n_strx: 7
+      n_type: 0xE
+      n_sect: 1
+      n_desc: 0
+      n_value: 0
+  StringTable:
+    - ''
+    - _list
+    - __OBJC_$_INSTANCE_METHODS_Coalesced
+
+#--- strong-list.s
+.section __DATA,__objc_const
+.p2align 3
+.globl _list
+_list:
+.long 24
+.long 0
 .subsections_via_symbols

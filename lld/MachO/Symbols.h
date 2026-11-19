@@ -11,6 +11,7 @@
 
 #include "Config.h"
 #include "InputFiles.h"
+#include "ObjC.h"
 #include "Target.h"
 
 #include "lld/Common/Utils.h"
@@ -24,6 +25,15 @@ namespace lld {
 namespace macho {
 
 class MachHeaderSection;
+
+inline bool isObjCMethodListName(StringRef name) {
+  // The common prefix of the four kinds rules out nearly every name at once.
+  return name.starts_with("__OBJC_$_") &&
+         (name.starts_with(objc::symbol_names::classMethods) ||
+          name.starts_with(objc::symbol_names::instanceMethods) ||
+          name.starts_with(objc::symbol_names::categoryInstanceMethods) ||
+          name.starts_with(objc::symbol_names::categoryClassMethods));
+}
 
 class Symbol {
 public:
@@ -102,6 +112,7 @@ protected:
   Symbol(Kind k, StringRef name, InputFile *file)
       : symbolKind(k), nameData(name.data()), file(file), nameSize(name.size()),
         isUsedInRegularObj(!file || isa<ObjFile>(file)),
+        isObjCMethodList(isObjCMethodListName(name)),
         used(!config->deadStrip) {}
 
   Kind symbolKind;
@@ -112,6 +123,10 @@ protected:
 public:
   // True if this symbol was referenced by a regular (non-bitcode) object.
   bool isUsedInRegularObj : 1;
+
+  // Whether the name marks an ObjC method list, so that routing an input
+  // section does not have to read the names of its symbols.
+  bool isObjCMethodList : 1;
 
   // True if this symbol is used from a live section.
   bool used;

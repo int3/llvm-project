@@ -74,6 +74,8 @@ public:
   uint64_t addr;
   Subsections subsections;
   mutable ConcatOutputSection *outputSection = nullptr;
+  // A section can acquire method-list symbols through weak coalescing too.
+  mutable bool mayHaveObjCMethodList = false;
 
   Section(InputFile *file, StringRef segname, StringRef name, uint32_t flags,
           uint64_t addr)

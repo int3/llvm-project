@@ -65,6 +65,8 @@ Defined::Defined(StringRef name, InputFile *file, InputSection *isec,
       cold(cold), branchExtensionThunk(false), weakDef(isWeakDef),
       external(isExternal), originalIsec(isec), value(value), size(size) {
   if (isec) {
+    if (isObjCMethodList)
+      isec->section.mayHaveObjCMethodList = true;
     isec->symbols.push_back(this);
     // Maintain sorted order.
     for (auto it = isec->symbols.rbegin(), rend = isec->symbols.rend();

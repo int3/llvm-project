@@ -46,6 +46,7 @@ void lld::macho::addInputSection(InputSection *inputSection) {
     if (isec->isCoalescedWeak())
       return;
     if (config->emitRelativeMethodLists &&
+        isec->section.mayHaveObjCMethodList &&
         ObjCMethListSection::isMethodList(isec)) {
       if (in.objcMethList->inputOrder == UnspecifiedInputOrder)
         in.objcMethList->inputOrder = inputSectionsOrder++;

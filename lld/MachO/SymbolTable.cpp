@@ -87,6 +87,8 @@ static void transplantSymbolsAtOffset(InputSection *fromIsec,
     // iterator. However, that is typically the case for files that have
     // .subsections_via_symbols set.
     insertIt = toIsec->symbols.insert(insertIt, d);
+    if (d->isObjCMethodList)
+      toIsec->section.mayHaveObjCMethodList = true;
     d->originalIsec = toIsec;
     d->value = toOff;
     // We don't want to have more than one unwindEntry at a given address, so
