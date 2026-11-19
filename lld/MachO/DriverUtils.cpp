@@ -15,6 +15,7 @@
 #include "lld/Common/Reproduce.h"
 #include "llvm/ADT/CachedHashString.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/LTO/LTO.h"
 #include "llvm/Option/Arg.h"
 #include "llvm/Option/ArgList.h"
@@ -22,6 +23,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/xxhash.h"
 #include "llvm/TextAPI/InterfaceFile.h"
 #include "llvm/TextAPI/TextAPIReader.h"
 
@@ -222,6 +224,10 @@ std::optional<StringRef> macho::resolveDylibPath(StringRef dylibPath) {
 // It's not uncommon to have multiple attempts to load a single dylib,
 // especially if it's a commonly re-exported core library.
 static DenseMap<CachedHashStringRef, DylibFile *> loadedDylibs;
+static DenseMap<
+    uint64_t,
+    SmallVector<std::pair<StringRef, std::unique_ptr<InterfaceFile>>, 1>>
+    tapiContents;
 
 static StringRef realPathIfDifferent(StringRef path) {
   SmallString<128> realPathBuf;
@@ -264,14 +270,41 @@ DylibFile *macho::loadDylib(MemoryBufferRef mbref, DylibFile *umbrella,
   DylibFile *newFile;
   file_magic magic = identify_magic(mbref.getBuffer());
   if (magic == file_magic::tapi_file) {
-    Expected<std::unique_ptr<InterfaceFile>> result = TextAPIReader::get(mbref);
-    if (!result) {
-      error("could not load TAPI file at " + mbref.getBufferIdentifier() +
-            ": " + toString(result.takeError()));
-      return nullptr;
+    auto &entries = tapiContents[xxh3_64bits(mbref.getBuffer())];
+    InterfaceFile *interface = nullptr;
+    for (auto &entry : entries)
+      if (entry.first == mbref.getBuffer()) {
+        interface = entry.second.get();
+        break;
+      }
+    if (!interface) {
+      auto result = TextAPIReader::get(mbref);
+      if (!result) {
+        error("could not load TAPI file at " + mbref.getBufferIdentifier() +
+              ": " + toString(result.takeError()));
+        return nullptr;
+      }
+      interface = result->get();
+      entries.emplace_back(mbref.getBuffer(), std::move(*result));
     }
+    std::string previousPath = interface->getPath().str();
+    SmallVector<InterfaceFile *, 2> changedPaths;
+    auto updatePaths = [&](auto &&self, InterfaceFile &file) -> void {
+      if (file.getPath() == previousPath) {
+        file.setPath(mbref.getBufferIdentifier());
+        changedPaths.push_back(&file);
+      }
+      for (const auto &document : file.documents())
+        self(self, *document);
+    };
+    if (previousPath != mbref.getBufferIdentifier())
+      updatePaths(updatePaths, *interface);
+    auto restorePaths = scope_exit([&] {
+      for (InterfaceFile *file : changedPaths)
+        file->setPath(previousPath);
+    });
     file =
-        make<DylibFile>(**result, umbrella, isBundleLoader, explicitlyLinked);
+        make<DylibFile>(*interface, umbrella, isBundleLoader, explicitlyLinked);
 
     // parseReexports() can recursively call loadDylib(). That's fine since
     // we wrote the DylibFile we just loaded to the loadDylib cache via the
@@ -280,7 +313,7 @@ DylibFile *macho::loadDylib(MemoryBufferRef mbref, DylibFile *umbrella,
     // the pointer it refers to before continuing.
     newFile = file;
     if (newFile->exportingFile)
-      newFile->parseReexports(**result);
+      newFile->parseReexports(*interface);
   } else {
     assert(magic == file_magic::macho_dynamically_linked_shared_lib ||
            magic == file_magic::macho_dynamically_linked_shared_lib_stub ||
@@ -321,7 +354,10 @@ DylibFile *macho::loadDylib(MemoryBufferRef mbref, DylibFile *umbrella,
   return newFile;
 }
 
-void macho::resetLoadedDylibs() { loadedDylibs.clear(); }
+void macho::resetLoadedDylibs() {
+  loadedDylibs.clear();
+  tapiContents.clear();
+}
 
 std::optional<StringRef>
 macho::findPathCombination(const Twine &name,

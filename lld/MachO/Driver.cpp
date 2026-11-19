@@ -2568,6 +2568,7 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
 
     parseDeferredRelocations();
 
+    symtab->finishTapi();
     gatherInputSections();
 
     if (!config->codegenDataGeneratePath.empty())

@@ -2094,57 +2094,114 @@ DylibFile::DylibFile(const InterfaceFile &interface, DylibFile *umbrella,
       allowableClients.push_back(
           *make<std::string>(allowableClient.getInstallName().data()));
 
-  auto addSymbol = [&](const llvm::MachO::Symbol &symbol,
-                       const Twine &name) -> void {
-    StringRef savedName = saver().save(name);
-    if (exportingFile->hiddenSymbols.contains(CachedHashStringRef(savedName)))
-      return;
-
-    symbols.push_back(symtab->addDylib(savedName, exportingFile,
-                                       symbol.isWeakDefined(),
-                                       symbol.isThreadLocalValue()));
+  uint64_t filterBits = 64;
+  while (filterBits < interface.symbolsCount() * 16)
+    filterBits *= 2;
+  tapiBloom.resize(filterBits / 64);
+  tapiBloomMask = filterBits - 1;
+  auto addToFilter = [&](const Twine &name) {
+    SmallString<128> storage;
+    uint64_t hash =
+        tapiFilterHash(CachedHashStringRef(name.toStringRef(storage)).hash());
+    symtab->addTapiFilter(hash);
+    uint64_t a = hash & tapiBloomMask;
+    uint64_t b = (hash >> 32) & tapiBloomMask;
+    tapiBloom[a / 64] |= uint64_t(1) << (a % 64);
+    tapiBloom[b / 64] |= uint64_t(1) << (b % 64);
   };
-
-  std::vector<const llvm::MachO::Symbol *> normalSymbols;
-  normalSymbols.reserve(interface.symbolsCount());
   for (const auto *symbol : interface.symbols()) {
-    if (!isArchABICompatible(symbol->getArchitectures(), config->arch()))
+    if (!isArchABICompatible(symbol->getArchitectures(), config->arch()) ||
+        handleLDSymbol(symbol->getName()))
       continue;
-    if (handleLDSymbol(symbol->getName()))
-      continue;
-
     switch (symbol->getKind()) {
     case EncodeKind::GlobalSymbol:
-    case EncodeKind::ObjectiveCClass:
-    case EncodeKind::ObjectiveCClassEHType:
-    case EncodeKind::ObjectiveCInstanceVariable:
-      normalSymbols.push_back(symbol);
-    }
-  }
-  // interface.symbols() order is non-deterministic.
-  llvm::sort(normalSymbols,
-             [](auto *l, auto *r) { return l->getName() < r->getName(); });
-
-  // TODO(compnerd) filter out symbols based on the target platform
-  for (const auto *symbol : normalSymbols) {
-    switch (symbol->getKind()) {
-    case EncodeKind::GlobalSymbol:
-      addSymbol(*symbol, symbol->getName());
+      addToFilter(symbol->getName());
       break;
     case EncodeKind::ObjectiveCClass:
-      // XXX ld64 only creates these symbols when -ObjC is passed in. We may
-      // want to emulate that.
-      addSymbol(*symbol, objc::symbol_names::klass + symbol->getName());
-      addSymbol(*symbol, objc::symbol_names::metaclass + symbol->getName());
+      addToFilter(objc::symbol_names::klass + symbol->getName());
+      addToFilter(objc::symbol_names::metaclass + symbol->getName());
       break;
     case EncodeKind::ObjectiveCClassEHType:
-      addSymbol(*symbol, objc::symbol_names::ehtype + symbol->getName());
+      addToFilter(objc::symbol_names::ehtype + symbol->getName());
       break;
     case EncodeKind::ObjectiveCInstanceVariable:
-      addSymbol(*symbol, objc::symbol_names::ivar + symbol->getName());
+      addToFilter(objc::symbol_names::ivar + symbol->getName());
       break;
     }
   }
+  tapi = &interface;
+  // A hide from a later re-export must not hide an earlier export.
+  tapiHiddenSymbols = exportingFile->hiddenSymbols;
+  symtab->addTapi(this);
+  for (const auto *symbol : interface.symbols()) {
+    if ((!symbol->isWeakDefined() && !config->hasExplicitExports) ||
+        symbol->getName().starts_with("$ld$") ||
+        !isArchABICompatible(symbol->getArchitectures(), config->arch()))
+      continue;
+    auto visitName = [&](const Twine &name) {
+      SmallString<128> storage;
+      StringRef fullName = name.toStringRef(storage);
+      if (tapiHiddenSymbols.contains(CachedHashStringRef(fullName)))
+        return;
+      if (symbol->isWeakDefined())
+        symtab->markTapiWeak(fullName);
+      if (config->hasExplicitExports && config->exportedSymbols.match(fullName))
+        symtab->find(fullName);
+    };
+    switch (symbol->getKind()) {
+    case EncodeKind::GlobalSymbol:
+      visitName(symbol->getName());
+      break;
+    case EncodeKind::ObjectiveCClass:
+      visitName(objc::symbol_names::klass + symbol->getName());
+      visitName(objc::symbol_names::metaclass + symbol->getName());
+      break;
+    case EncodeKind::ObjectiveCClassEHType:
+      visitName(objc::symbol_names::ehtype + symbol->getName());
+      break;
+    case EncodeKind::ObjectiveCInstanceVariable:
+      visitName(objc::symbol_names::ivar + symbol->getName());
+      break;
+    }
+  }
+}
+
+std::optional<DylibFile::TapiExport>
+DylibFile::findTapiExport(StringRef name, StringRef *orderName) const {
+  if (name.starts_with("$ld$") ||
+      tapiHiddenSymbols.contains(CachedHashStringRef(name)))
+    return std::nullopt;
+  auto kind = EncodeKind::GlobalSymbol;
+  StringRef rawName = name;
+  if (rawName.consume_front(objc::symbol_names::klass) ||
+      rawName.consume_front(objc::symbol_names::metaclass))
+    kind = EncodeKind::ObjectiveCClass;
+  else if (rawName.consume_front(objc::symbol_names::ehtype))
+    kind = EncodeKind::ObjectiveCClassEHType;
+  else if (rawName.consume_front(objc::symbol_names::ivar))
+    kind = EncodeKind::ObjectiveCInstanceVariable;
+  const llvm::MachO::Symbol *first = nullptr;
+  const llvm::MachO::Symbol *second = nullptr;
+  auto global = tapi->getSymbol(EncodeKind::GlobalSymbol, name);
+  if (global &&
+      isArchABICompatible((*global)->getArchitectures(), config->arch()))
+    first = *global;
+  if (kind != EncodeKind::GlobalSymbol) {
+    auto objc = tapi->getSymbol(kind, rawName);
+    if (objc &&
+        isArchABICompatible((*objc)->getArchitectures(), config->arch()))
+      second = *objc;
+  }
+  if (!first || (second && second->getName() < first->getName()))
+    std::swap(first, second);
+  if (!first)
+    return std::nullopt;
+  if (orderName)
+    *orderName = first->getName();
+  const auto *resolved =
+      first->isWeakDefined() && second && !second->isWeakDefined() ? second
+                                                                   : first;
+  return TapiExport{resolved->isWeakDefined(), resolved->isThreadLocalValue()};
 }
 
 DylibFile::DylibFile(DylibFile *umbrella)
