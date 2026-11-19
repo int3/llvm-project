@@ -66,10 +66,13 @@
 #include "llvm/LTO/LTO.h"
 #include "llvm/Support/BinaryStreamReader.h"
 #include "llvm/Support/Endian.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/Process.h"
 #include "llvm/Support/TarWriter.h"
+#include "llvm/Support/ThreadPool.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/TextAPI/Architecture.h"
 #include "llvm/TextAPI/InterfaceFile.h"
@@ -78,6 +81,10 @@
 #include <optional>
 #include <thread>
 #include <type_traits>
+
+#ifdef __APPLE__
+#include <sys/mman.h>
+#endif
 
 using namespace llvm;
 using namespace llvm::MachO;
@@ -314,6 +321,9 @@ class InputReadAhead {
   std::vector<Entry *> order;
   std::vector<std::thread> readers;
   std::atomic<bool> stopped{false};
+#ifdef __APPLE__
+  std::unique_ptr<llvm::DefaultThreadPool> advisor;
+#endif
 
 public:
   InputReadAhead(ArrayRef<StringRef> paths) {
@@ -408,7 +418,31 @@ public:
     stopped.store(true, std::memory_order_relaxed);
     for (auto &reader : readers)
       reader.join();
+#ifdef __APPLE__
+    if (advisor)
+      advisor->wait();
+#endif
   }
+#ifdef __APPLE__
+  void advise(MemoryBufferRef buffer) {
+    // Readers prepare headers. Large buffers also contain pages needed by later
+    // passes, including archives found by -l rather than the direct-path scan.
+    if (buffer.getBufferSize() <= 10 * 1024 * 1024)
+      return;
+    if (!advisor)
+      advisor =
+          std::make_unique<llvm::DefaultThreadPool>(hardware_concurrency(1));
+    advisor->async([this, buffer] {
+      if (stopped.load(std::memory_order_relaxed))
+        return;
+      size_t pageSize = Process::getPageSizeEstimate();
+      uintptr_t start = reinterpret_cast<uintptr_t>(buffer.getBufferStart());
+      uintptr_t aligned = llvm::alignDown(start, pageSize);
+      madvise(reinterpret_cast<void *>(aligned),
+              buffer.getBufferSize() + start - aligned, MADV_WILLNEED);
+    });
+  }
+#endif
   std::optional<InputReadAheadArchive> takeArchive(StringRef path,
                                                    MemoryBufferRef buffer) {
     auto it = entries.find(path);
@@ -499,6 +533,10 @@ std::optional<MemoryBufferRef> macho::readFile(StringRef path) {
       read32be(&hdr->magic) != FAT_MAGIC) {
     if (tar)
       tar->append(relativeToRoot(path), mbref.getBuffer());
+#if LLVM_ENABLE_THREADS && defined(__APPLE__)
+    if (inputReadAhead)
+      inputReadAhead->advise(mbref);
+#endif
     return cachedReads[key] = mbref;
   }
 
@@ -539,6 +577,10 @@ std::optional<MemoryBufferRef> macho::readFile(StringRef path) {
     if (tar)
       tar->append(relativeToRoot(path), mbref.getBuffer());
     MemoryBufferRef slice(StringRef(buf + offset, size), path.copy(bAlloc));
+#if LLVM_ENABLE_THREADS && defined(__APPLE__)
+    if (inputReadAhead)
+      inputReadAhead->advise(slice);
+#endif
     return cachedReads[key] = slice;
   }
 
