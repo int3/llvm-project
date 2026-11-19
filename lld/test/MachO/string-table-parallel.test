@@ -1,0 +1,10 @@
+# REQUIRES: x86
+# RUN: rm -rf %t; mkdir -p %t/a %t/b
+# RUN: %python %S/Inputs/string-table-chunks.py > %t/input.s
+# RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %t/input.s -o %t/input.o
+# RUN: %lld -lSystem %t/input.o --threads=1 -o %t/a/out
+# RUN: %lld -lSystem %t/input.o --threads=8 -o %t/b/out
+# RUN: cmp %t/a/out %t/b/out
+# RUN: %lld -lSystem %t/input.o --threads=1 -no-deduplicate-symbol-strings -o %t/a/out
+# RUN: %lld -lSystem %t/input.o --threads=8 -no-deduplicate-symbol-strings -o %t/b/out
+# RUN: cmp %t/a/out %t/b/out

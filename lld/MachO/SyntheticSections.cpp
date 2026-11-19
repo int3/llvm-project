@@ -1837,10 +1837,29 @@ uint32_t StringTableSection::addString(StringRef str) {
 
   strings.push_back(str);
   size += str.size() + 1; // account for null terminator
+  if (parallel::strategy.ThreadsRequested != 1 && size <= UINT32_MAX &&
+      size - chunkStart >= 1024 * 1024) {
+    writeChunks.emplace_back(strings.size(), size);
+    chunkStart = size;
+  }
   return strx;
 }
 
 void StringTableSection::writeTo(uint8_t *buf) const {
+  if (!writeChunks.empty() && size <= UINT32_MAX) {
+    parallelFor(0, writeChunks.size() + 1, [&](size_t i) {
+      size_t begin = i == 0 ? 0 : writeChunks[i - 1].first;
+      size_t end =
+          i == writeChunks.size() ? strings.size() : writeChunks[i].first;
+      size_t off = i == 0 ? 0 : writeChunks[i - 1].second;
+      for (size_t j = begin; j < end; ++j) {
+        StringRef str = strings[j];
+        memcpy(buf + off, str.data(), str.size());
+        off += str.size() + 1;
+      }
+    });
+    return;
+  }
   uint32_t off = 0;
   for (StringRef str : strings) {
     memcpy(buf + off, str.data(), str.size());
