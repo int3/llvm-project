@@ -516,7 +516,7 @@ static InputFile *processFile(std::optional<MemoryBufferRef> buffer,
                 ": Archive::children failed: " + toString(std::move(e)));
       }
     }
-    if (!archiveContents || archiveContents->empty())
+    if (!archiveContents)
       file->addLazySymbols();
     loadedArchives[path] = ArchiveFileInfo{file, isCommandLineLoad};
     newFile = file;
