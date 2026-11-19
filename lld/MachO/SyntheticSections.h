@@ -485,6 +485,9 @@ private:
   std::vector<StringRef> strings{" "};
   llvm::DenseMap<llvm::CachedHashStringRef, uint32_t> stringMap;
   size_t size = 2;
+  // End string index and byte offset for each complete output chunk.
+  std::vector<std::pair<size_t, size_t>> writeChunks;
+  size_t chunkStart = 0;
 };
 
 struct SymtabEntry {
