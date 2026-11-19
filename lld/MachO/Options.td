@@ -413,7 +413,7 @@ def interposable : Flag<["-"], "interposable">,
     HelpText<"Indirects access to all exported symbols in an image">,
     Group<grp_opts>;
 def read_workers : Joined<["--"], "read-workers=">,
-    HelpText<"Approximate number of workers to use to eagerly preload input files content into memory. Use 0 to disable this feature. Default is disabled.">,
+    HelpText<"Compatibility option: 0 disables automatic input read-ahead; nonzero enables it (the default).">,
     Group<grp_lld>;
 def order_file : Separate<["-"], "order_file">,
     MetaVarName<"<file>">,

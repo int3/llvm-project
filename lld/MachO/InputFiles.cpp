@@ -55,6 +55,7 @@
 #include "Symbols.h"
 #include "SyntheticSections.h"
 #include "Target.h"
+#include "llvm/ADT/StringMap.h"
 
 #include "lld/Common/CommonLinkerContext.h"
 #include "lld/Common/DWARF.h"
@@ -73,7 +74,9 @@
 #include "llvm/TextAPI/Architecture.h"
 #include "llvm/TextAPI/InterfaceFile.h"
 
+#include <atomic>
 #include <optional>
+#include <thread>
 #include <type_traits>
 
 using namespace llvm;
@@ -219,6 +222,251 @@ static bool compatWithTargetArch(const InputFile *file, const Header *hdr) {
 // Theoretically this caching could be more efficient by hoisting it, but that
 // would require altering many callers to track the state.
 DenseMap<CachedHashStringRef, MemoryBufferRef> macho::cachedReads;
+#if LLVM_ENABLE_THREADS
+namespace {
+template <class LP>
+static std::optional<bool> checkedReadAheadObjC(MemoryBufferRef buffer) {
+  using Header = typename LP::mach_header;
+  using Segment = typename LP::segment_command;
+  using Section = typename LP::section;
+  StringRef data = buffer.getBuffer();
+  if (data.size() < sizeof(Header))
+    return std::nullopt;
+  auto *header = reinterpret_cast<const Header *>(data.data());
+  if (header->magic != LP::magic)
+    return false;
+  size_t offset = sizeof(Header);
+  if (header->sizeofcmds > data.size() - offset)
+    return std::nullopt;
+  size_t end = offset + header->sizeofcmds;
+  for (uint32_t i = 0; i < header->ncmds; ++i) {
+    if (offset > end || sizeof(MachO::load_command) > end - offset)
+      return std::nullopt;
+    auto *command =
+        reinterpret_cast<const MachO::load_command *>(data.data() + offset);
+    if (command->cmdsize < sizeof(MachO::load_command) ||
+        command->cmdsize > end - offset)
+      return std::nullopt;
+    if (command->cmd == LP::segmentLCType) {
+      if (command->cmdsize < sizeof(Segment))
+        return std::nullopt;
+      auto *segment = reinterpret_cast<const Segment *>(command);
+      if (segment->nsects >
+          (command->cmdsize - sizeof(Segment)) / sizeof(Section))
+        return std::nullopt;
+    }
+    offset += command->cmdsize;
+  }
+  return hasObjCSection(buffer);
+}
+
+static std::optional<bool> readAheadObjC(MemoryBufferRef buffer) {
+  auto magic = identify_magic(buffer.getBuffer());
+  if (magic == file_magic::bitcode)
+    return std::nullopt;
+  if (magic != file_magic::macho_object)
+    return false;
+  return target->wordSize == 8 ? checkedReadAheadObjC<LP64>(buffer)
+                               : checkedReadAheadObjC<ILP32>(buffer);
+}
+
+static MemoryBufferRef readAheadSlice(MemoryBufferRef buffer) {
+  const char *data = buffer.getBufferStart();
+  size_t size = buffer.getBufferSize();
+  if (size < sizeof(uint32_t) || read32be(data) != FAT_MAGIC)
+    return buffer;
+  if (size < sizeof(fat_header))
+    return {};
+  auto *header = reinterpret_cast<const fat_header *>(data);
+  uint32_t count = read32be(&header->nfat_arch);
+  if (count > (size - sizeof(fat_header)) / sizeof(fat_arch))
+    return {};
+  auto *arch = reinterpret_cast<const fat_arch *>(header + 1);
+  for (uint32_t i = 0; i < count; ++i) {
+    if (read32be(&arch[i].cputype) != static_cast<uint32_t>(target->cpuType) ||
+        (read32be(&arch[i].cpusubtype) & ~MachO::CPU_SUBTYPE_MASK) !=
+            target->cpuSubtype)
+      continue;
+    uint32_t offset = read32be(&arch[i].offset),
+             length = read32be(&arch[i].size);
+    if (offset > size || length > size - offset)
+      return {};
+    return MemoryBufferRef(StringRef(data + offset, length),
+                           buffer.getBufferIdentifier());
+  }
+  return {};
+}
+
+class InputReadAhead {
+  struct Entry {
+    StringRef path;
+    std::unique_ptr<MemoryBuffer> buffer;
+    std::error_code error;
+    std::atomic<bool> claimed{false};
+    std::atomic<bool> ready{false};
+    bool taken = false;
+    std::optional<InputReadAheadArchive> prepared;
+    std::atomic<bool> archiveReady{false};
+    std::atomic<bool> archiveAbandoned{false};
+    bool archiveTaken = false;
+  };
+  StringMap<std::unique_ptr<Entry>> entries;
+  std::vector<Entry *> order;
+  std::vector<std::thread> readers;
+  std::atomic<bool> stopped{false};
+
+public:
+  InputReadAhead(ArrayRef<StringRef> paths) {
+    for (StringRef path : paths) {
+      if (cachedReads.contains(CachedHashStringRef(path)))
+        continue;
+      auto [it, inserted] = entries.try_emplace(path);
+      if (!inserted)
+        continue;
+      it->second = std::make_unique<Entry>();
+      it->second->path = it->first();
+      order.push_back(it->second.get());
+    }
+    if (order.empty())
+      return;
+    unsigned count =
+        std::min(4u, llvm::parallel::strategy.compute_thread_count());
+    for (unsigned i = 0; i < count; ++i)
+      readers.emplace_back([this, i, count] {
+        for (size_t j = i;
+             j < order.size() && !stopped.load(std::memory_order_relaxed);
+             j += count) {
+          Entry &entry = *order[j];
+          if (entry.claimed.exchange(true, std::memory_order_relaxed))
+            continue;
+          auto buffer = MemoryBuffer::getFile(entry.path, false, false);
+          MemoryBufferRef slice;
+          if (buffer) {
+            slice = readAheadSlice((*buffer)->getMemBufferRef());
+            if ((*buffer)->getBufferSize()) {
+              [[maybe_unused]] volatile char first =
+                  *(*buffer)->getBufferStart();
+              (void)first;
+            }
+            if (slice.getBufferSize() &&
+                slice.getBufferStart() != (*buffer)->getBufferStart()) {
+              [[maybe_unused]] volatile char first = *slice.getBufferStart();
+              (void)first;
+            }
+            entry.buffer = std::move(*buffer);
+          } else {
+            entry.error = buffer.getError();
+          }
+          entry.ready.store(true, std::memory_order_release);
+          if (entry.archiveAbandoned.load(std::memory_order_relaxed) ||
+              entry.error ||
+              identify_magic(slice.getBuffer()) != file_magic::archive)
+            continue;
+          auto archive = object::Archive::create(slice);
+          if (!archive) {
+            consumeError(archive.takeError());
+            continue;
+          }
+          entry.prepared.emplace();
+          entry.prepared->archive = std::move(*archive);
+          if (config->forceLoadObjC) {
+            std::vector<object::Archive::Child> matches;
+            bool scanned = true;
+            Error error = Error::success();
+            for (const auto &child : entry.prepared->archive->children(error)) {
+              if (stopped.load(std::memory_order_relaxed) ||
+                  entry.archiveAbandoned.load(std::memory_order_relaxed)) {
+                scanned = false;
+                break;
+              }
+              auto member = child.getMemoryBufferRef();
+              if (!member) {
+                consumeError(member.takeError());
+                scanned = false;
+                break;
+              }
+              auto objc = readAheadObjC(*member);
+              if (!objc) {
+                scanned = false;
+                break;
+              }
+              if (*objc)
+                matches.push_back(child);
+            }
+            if (error) {
+              consumeError(std::move(error));
+              scanned = false;
+            }
+            if (scanned)
+              entry.prepared->objcFiles = std::move(matches);
+          }
+          entry.archiveReady.store(true, std::memory_order_release);
+        }
+      });
+  }
+  ~InputReadAhead() {
+    stopped.store(true, std::memory_order_relaxed);
+    for (auto &reader : readers)
+      reader.join();
+  }
+  std::optional<InputReadAheadArchive> takeArchive(StringRef path,
+                                                   MemoryBufferRef buffer) {
+    auto it = entries.find(path);
+    if (it == entries.end())
+      return std::nullopt;
+    Entry &entry = *it->second;
+    if (entry.archiveTaken)
+      return std::nullopt;
+    if (!entry.taken || !entry.archiveReady.load(std::memory_order_acquire)) {
+      entry.archiveAbandoned.store(true, std::memory_order_relaxed);
+      return std::nullopt;
+    }
+    // Prepared state borrows the buffer that the driver must also have adopted.
+    MemoryBufferRef prepared = entry.prepared->archive->getMemoryBufferRef();
+    if (prepared.getBufferStart() != buffer.getBufferStart() ||
+        prepared.getBufferSize() != buffer.getBufferSize())
+      return std::nullopt;
+    entry.archiveTaken = true;
+    return std::move(entry.prepared);
+  }
+  std::optional<ErrorOr<std::unique_ptr<MemoryBuffer>>> take(StringRef path) {
+    auto it = entries.find(path);
+    if (it == entries.end() || it->second->taken)
+      return std::nullopt;
+    Entry &entry = *it->second;
+    if (!entry.ready.load(std::memory_order_acquire)) {
+      entry.claimed.store(true, std::memory_order_relaxed);
+      return std::nullopt;
+    }
+    entry.taken = true;
+    if (entry.error)
+      return ErrorOr<std::unique_ptr<MemoryBuffer>>(entry.error);
+    return ErrorOr<std::unique_ptr<MemoryBuffer>>(std::move(entry.buffer));
+  }
+};
+static std::unique_ptr<InputReadAhead> inputReadAhead;
+}
+#endif
+
+void macho::startInputReadAhead(ArrayRef<StringRef> paths) {
+#if LLVM_ENABLE_THREADS
+  inputReadAhead = std::make_unique<InputReadAhead>(paths);
+#endif
+}
+std::optional<InputReadAheadArchive>
+macho::takeInputReadAheadArchive(StringRef path, MemoryBufferRef buffer) {
+#if LLVM_ENABLE_THREADS
+  if (inputReadAhead)
+    return inputReadAhead->takeArchive(path, buffer);
+#endif
+  return std::nullopt;
+}
+void macho::stopInputReadAhead() {
+#if LLVM_ENABLE_THREADS
+  inputReadAhead.reset();
+#endif
+}
+
 // Open a given file path and return it as a memory-mapped file.
 std::optional<MemoryBufferRef> macho::readFile(StringRef path) {
   CachedHashStringRef key(path);
@@ -226,8 +474,15 @@ std::optional<MemoryBufferRef> macho::readFile(StringRef path) {
   if (entry != cachedReads.end())
     return entry->second;
 
+  std::optional<ErrorOr<std::unique_ptr<MemoryBuffer>>> ahead;
+#if LLVM_ENABLE_THREADS
+  if (inputReadAhead)
+    ahead = inputReadAhead->take(path);
+#endif
   ErrorOr<std::unique_ptr<MemoryBuffer>> mbOrErr =
-      MemoryBuffer::getFile(path, false, /*RequiresNullTerminator=*/false);
+      ahead ? std::move(*ahead)
+            : MemoryBuffer::getFile(path, false,
+                                    /*RequiresNullTerminator=*/false);
   if (std::error_code ec = mbOrErr.getError()) {
     error("cannot open " + path + ": " + ec.message());
     return std::nullopt;
@@ -283,8 +538,8 @@ std::optional<MemoryBufferRef> macho::readFile(StringRef path) {
       error(path + ": slice extends beyond end of file");
     if (tar)
       tar->append(relativeToRoot(path), mbref.getBuffer());
-    return cachedReads[key] = MemoryBufferRef(StringRef(buf + offset, size),
-                                              path.copy(bAlloc));
+    MemoryBufferRef slice(StringRef(buf + offset, size), path.copy(bAlloc));
+    return cachedReads[key] = slice;
   }
 
   auto targetArchName = getArchName(target->cpuType, target->cpuSubtype);
@@ -930,7 +1185,7 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
     }
     sections[i]->doneSplitting = true;
 
-    auto getSymName = [strtab](const NList& sym) -> StringRef {
+    auto getSymName = [strtab](const NList &sym) -> StringRef {
       return StringRef(strtab + sym.n_strx);
     };
 
@@ -944,7 +1199,8 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
       // SymbolTable::addDefined() for details.
       if (nList[lhs].n_value == nList[rhs].n_value &&
           nList[lhs].n_type & N_EXT && nList[rhs].n_type & N_EXT)
-        return !(nList[lhs].n_desc & N_WEAK_DEF) && (nList[rhs].n_desc & N_WEAK_DEF);
+        return !(nList[lhs].n_desc & N_WEAK_DEF) &&
+               (nList[rhs].n_desc & N_WEAK_DEF);
       return nList[lhs].n_value < nList[rhs].n_value;
     });
     size_t sameAddrGroupIdx = 0;
@@ -1851,7 +2107,7 @@ static bool isImplicitlyLinked(StringRef path) {
 }
 
 void DylibFile::loadReexport(StringRef path, DylibFile *umbrella,
-                         const InterfaceFile *currentTopLevelTapi) {
+                             const InterfaceFile *currentTopLevelTapi) {
   DylibFile *reexport = findDylib(path, umbrella, currentTopLevelTapi);
   if (!reexport) {
     // If not found in umbrella, retry since some rpaths might have been
@@ -2320,8 +2576,8 @@ void DylibFile::handleLDHideSymbol(StringRef name, StringRef originalName) {
     std::tie(minVersion, symbolName) = name.split('$');
     VersionTuple versionTup;
     if (versionTup.tryParse(minVersion)) {
-      warn(toString(this) + ": failed to parse hidden version, symbol `" + originalName +
-           "` ignored.");
+      warn(toString(this) + ": failed to parse hidden version, symbol `" +
+           originalName + "` ignored.");
       return;
     }
     shouldHide = versionTup == config->platformInfo.target.MinDeployment;
