@@ -3,7 +3,8 @@
 ## This tests that we can handle relocations that are not sorted by address.
 ## llvm-mc isn't able to emit such a file, hence the use of yaml2obj. ld64
 ## may emit files with unsorted relocations in `-r` mode, so we need to support
-## this.
+## this. Returning to an earlier subsection also exercises growth of a
+## borrowed relocation slice while another subsection still uses the pool.
 
 # RUN: yaml2obj %s -o %t.o
 # RUN: %lld -dylib -o %t %t.o
@@ -11,10 +12,16 @@
 
 # CHECK:      _foo:
 # CHECK-NEXT:      movq    _bar(%rip), %rax
-# CHECK-NEXT: _bar:
 # CHECK-NEXT:      movq    _baz(%rip), %rax
+# CHECK-NEXT:      movq    _foo(%rip), %rax
+# CHECK-NEXT: _bar:
+# CHECK-NEXT:      movq    _foo(%rip), %rax
+# CHECK-NEXT:      movq    _baz(%rip), %rax
+# CHECK-NEXT:      movq    _bar(%rip), %rax
 # CHECK-NEXT: _baz:
 # CHECK-NEXT:      movq    _foo(%rip), %rax
+# CHECK-NEXT:      movq    _bar(%rip), %rax
+# CHECK-NEXT:      movq    _baz(%rip), %rax
 
 --- !mach-o
 IsLittleEndian:  true
@@ -32,9 +39,9 @@ LoadCommands:
     cmdsize:         152
     segname:         ''
     vmaddr:          0
-    vmsize:          21
+    vmsize:          63
     fileoff:         312
-    filesize:        21
+    filesize:        63
     maxprot:         7
     initprot:        7
     nsects:          1
@@ -43,18 +50,26 @@ LoadCommands:
       - sectname:        __text
         segname:         __TEXT
         addr:            0x0
-        size:            21
+        size:            63
         offset:          0x138
         align:           0
-        reloff:          0x150
-        nreloc:          3
+        reloff:          0x178
+        nreloc:          9
         flags:           0x80000400
         reserved1:       0x0
         reserved2:       0x0
         reserved3:       0x0
-        content:         488B0500000000488B0500000000488B0500000000
+        content:         488B0500000000488B0500000000488B0500000000488B0500000000488B0500000000488B0500000000488B0500000000488B0500000000488B0500000000
         relocations:
-          - address:         0x3
+          - address:         59
+            symbolnum:       2
+            pcrel:           true
+            length:          2
+            extern:          true
+            type:            1
+            scattered:       false
+            value:           0
+          - address:         52
             symbolnum:       1
             pcrel:           true
             length:          2
@@ -62,7 +77,7 @@ LoadCommands:
             type:            1
             scattered:       false
             value:           0
-          - address:         0x11
+          - address:         45
             symbolnum:       0
             pcrel:           true
             length:          2
@@ -70,8 +85,48 @@ LoadCommands:
             type:            1
             scattered:       false
             value:           0
-          - address:         0xA
+          - address:         17
+            symbolnum:       0
+            pcrel:           true
+            length:          2
+            extern:          true
+            type:            1
+            scattered:       false
+            value:           0
+          - address:         38
+            symbolnum:       1
+            pcrel:           true
+            length:          2
+            extern:          true
+            type:            1
+            scattered:       false
+            value:           0
+          - address:         3
+            symbolnum:       1
+            pcrel:           true
+            length:          2
+            extern:          true
+            type:            1
+            scattered:       false
+            value:           0
+          - address:         31
             symbolnum:       2
+            pcrel:           true
+            length:          2
+            extern:          true
+            type:            1
+            scattered:       false
+            value:           0
+          - address:         10
+            symbolnum:       2
+            pcrel:           true
+            length:          2
+            extern:          true
+            type:            1
+            scattered:       false
+            value:           0
+          - address:         24
+            symbolnum:       0
             pcrel:           true
             length:          2
             extern:          true
@@ -80,9 +135,9 @@ LoadCommands:
             value:           0
   - cmd:             LC_SYMTAB
     cmdsize:         24
-    symoff:          360
+    symoff:          448
     nsyms:           3
-    stroff:          408
+    stroff:          496
     strsize:         16
 LinkEditData:
   NameList:
@@ -95,12 +150,12 @@ LinkEditData:
       n_type:          0xE
       n_sect:          1
       n_desc:          0
-      n_value:         7
+      n_value:         21
     - n_strx:          1
       n_type:          0xE
       n_sect:          1
       n_desc:          0
-      n_value:         14
+      n_value:         42
   StringTable:
     - ''
     - _baz
