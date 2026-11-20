@@ -570,29 +570,21 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
   if (relInfos.empty())
     return;
 
-  // ld64 -r can emit relocations out of address order. Sorting them gives each
-  // subsection one contiguous run of the Section's relocation array.
-  SmallVector<relocation_info, 0> sortedInfos;
-  auto byDescendingAddress = [](const relocation_info &a,
-                                const relocation_info &b) {
-    return a.r_address > b.r_address;
-  };
-  if (!llvm::is_sorted(relInfos, byDescendingAddress)) {
-    // Both entries of an ADDEND or SUBTRACTOR pair have the same address, so a
-    // stable sort keeps them adjacent and in order.
-    sortedInfos.assign(relInfos.begin(), relInfos.end());
-    llvm::stable_sort(sortedInfos, byDescendingAddress);
-    relInfos = sortedInfos;
-  }
-
   // Every relocation_info yields at most one Relocation.
   assert(!section.relocBuf);
   section.relocBuf = static_cast<Relocation *>(
       safe_malloc(relInfos.size() * sizeof(Relocation)));
   Relocation *nextSlot = section.relocBuf;
+  InputSection *tail = nullptr;
   auto append = [&](InputSection *subsec, const Relocation &r) {
+    // Unsorted relocations can return to a subsection whose slice has ended.
+    if (subsec != tail && !subsec->relocs.empty()) {
+      subsec->relocs.push_back(r);
+      return;
+    }
     new (nextSlot) Relocation(r);
     subsec->relocs.appendInPlace(nextSlot++);
+    tail = subsec;
   };
 
   Subsections &subsections = section.subsections;
@@ -680,12 +672,20 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
       r.setAddend(referentOffset);
     }
 
+    // Find the subsection that this relocation belongs to.
+    // Though not required by the Mach-O format, clang and gcc seem to emit
+    // relocations in order, so let's take advantage of it. However, ld64 emits
+    // unsorted relocations (in `-r` mode), so we have a fallback for that
+    // uncommon case.
     InputSection *subsec;
     while (subsecIt != subsections.rend() && subsecIt->offset > r.offset)
       ++subsecIt;
     if (subsecIt == subsections.rend() ||
         subsecIt->offset + subsecIt->isec->getSize() <= r.offset) {
       subsec = findContainingSubsection(section, &r.offset);
+      // Now that we know the relocs are unsorted, avoid trying the 'fast path'
+      // for the other relocations.
+      subsecIt = subsections.rend();
     } else {
       subsec = subsecIt->isec;
       r.offset -= subsecIt->offset;
