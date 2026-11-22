@@ -138,7 +138,7 @@ private:
   };
 };
 
-// The relocations of one subsection. They start as an alias of a slice of the
+// The relocations of one subsection. They start out borrowing a slice of the
 // input Section's relocation array, which avoids an allocation per subsection.
 // Appending moves them to a buffer of their own.
 class RelocArray {
@@ -166,7 +166,7 @@ public:
     return ptr[i];
   }
 
-  void alias(llvm::MutableArrayRef<Relocation> slice) {
+  void borrow(llvm::MutableArrayRef<Relocation> slice) {
     assert(!cap && "array has its own buffer");
     ptr = slice.data();
     len = slice.size();
@@ -175,7 +175,7 @@ public:
   template <class... Args> Relocation &emplace_back(Args &&...args) {
     if (len < cap)
       return *new (ptr + len++) Relocation(std::forward<Args>(args)...);
-    // An alias has no capacity: the array after it belongs to other
+    // A borrowed slice has no capacity: the array after it belongs to other
     // subsections.
     uint32_t newCap = std::max<uint32_t>(4, 2 * len);
     auto *buf = static_cast<Relocation *>(
@@ -199,7 +199,7 @@ public:
 private:
   Relocation *ptr = nullptr;
   uint32_t len = 0;
-  // Zero while this aliases the Section's array.
+  // Zero while this borrows from the Section's array.
   uint32_t cap = 0;
 };
 

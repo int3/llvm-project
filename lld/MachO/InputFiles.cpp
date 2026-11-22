@@ -584,7 +584,7 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
     if (!tail)
       return;
     std::reverse(nextSlot, runEnd);
-    tail->relocs.alias({nextSlot, runEnd});
+    tail->relocs.borrow({nextSlot, runEnd});
     runEnd = nextSlot;
     tail = nullptr;
   };
