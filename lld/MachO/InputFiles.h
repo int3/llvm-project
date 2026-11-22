@@ -72,12 +72,23 @@ public:
   uint32_t flags;
   uint64_t addr;
   Subsections subsections;
-  Relocation *relocBuf = nullptr;
+  // One allocation for the relocations of all subsections. The blocks fill
+  // its end, in subsection order.
+  void *relocBuf = nullptr;
+  RelocBlock *relocBlocks = nullptr;
+  RelocBlock *relocBlocksEnd = nullptr;
 
   Section(InputFile *file, StringRef segname, StringRef name, uint32_t flags,
           uint64_t addr)
       : file(file), segname(segname), name(name), flags(flags), addr(addr) {}
-  ~Section() { free(relocBuf); }
+  ~Section() {
+    for (RelocBlock *block = relocBlocks; block != relocBlocksEnd;) {
+      RelocBlock *next = block->next();
+      block->~RelocBlock();
+      block = next;
+    }
+    free(relocBuf);
+  }
   // Ensure pointers to Sections are never invalidated.
   Section(const Section &) = delete;
   Section &operator=(const Section &) = delete;

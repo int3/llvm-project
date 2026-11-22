@@ -980,8 +980,8 @@ void ObjCSelRefsHelper::initialize() {
       continue;
     // We expect a single relocation per selref entry to __objc_methname that
     // might be aggregated.
-    assert(isec->relocs.size() == 1);
-    auto Reloc = isec->relocs[0];
+    assert(isec->relocs().size() == 1);
+    auto Reloc = isec->relocs()[0];
     if (const auto *sym = dyn_cast_if_present<Symbol *>(Reloc.referent)) {
       if (const auto *d = dyn_cast<Defined>(sym)) {
         auto *cisec = cast<CStringInputSection>(d->isec());
@@ -1006,11 +1006,12 @@ ConcatInputSection *ObjCSelRefsHelper::makeSelRef(StringRef methname) {
                                 ArrayRef<uint8_t>{selrefData, wordSize},
                                 /*align=*/wordSize);
   assert(objcSelref->live);
-  objcSelref->relocs.push_back({/*type=*/target->unsignedRelocType,
-                                /*pcrel=*/false, /*length=*/3,
-                                /*offset=*/0,
-                                /*addend=*/static_cast<int64_t>(methnameOffset),
-                                /*referent=*/in.objcMethnameSection->isec});
+  objcSelref->relocVector().push_back(
+      {/*type=*/target->unsignedRelocType,
+       /*pcrel=*/false, /*length=*/3,
+       /*offset=*/0,
+       /*addend=*/static_cast<int64_t>(methnameOffset),
+       /*referent=*/in.objcMethnameSection->isec});
   objcSelref->parent = ConcatOutputSection::getOrCreateForInput(objcSelref);
   addInputSection(objcSelref);
   objcSelref->isFinal = true;
@@ -2329,14 +2330,14 @@ InitOffsetsSection::InitOffsetsSection()
 uint64_t InitOffsetsSection::getSize() const {
   size_t count = 0;
   for (const ConcatInputSection *isec : sections)
-    count += isec->relocs.size();
+    count += isec->relocs().size();
   return count * sizeof(uint32_t);
 }
 
 void InitOffsetsSection::writeTo(uint8_t *buf) const {
   // FIXME: Add function specified by -init when that argument is implemented.
   for (ConcatInputSection *isec : sections) {
-    for (const Relocation &rel : isec->relocs) {
+    for (const Relocation &rel : isec->relocs()) {
       const Symbol *referent = cast<Symbol *>(rel.referent);
       assert(referent && "section relocation should have been rejected");
       uint64_t offset = referent->getVA() - in.header->addr;
@@ -2351,7 +2352,7 @@ void InitOffsetsSection::writeTo(uint8_t *buf) const {
       size_t index = rel.offset >> target->p2WordSize;
       write32le(&buf[index * sizeof(uint32_t)], offset);
     }
-    buf += isec->relocs.size() * sizeof(uint32_t);
+    buf += isec->relocs().size() * sizeof(uint32_t);
   }
 }
 
@@ -2361,7 +2362,7 @@ void InitOffsetsSection::writeTo(uint8_t *buf) const {
 // not known at link time, stub-indirection has to be used.
 void InitOffsetsSection::setUp() {
   for (const ConcatInputSection *isec : sections) {
-    for (const Relocation &rel : isec->relocs) {
+    for (const Relocation &rel : isec->relocs()) {
       RelocAttrs attrs = target->getRelocAttrs(rel.type);
       if (!attrs.hasAttr(RelocAttrBits::UNSIGNED))
         error(isec->getLocation(rel.offset) +

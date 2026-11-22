@@ -721,7 +721,7 @@ void Writer::scanRelocations() {
     if (isec->shouldOmitFromOutput())
       continue;
 
-    for (auto it = isec->relocs.begin(); it != isec->relocs.end(); ++it) {
+    for (auto it = isec->relocs().begin(); it != isec->relocs().end(); ++it) {
       Relocation &r = *it;
 
       // Canonicalize the referent so that later accesses in Writer won't
@@ -1009,7 +1009,7 @@ static void orderObjCStubsByCallerPriority(
     auto prio = priorities.find(priorityIsec);
     if (prio == priorities.end())
       continue;
-    for (const Relocation &r : isec->relocs) {
+    for (const Relocation &r : isec->relocs()) {
       if (!target->hasAttr(r.type, RelocAttrBits::BRANCH))
         continue;
       auto *stub = dyn_cast_if_present<Symbol *>(r.referent);

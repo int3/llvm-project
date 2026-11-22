@@ -58,6 +58,15 @@ public:
   // Return the source line corresponding to an address, or the empty string.
   // Format: Source.cpp:123 (/path/to/Source.cpp:123)
   std::string getSourceLocation(uint64_t off) const;
+  ArrayRef<Relocation> relocs() const {
+    return relocVec ? ArrayRef<Relocation>(*relocVec) : ArrayRef<Relocation>();
+  }
+  MutableArrayRef<Relocation> relocs() {
+    return relocVec ? MutableArrayRef<Relocation>(*relocVec)
+                    : MutableArrayRef<Relocation>();
+  }
+  // Returns the relocations for appending, creating the vector if needed.
+  llvm::SmallVectorImpl<Relocation> &relocVector();
   // Return the relocation at \p off, if it exists. This does a linear search.
   const Relocation *getRelocAt(uint32_t off) const;
   // Whether the data at \p off in this InputSection is live. isLive() and
@@ -101,7 +110,9 @@ public:
 
   OutputSection *parent = nullptr;
   ArrayRef<uint8_t> data;
-  RelocArray relocs;
+  // Null if there are no relocations. Parsed relocations live in the Section's
+  // relocation buffer.
+  llvm::SmallVectorImpl<Relocation> *relocVec = nullptr;
   // The symbols that belong to this InputSection, sorted by value. With
   // .subsections_via_symbols, there is typically only one element here.
   llvm::TinyPtrVector<Defined *> symbols;

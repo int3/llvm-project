@@ -69,7 +69,7 @@ struct BPOrdererMachO : lld::BPOrderer<BPOrdererMachO> {
       hashes.push_back(byte);
 
     // Calculate relocation hashes
-    for (const auto &r : sec.relocs) {
+    for (const auto &r : sec.relocs()) {
       uint32_t relocLength = 1 << r.length;
       if (r.referent.isNull() || r.offset + relocLength > data.size())
         continue;

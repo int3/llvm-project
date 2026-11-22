@@ -191,7 +191,7 @@ void ObjcCategoryChecker::parseMethods(const ConcatInputSection *methodsIsec,
                                        MethodContainerKind mcKind,
                                        MethodKind mKind) {
   ObjcClass &klass = classMap[methodContainerSym];
-  for (const Relocation &r : methodsIsec->relocs) {
+  for (const Relocation &r : methodsIsec->relocs()) {
     if ((r.offset - listHeaderLayout.totalSize) % methodLayout.totalSize !=
         methodLayout.nameOffset)
       continue;
@@ -316,7 +316,7 @@ void objc::checkCategories() {
   ObjcCategoryChecker checker;
   for (const InputSection *isec : inputSections) {
     if (isec->getName() == section_names::objcCatList)
-      for (const Relocation &r : isec->relocs) {
+      for (const Relocation &r : isec->relocs()) {
         auto *catIsec = cast<ConcatInputSection>(r.getReferentInputSection());
         checker.parseCategory(catIsec);
       }
@@ -536,8 +536,8 @@ void ObjcCategoryMerger::collectSectionWriteInfoFromIsec(
   assert(catWriteInfo.outputSection &&
          "outputSection may not be null in collectSectionWriteInfoFromIsec.");
 
-  if (isec->relocs.size())
-    catWriteInfo.relocTemplate = isec->relocs[0];
+  if (isec->relocs().size())
+    catWriteInfo.relocTemplate = isec->relocs()[0];
 
   catWriteInfo.valid = true;
 }
@@ -1159,7 +1159,7 @@ void ObjcCategoryMerger::createSymbolReference(Defined *refFrom,
   r.offset = offset;
   r.setAddend(addend);
   r.referent = const_cast<Symbol *>(refTo);
-  refFrom->isec()->relocs.push_back(r);
+  refFrom->isec()->relocVector().push_back(r);
 }
 
 // Get the list of categories in the '__objc_nlcatlist' section. We can't
@@ -1172,7 +1172,7 @@ DenseSet<const Symbol *> ObjcCategoryMerger::collectNlCategories() {
     if (sec->getName() != section_names::objcNonLazyCatList)
       continue;
 
-    for (auto &r : sec->relocs) {
+    for (auto &r : sec->relocs()) {
       const Symbol *sym = dyn_cast_if_present<Symbol *>(r.referent);
       nlCategories.insert(sym);
     }
@@ -1493,7 +1493,8 @@ void ObjcCategoryMerger::eraseSymbolAtIsecOffset(ConcatInputSection *isec,
   auto removeAtOff = [offset](Relocation const &r) {
     return r.offset == offset;
   };
-  llvm::erase_if(isec->relocs, removeAtOff);
+  if (isec->relocVec)
+    llvm::erase_if(*isec->relocVec, removeAtOff);
 
   // Now, if the symbol fully occupies a ConcatInputSection, we can also erase
   // the whole ConcatInputSection

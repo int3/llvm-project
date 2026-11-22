@@ -570,24 +570,45 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
   if (relInfos.empty())
     return;
 
-  // Every relocation_info yields at most one Relocation.
+  // Every relocation_info yields at most one Relocation, and every subsection
+  // gets at most one block.
   assert(!section.relocBuf);
-  section.relocBuf = static_cast<Relocation *>(
-      safe_malloc(relInfos.size() * sizeof(Relocation)));
-  Relocation *nextSlot = section.relocBuf;
+  Subsections &subsections = section.subsections;
+  size_t bufSize =
+      relInfos.size() * sizeof(Relocation) +
+      std::min(subsections.size(), relInfos.size()) * sizeof(RelocBlock);
+  section.relocBuf = safe_malloc(bufSize);
+  section.relocBlocksEnd = reinterpret_cast<RelocBlock *>(
+      static_cast<char *>(section.relocBuf) + bufSize);
+  // Relocations arrive by descending address. Filling the buffer from its end
+  // puts the blocks in subsection order, so forward subsection walks read a
+  // forward stream.
+  auto *runEnd = reinterpret_cast<Relocation *>(section.relocBlocksEnd);
+  Relocation *nextSlot = runEnd;
   InputSection *tail = nullptr;
-  auto append = [&](InputSection *subsec, const Relocation &r) {
-    // Unsorted relocations can return to a subsection whose slice has ended.
-    if (subsec != tail && !subsec->relocs.empty()) {
-      subsec->relocs.push_back(r);
+  auto closeRun = [&] {
+    if (!tail)
       return;
+    std::reverse(nextSlot, runEnd);
+    auto *block = new (reinterpret_cast<RelocBlock *>(nextSlot) - 1)
+        RelocBlock(runEnd - nextSlot);
+    tail->relocVec = &block->relocs;
+    runEnd = nextSlot = reinterpret_cast<Relocation *>(block);
+    tail = nullptr;
+  };
+  auto append = [&](InputSection *subsec, const Relocation &r) {
+    if (subsec != tail) {
+      closeRun();
+      // Unsorted relocations can return to a subsection whose run has ended.
+      if (subsec->relocVec) {
+        subsec->relocVec->push_back(r);
+        return;
+      }
+      tail = subsec;
     }
-    new (nextSlot) Relocation(r);
-    subsec->relocs.appendInPlace(nextSlot++);
-    tail = subsec;
+    new (--nextSlot) Relocation(r);
   };
 
-  Subsections &subsections = section.subsections;
   auto subsecIt = subsections.rbegin();
   for (size_t i = 0; i < relInfos.size(); i++) {
     // Paired relocations serve as Mach-O's method for attaching a
@@ -716,11 +737,8 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
       append(subsec, p);
     }
   }
-  // Let forward subsection walks read a forward stream, without changing the
-  // relocation order within any subsection.
-  std::reverse(section.relocBuf, nextSlot);
-  for (auto sub : subsections)
-    sub.isec->relocs.restoreOrderAfterBufferReverse(section.relocBuf, nextSlot);
+  closeRun();
+  section.relocBlocks = reinterpret_cast<RelocBlock *>(nextSlot);
 }
 
 // ld64 never turns these labels into named atoms or symbol table entries.
@@ -1315,7 +1333,7 @@ void ObjFile::registerCompactUnwind(Section &compactUnwindSection) {
       continue;
 
     ConcatInputSection *referentIsec;
-    for (auto it = isec->relocs.begin(); it != isec->relocs.end();) {
+    for (auto it = isec->relocs().begin(); it != isec->relocs().end();) {
       Relocation &r = *it;
       // CUE::functionAddress is at offset 0. Skip personality & LSDA relocs.
       if (r.offset != 0) {
@@ -1390,7 +1408,7 @@ void ObjFile::registerCompactUnwind(Section &compactUnwindSection) {
       // Given that clang emits relocations in reverse order of address, this
       // relocation should be at the end of the vector for most of our input
       // object files, so this erase() is typically an O(1) operation.
-      it = isec->relocs.erase(it);
+      it = isec->relocVec->erase(it);
     }
   }
 }
@@ -1510,9 +1528,8 @@ static CIE parseCIE(const InputSection *isec, const EhReader &reader,
 // If `Invert` is set, then we instead expect `target_addr - PC` to be written
 // to `PC`.
 template <bool Invert = false>
-Defined *
-targetSymFromCanonicalSubtractor(const InputSection *isec,
-                                 RelocArray::iterator relocIt) {
+Defined *targetSymFromCanonicalSubtractor(const InputSection *isec,
+                                          Relocation *relocIt) {
   Relocation &subtrahend = *relocIt;
   Relocation &minuend = *std::next(relocIt);
   assert(target->hasAttr(subtrahend.type, RelocAttrBits::SUBTRAHEND));
@@ -1595,11 +1612,12 @@ void ObjFile::registerEhFrames(Section &ehFrameSection) {
     const size_t cieOffOff = dataOff;
 
     EhRelocator ehRelocator(isec);
-    auto cieOffRelocIt = llvm::find_if(isec->relocs, [=](const Relocation &r) {
-      return r.offset == cieOffOff;
-    });
+    auto cieOffRelocIt =
+        llvm::find_if(isec->relocs(), [=](const Relocation &r) {
+          return r.offset == cieOffOff;
+        });
     InputSection *cieIsec = nullptr;
-    if (cieOffRelocIt != isec->relocs.end()) {
+    if (cieOffRelocIt != isec->relocs().end()) {
       // We already have an explicit relocation for the CIE offset.
       cieIsec =
           targetSymFromCanonicalSubtractor</*Invert=*/true>(isec, cieOffRelocIt)
@@ -1646,9 +1664,9 @@ void ObjFile::registerEhFrames(Section &ehFrameSection) {
       }
     }
 
-    auto funcAddrRelocIt = isec->relocs.end();
-    auto lsdaAddrRelocIt = isec->relocs.end();
-    for (auto it = isec->relocs.begin(); it != isec->relocs.end(); ++it) {
+    auto funcAddrRelocIt = isec->relocs().end();
+    auto lsdaAddrRelocIt = isec->relocs().end();
+    for (auto it = isec->relocs().begin(); it != isec->relocs().end(); ++it) {
       if (it->offset == funcAddrOff)
         funcAddrRelocIt = it++; // Found subtrahend; skip over minuend reloc
       else if (lsdaAddrOpt && it->offset == lsdaAddrOff)
@@ -1656,7 +1674,7 @@ void ObjFile::registerEhFrames(Section &ehFrameSection) {
     }
 
     Defined *funcSym;
-    if (funcAddrRelocIt != isec->relocs.end()) {
+    if (funcAddrRelocIt != isec->relocs().end()) {
       funcSym = targetSymFromCanonicalSubtractor(isec, funcAddrRelocIt);
       // Canonicalize the symbol. If there are multiple symbols at the same
       // address, we want both `registerEhFrame` and `registerCompactUnwind`
@@ -1679,7 +1697,7 @@ void ObjFile::registerEhFrames(Section &ehFrameSection) {
     }
 
     InputSection *lsdaIsec = nullptr;
-    if (lsdaAddrRelocIt != isec->relocs.end()) {
+    if (lsdaAddrRelocIt != isec->relocs().end()) {
       lsdaIsec =
           targetSymFromCanonicalSubtractor(isec, lsdaAddrRelocIt)->isec();
     } else if (lsdaAddrOpt) {

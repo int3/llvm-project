@@ -27,7 +27,7 @@ using namespace llvm::support;
 using namespace lld;
 using namespace lld::macho;
 
-static_assert(sizeof(void *) != 8 || sizeof(ConcatInputSection) == 104,
+static_assert(sizeof(void *) != 8 || sizeof(ConcatInputSection) == 96,
               "Try to minimize ConcatInputSection's size, we create many "
               "instances of it");
 
@@ -184,10 +184,16 @@ std::string InputSection::getSourceLocation(uint64_t off) const {
   return {};
 }
 
+SmallVectorImpl<Relocation> &InputSection::relocVector() {
+  if (!relocVec)
+    relocVec = make<SmallVector<Relocation, 0>>();
+  return *relocVec;
+}
+
 const Relocation *InputSection::getRelocAt(uint32_t off) const {
-  auto it = llvm::find_if(relocs,
+  auto it = llvm::find_if(relocs(),
                           [=](const Relocation &r) { return r.offset == off; });
-  if (it == relocs.end())
+  if (it == relocs().end())
     return nullptr;
   return &*it;
 }
@@ -225,6 +231,7 @@ void ConcatInputSection::writeTo(uint8_t *buf) {
 
   memcpy(buf, data.data(), data.size());
 
+  ArrayRef<Relocation> relocs = this->relocs();
   for (size_t i = 0; i < relocs.size(); i++) {
     const Relocation &r = relocs[i];
     uint8_t *loc = buf + r.offset;

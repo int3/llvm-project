@@ -11,16 +11,12 @@
 
 #include "llvm/ADT/BitmaskEnum.h"
 #include "llvm/ADT/PointerUnion.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/Support/Endian.h"
-#include "llvm/Support/MemAlloc.h"
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
-#include <memory>
-#include <utility>
 
 namespace lld::macho {
 LLVM_ENABLE_BITMASK_ENUMS_IN_NAMESPACE();
@@ -137,98 +133,29 @@ private:
   };
 };
 
-// Borrow relocation storage from the input Section to avoid allocating per
-// subsection. Growing a borrowed slice moves it to a buffer of its own.
-class RelocArray {
-public:
-  using value_type = Relocation;
-  using iterator = Relocation *;
-  using const_iterator = const Relocation *;
+// A subsection's relocations, laid out in its Section's relocation buffer.
+// The relocations directly follow the vector, so they are its inline storage:
+// appending to a full vector moves it to the heap and leaves the buffer alone.
+struct RelocBlock {
+  struct Vector : llvm::SmallVectorImpl<Relocation> {
+    explicit Vector(unsigned n) : SmallVectorImpl<Relocation>(n) {
+      this->Size = n;
+    }
+  };
 
-  RelocArray() = default;
-  RelocArray(const RelocArray &) = delete;
-  RelocArray &operator=(const RelocArray &) = delete;
-  ~RelocArray() {
-    if (cap)
-      free(ptr);
-  }
+  // Kept so that ~Section() can find the next block after the vector grows.
+  size_t inlineSize;
+  Vector relocs;
 
-  iterator begin() { return ptr; }
-  iterator end() { return ptr + len; }
-  const_iterator begin() const { return ptr; }
-  const_iterator end() const { return ptr + len; }
-  size_t size() const { return len; }
-  bool empty() const { return len == 0; }
-  Relocation &operator[](size_t i) {
-    assert(i < len);
-    return ptr[i];
+  explicit RelocBlock(size_t n) : inlineSize(n), relocs(n) {}
+  RelocBlock *next() {
+    return reinterpret_cast<RelocBlock *>(
+        reinterpret_cast<Relocation *>(this + 1) + inlineSize);
   }
-  const Relocation &operator[](size_t i) const {
-    assert(i < len);
-    return ptr[i];
-  }
-  Relocation &front() { return (*this)[0]; }
-  const Relocation &front() const { return (*this)[0]; }
-  Relocation &back() { return (*this)[len - 1]; }
-
-  void push_back(const Relocation &r) {
-    // r may be an element of this array.
-    Relocation copy = r;
-    // A slice has no capacity: the array after it belongs to other subsections.
-    if (len >= cap)
-      grow();
-    new (ptr + len++) Relocation(copy);
-  }
-  template <class... Args> Relocation &emplace_back(Args &&...args) {
-    push_back(Relocation(std::forward<Args>(args)...));
-    return back();
-  }
-  template <class It> void insert(iterator pos, It first, It last) {
-    assert(pos == end() && "only appending is supported");
-    for (; first != last; ++first)
-      push_back(*first);
-  }
-  iterator erase(iterator it) { return erase(it, it + 1); }
-  iterator erase(iterator first, iterator last) {
-    len = std::move(last, end(), first) - ptr;
-    return first;
-  }
-
-  // The parser reverses the Section buffer to put slices in subsection order.
-  // Preserve the order within each slice; separately grown arrays are
-  // unaffected.
-  void restoreOrderAfterBufferReverse(Relocation *begin, Relocation *end) {
-    if (cap || empty())
-      return;
-    ptr = begin + (end - (ptr + len));
-    std::reverse(ptr, ptr + len);
-  }
-
-  void appendInPlace(Relocation *slot) {
-    assert(cap == 0 && "slice has its own buffer");
-    assert(len == 0 || ptr + len == slot);
-    if (len == 0)
-      ptr = slot;
-    ++len;
-  }
-
-private:
-  void grow() {
-    uint32_t newCap = std::max<uint32_t>(4, 2 * len);
-    auto *buf = static_cast<Relocation *>(
-        llvm::safe_malloc(newCap * sizeof(Relocation)));
-    std::uninitialized_copy(ptr, ptr + len, buf);
-    if (cap)
-      free(ptr);
-    ptr = buf;
-    cap = newCap;
-  }
-
-  Relocation *ptr = nullptr;
-  uint32_t len = 0;
-  // Zero while this is a slice of the Section's array.
-  uint32_t cap = 0;
 };
+static_assert(sizeof(RelocBlock) % alignof(Relocation) == 0 &&
+                  alignof(RelocBlock) <= alignof(Relocation),
+              "relocations must directly follow RelocBlock::relocs");
 
 bool validateSymbolRelocation(const Symbol *, const InputSection *,
                               const Relocation &);

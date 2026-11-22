@@ -276,14 +276,14 @@ void ARM64::populateThunk(InputSection *thunk, Symbol *funcSym,
   thunk->align = 4;
   thunk->data = {reinterpret_cast<const uint8_t *>(thunkCode),
                  sizeof(thunkCode)};
-  thunk->relocs.emplace_back(/*type=*/ARM64_RELOC_PAGEOFF12,
-                             /*pcrel=*/false, /*length=*/2,
-                             /*offset=*/4, /*addend=*/addend,
-                             /*referent=*/funcSym);
-  thunk->relocs.emplace_back(/*type=*/ARM64_RELOC_PAGE21,
-                             /*pcrel=*/true, /*length=*/2,
-                             /*offset=*/0, /*addend=*/addend,
-                             /*referent=*/funcSym);
+  thunk->relocVector().emplace_back(/*type=*/ARM64_RELOC_PAGEOFF12,
+                                    /*pcrel=*/false, /*length=*/2,
+                                    /*offset=*/4, /*addend=*/addend,
+                                    /*referent=*/funcSym);
+  thunk->relocVector().emplace_back(/*type=*/ARM64_RELOC_PAGE21,
+                                    /*pcrel=*/true, /*length=*/2,
+                                    /*offset=*/0, /*addend=*/addend,
+                                    /*referent=*/funcSym);
 }
 // Just a single direct branch to the target function.
 static constexpr uint32_t icfSafeThunkCode[] = {
@@ -296,16 +296,16 @@ void ARM64::initICFSafeThunkBody(InputSection *thunk, Symbol *targetSym) const {
   thunk->data = {reinterpret_cast<const uint8_t *>(icfSafeThunkCode),
                  sizeof(icfSafeThunkCode)};
 
-  thunk->relocs.emplace_back(/*type=*/ARM64_RELOC_BRANCH26,
-                             /*pcrel=*/true, /*length=*/2,
-                             /*offset=*/0, /*addend=*/0,
-                             /*referent=*/targetSym);
+  thunk->relocVector().emplace_back(/*type=*/ARM64_RELOC_BRANCH26,
+                                    /*pcrel=*/true, /*length=*/2,
+                                    /*offset=*/0, /*addend=*/0,
+                                    /*referent=*/targetSym);
 }
 
 Symbol *ARM64::getThunkBranchTarget(InputSection *thunk) const {
-  assert(thunk->relocs.size() == 1 &&
+  assert(thunk->relocs().size() == 1 &&
          "expected a single reloc on ARM64 ICF thunk");
-  auto &reloc = thunk->relocs[0];
+  auto &reloc = thunk->relocs()[0];
   assert(isa<Symbol *>(reloc.referent) &&
          "ARM64 thunk reloc is expected to point to a Symbol");
 

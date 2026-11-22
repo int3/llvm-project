@@ -104,8 +104,8 @@ static bool isFoldableIgnoringRelocatedBytes(const ConcatInputSection *isec) {
 static void getNormalizedData(const ConcatInputSection *isec,
                               SmallVectorImpl<uint8_t> &buf) {
   buf.assign(isec->data.begin(), isec->data.end());
-  for (size_t i = 0; i < isec->relocs.size(); ++i) {
-    const Relocation &r = isec->relocs[i];
+  for (size_t i = 0; i < isec->relocs().size(); ++i) {
+    const Relocation &r = isec->relocs()[i];
     size_t size = 1ULL << r.length;
     if (r.offset + size <= buf.size())
       memset(buf.data() + r.offset, 0, size);
@@ -227,7 +227,7 @@ bool ICF::equalsConstant(const ConcatInputSection *ia,
     // For section relocs, we compare the content at the section offset.
     return isecA->getOffset(ra.getAddend()) == isecB->getOffset(rb.getAddend());
   };
-  if (!llvm::equal(ia->relocs, ib->relocs, f))
+  if (!llvm::equal(ia->relocs(), ib->relocs(), f))
     return false;
 
   // Check unwind info structural compatibility: if there are symbols with
@@ -262,7 +262,7 @@ bool ICF::equalsVariable(const ConcatInputSection *ia,
                          const ConcatInputSection *ib) {
   if (verboseDiagnostics)
     ++equalsVariableCount;
-  assert(ia->relocs.size() == ib->relocs.size());
+  assert(ia->relocs().size() == ib->relocs().size());
   auto f = [this](const Relocation &ra, const Relocation &rb) {
     // We already filtered out mismatching values/addends in equalsConstant.
     if (ra.referent == rb.referent)
@@ -290,7 +290,7 @@ bool ICF::equalsVariable(const ConcatInputSection *ia,
     }
     return isecA->icfEqClass[icfPass % 2] == isecB->icfEqClass[icfPass % 2];
   };
-  if (!llvm::equal(ia->relocs, ib->relocs, f))
+  if (!llvm::equal(ia->relocs(), ib->relocs(), f))
     return false;
 
   // Compare unwind info equivalence classes.
@@ -442,7 +442,7 @@ void ICF::run() {
   for (icfPass = 0; icfPass < 2; ++icfPass) {
     parallelForEach(icfInputs, [&](ConcatInputSection *isec) {
       uint32_t hash = isec->icfEqClass[icfPass % 2];
-      for (const Relocation &r : isec->relocs) {
+      for (const Relocation &r : isec->relocs()) {
         if (auto *sym = dyn_cast_if_present<Symbol *>(r.referent)) {
           if (auto *defined = dyn_cast<Defined>(sym)) {
             if (defined->isec()) {
@@ -586,7 +586,7 @@ void macho::markAddrSigSymbols() {
 
     const InputSection *isec = addrSigSection->subsections[0].isec;
 
-    for (const Relocation &r : isec->relocs) {
+    for (const Relocation &r : isec->relocs()) {
       if (auto *sym = dyn_cast_if_present<Symbol *>(r.referent))
         markSymAsAddrSig(sym);
       else
@@ -615,8 +615,8 @@ Defined *macho::getBodyForThunkFoldedSym(Defined *foldedSym) {
   if (bodySym->branchExtensionThunk) {
     // For branch extension thunks, follow relocations to get the original body
     InputSection *thunk = bodySym->isec();
-    assert(thunk && !thunk->relocs.empty());
-    const Relocation &r = thunk->relocs.front();
+    assert(thunk && !thunk->relocs().empty());
+    const Relocation &r = thunk->relocs().front();
     assert(r.getAddend() == 0);
     bodySym = cast<Defined>(cast<Symbol *>(r.referent));
     assert(!bodySym->branchExtensionThunk);

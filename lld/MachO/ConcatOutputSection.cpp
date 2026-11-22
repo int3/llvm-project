@@ -303,7 +303,7 @@ void TextOutputSection::finalize() {
 
     // TODO: Remove this check and the assert below. In fact, I don't believe
     // the relocation iteration order matters for correctness.
-    bool hasCallsite = llvm::any_of(isec->relocs, [](Relocation &r) {
+    bool hasCallsite = llvm::any_of(isec->relocs(), [](Relocation &r) {
       return target->hasAttr(r.type, RelocAttrBits::BRANCH);
     });
     if (!hasCallsite)
@@ -312,10 +312,10 @@ void TextOutputSection::finalize() {
     // Process relocs by ascending address, i.e., ascending offset within isec
     // FIXME: This property does not hold for object files produced by ld64's
     // `-r` mode.
-    assert(is_sorted(isec->relocs, [](Relocation &a, Relocation &b) {
+    assert(is_sorted(isec->relocs(), [](Relocation &a, Relocation &b) {
       return a.offset > b.offset;
     }));
-    for (Relocation &r : reverse(isec->relocs)) {
+    for (Relocation &r : reverse(isec->relocs())) {
       if (!target->hasAttr(r.type, RelocAttrBits::BRANCH))
         continue;
       if (isTargetKnownInRange(*isec, r))

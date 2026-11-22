@@ -28,13 +28,13 @@ static constexpr StringRef forceLoadPrefix = "__swift_FORCE_LOAD_$_";
 // pointer relocation to an imported `__swift_FORCE_LOAD_$_*` symbol, i.e.
 // the section exists only to force-load Swift overlays and holds no other data.
 static bool isSwiftForceLoadSection(const ConcatInputSection *isec) {
-  if (isec->relocs.empty())
+  if (isec->relocs().empty())
     return false;
 
-  if (isec->getSize() != target->wordSize * isec->relocs.size())
+  if (isec->getSize() != target->wordSize * isec->relocs().size())
     return false;
 
-  for (const Relocation &r : isec->relocs) {
+  for (const Relocation &r : isec->relocs()) {
     auto *sym = dyn_cast_if_present<Symbol *>(r.referent);
     auto *dylibSym = dyn_cast_or_null<DylibSymbol>(sym);
     if (!dylibSym || dylibSym->isDynamicLookup() ||
