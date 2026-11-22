@@ -582,18 +582,15 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
   Relocation *runEnd = section.relocBuf + relInfos.size();
   Relocation *nextSlot = runEnd;
   InputSection *tail = nullptr;
-  auto closeRun = [&] {
-    if (!tail)
-      return;
-    std::reverse(nextSlot, runEnd);
-    tail->relocs.borrow({nextSlot, runEnd});
-    runEnd = nextSlot;
-    tail = nullptr;
-  };
-  auto startRun = [&](InputSection *subsec) {
-    closeRun();
-    assert(subsec->relocs.empty() && "relocations are not sorted");
-    tail = subsec;
+  // Hands the current run to its subsection and makes next the current one.
+  auto switchRun = [&](InputSection *next) {
+    if (tail) {
+      std::reverse(nextSlot, runEnd);
+      tail->relocs.borrow({nextSlot, runEnd});
+      runEnd = nextSlot;
+    }
+    assert((!next || next->relocs.empty()) && "relocations are not sorted");
+    tail = next;
   };
 
   Subsections &subsections = section.subsections;
@@ -718,7 +715,7 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
       r.offset -= subsecIt->offset;
     }
     if (subsec != tail)
-      startRun(subsec);
+      switchRun(subsec);
     new (--nextSlot) Relocation(r);
 
     if (isSubtrahend) {
@@ -745,7 +742,7 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
       new (--nextSlot) Relocation(p);
     }
   }
-  closeRun();
+  switchRun(nullptr);
   for (const std::string &msg : errors)
     error(msg);
 }
