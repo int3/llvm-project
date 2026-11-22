@@ -571,15 +571,29 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
   if (relInfos.empty())
     return;
 
+  // All of the section's relocations go into one array, where each subsection
+  // gets one run: the contiguous range that holds its relocations. The file
+  // lists relocations by descending address (checked below), so a subsection's
+  // relocations arrive one after another, and the last subsection's come
+  // first.
+  //
+  // The array is filled from its end. That puts the runs in subsection order,
+  // so that a pass over the subsections reads the array front to back. It also
+  // stores each run back to front, so a finished run is reversed to give its
+  // relocations the order they have in the file.
+  //
+  // The array is never freed, and its unused slots are never constructed.
+  static_assert(std::is_trivially_destructible_v<Relocation>);
   // Every relocation_info yields at most one Relocation.
-  assert(!section.relocBuf);
-  section.relocBuf = static_cast<Relocation *>(
-      safe_malloc(relInfos.size() * sizeof(Relocation)));
-  // Relocations arrive by descending address. Filling the array from its end
-  // puts each subsection's run in subsection order, so forward subsection
-  // walks read a forward stream.
-  Relocation *runEnd = section.relocBuf + relInfos.size();
-  Relocation *nextSlot = runEnd;
+  Relocation *relocsEnd =
+      getSpecificAllocSingletonThreadLocal<Relocation>().Allocate(
+          relInfos.size()) +
+      relInfos.size();
+  // The slots from nextSlot to the end of the array are filled. The current
+  // run is [nextSlot, runEnd) and belongs to tail, which is null until the
+  // first relocation.
+  Relocation *runEnd = relocsEnd;
+  Relocation *nextSlot = relocsEnd;
   InputSection *tail = nullptr;
   // Hands the current run to its subsection and makes next the current one.
   auto switchRun = [&](InputSection *next) {
@@ -594,16 +608,17 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
 
   Subsections &subsections = section.subsections;
   auto subsecIt = subsections.rbegin();
-  // validateRelocationInfo's diagnostics, held back in case the walk restarts.
+  // validateRelocationInfo's errors, reported once the walk can no longer
+  // start over.
   SmallVector<std::string, 0> errors;
   SmallVector<relocation_info, 0> sortedInfos;
   int32_t prevAddress = std::numeric_limits<int32_t>::max();
   for (size_t i = 0; i < relInfos.size(); i++) {
     if (LLVM_UNLIKELY(relInfos[i].r_address > prevAddress)) {
       // ld64 -r can emit relocations out of address order, and then a
-      // subsection's relocations are not one run. Start over with them sorted.
-      // Both entries of an ADDEND or SUBTRACTOR pair have the same address, so
-      // a stable sort keeps them adjacent and in order.
+      // subsection's relocations do not arrive as one run. Sort them and start
+      // over. Both entries of an ADDEND or SUBTRACTOR pair have the same
+      // address, so a stable sort keeps them adjacent and in order.
       sortedInfos.assign(relInfos.begin(), relInfos.end());
       llvm::stable_sort(sortedInfos,
                         [](const relocation_info &a, const relocation_info &b) {
@@ -612,7 +627,7 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
       relInfos = sortedInfos;
       for (Subsection &sub : subsections)
         sub.isec->relocs.borrow({});
-      runEnd = nextSlot = section.relocBuf + relInfos.size();
+      runEnd = nextSlot = relocsEnd;
       tail = nullptr;
       subsecIt = subsections.rbegin();
       errors.clear();
@@ -701,8 +716,9 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
       r.setAddend(referentOffset);
     }
 
-    // Find the subsection that this relocation belongs to. The relocations
-    // are in descending address order, so the subsections only move backward.
+    // Find the subsection that this relocation belongs to. Addresses only
+    // descend, so the search continues from the previous relocation's
+    // subsection.
     InputSection *subsec;
     while (subsecIt != subsections.rend() && subsecIt->offset > r.offset)
       ++subsecIt;

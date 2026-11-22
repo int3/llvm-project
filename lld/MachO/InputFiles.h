@@ -72,12 +72,10 @@ public:
   uint32_t flags;
   uint64_t addr;
   Subsections subsections;
-  Relocation *relocBuf = nullptr;
 
   Section(InputFile *file, StringRef segname, StringRef name, uint32_t flags,
           uint64_t addr)
       : file(file), segname(segname), name(name), flags(flags), addr(addr) {}
-  ~Section() { free(relocBuf); }
   // Ensure pointers to Sections are never invalidated.
   Section(const Section &) = delete;
   Section &operator=(const Section &) = delete;
