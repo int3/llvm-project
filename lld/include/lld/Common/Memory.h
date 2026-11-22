@@ -88,6 +88,12 @@ template <typename T> T *makeThreadLocalN(size_t n) {
   return new (getSpecificAllocSingletonThreadLocal<T>().Allocate(n)) T[n];
 }
 
+// A bump allocator for the calling thread. Unlike the allocators above, it
+// neither constructs nor destroys what it hands out.
+inline llvm::BumpPtrAllocator &bAllocThreadLocal() {
+  thread_local llvm::BumpPtrAllocator alloc;
+  return alloc;
+}
 } // namespace lld
 
 #endif

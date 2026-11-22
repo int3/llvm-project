@@ -582,12 +582,9 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
   // stores each run back to front, so a finished run is reversed to give its
   // relocations the order they have in the file.
   //
-  // The array is never freed, and its unused slots are never constructed.
-  static_assert(std::is_trivially_destructible_v<Relocation>);
   // Every relocation_info yields at most one Relocation.
   Relocation *relocsEnd =
-      getSpecificAllocSingletonThreadLocal<Relocation>().Allocate(
-          relInfos.size()) +
+      bAllocThreadLocal().Allocate<Relocation>(relInfos.size()) +
       relInfos.size();
   // The slots from nextSlot to the end of the array are filled. The current
   // run is [nextSlot, runEnd) and belongs to tail, which is null until the
