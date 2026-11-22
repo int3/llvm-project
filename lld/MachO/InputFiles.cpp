@@ -574,17 +574,31 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
   assert(!section.relocBuf);
   section.relocBuf = static_cast<Relocation *>(
       safe_malloc(relInfos.size() * sizeof(Relocation)));
-  Relocation *nextSlot = section.relocBuf;
+  // Relocations arrive by descending address. Filling the array from its end
+  // puts each subsection's run in subsection order, so forward subsection
+  // walks read a forward stream.
+  Relocation *runEnd = section.relocBuf + relInfos.size();
+  Relocation *nextSlot = runEnd;
   InputSection *tail = nullptr;
-  auto append = [&](InputSection *subsec, const Relocation &r) {
-    // Unsorted relocations can return to a subsection whose slice has ended.
-    if (subsec != tail && !subsec->relocs.empty()) {
-      subsec->relocs.push_back(r);
+  auto closeRun = [&] {
+    if (!tail)
       return;
+    std::reverse(nextSlot, runEnd);
+    tail->relocs.alias({nextSlot, runEnd});
+    runEnd = nextSlot;
+    tail = nullptr;
+  };
+  auto append = [&](InputSection *subsec, const Relocation &r) {
+    if (subsec != tail) {
+      closeRun();
+      // Unsorted relocations can return to a subsection whose run has ended.
+      if (!subsec->relocs.empty()) {
+        subsec->relocs.emplace_back(r);
+        return;
+      }
+      tail = subsec;
     }
-    new (nextSlot) Relocation(r);
-    subsec->relocs.appendInPlace(nextSlot++);
-    tail = subsec;
+    new (--nextSlot) Relocation(r);
   };
 
   Subsections &subsections = section.subsections;
@@ -716,11 +730,7 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
       append(subsec, p);
     }
   }
-  // Let forward subsection walks read a forward stream, without changing the
-  // relocation order within any subsection.
-  std::reverse(section.relocBuf, nextSlot);
-  for (auto sub : subsections)
-    sub.isec->relocs.restoreOrderAfterBufferReverse(section.relocBuf, nextSlot);
+  closeRun();
 }
 
 // ld64 never turns these labels into named atoms or symbol table entries.
@@ -1510,9 +1520,8 @@ static CIE parseCIE(const InputSection *isec, const EhReader &reader,
 // If `Invert` is set, then we instead expect `target_addr - PC` to be written
 // to `PC`.
 template <bool Invert = false>
-Defined *
-targetSymFromCanonicalSubtractor(const InputSection *isec,
-                                 RelocArray::iterator relocIt) {
+Defined *targetSymFromCanonicalSubtractor(const InputSection *isec,
+                                          Relocation *relocIt) {
   Relocation &subtrahend = *relocIt;
   Relocation &minuend = *std::next(relocIt);
   assert(target->hasAttr(subtrahend.type, RelocAttrBits::SUBTRAHEND));
