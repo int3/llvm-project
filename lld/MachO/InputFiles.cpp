@@ -588,17 +588,21 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
     runEnd = nextSlot;
     tail = nullptr;
   };
-  auto append = [&](InputSection *subsec, const Relocation &r) {
-    if (subsec != tail) {
-      closeRun();
-      // Unsorted relocations can return to a subsection whose run has ended.
-      if (!subsec->relocs.empty()) {
-        subsec->relocs.emplace_back(r);
-        return;
-      }
-      tail = subsec;
+  // Returns false if it appended r itself: unsorted relocations can return to
+  // a subsection whose run has ended.
+  auto startRun = [&](InputSection *subsec, const Relocation &r) {
+    closeRun();
+    if (!subsec->relocs.empty()) {
+      subsec->relocs.emplace_back(r);
+      return false;
     }
-    new (--nextSlot) Relocation(r);
+    tail = subsec;
+    return true;
+  };
+  // Keep this small enough to inline: it runs for every relocation.
+  auto append = [&](InputSection *subsec, const Relocation &r) {
+    if (subsec == tail || startRun(subsec, r))
+      new (--nextSlot) Relocation(r);
   };
 
   Subsections &subsections = section.subsections;
