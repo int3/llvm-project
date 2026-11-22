@@ -527,7 +527,8 @@ struct AuthEmbeddedPointer {
 
 template <class SectionHeader>
 static bool validateRelocationInfo(InputFile *file, const SectionHeader &sec,
-                                   relocation_info rel) {
+                                   relocation_info rel,
+                                   SmallVectorImpl<std::string> &errors) {
   const RelocAttrs &relocAttrs = target->getRelocAttrs(rel.r_type);
   bool valid = true;
   auto message = [relocAttrs, file, sec, rel, &valid](const Twine &diagnostic) {
@@ -539,24 +540,25 @@ static bool validateRelocationInfo(InputFile *file, const SectionHeader &sec,
   };
 
   if (!relocAttrs.hasAttr(RelocAttrBits::LOCAL) && !rel.r_extern)
-    error(message("must be extern"));
+    errors.push_back(message("must be extern"));
   if (relocAttrs.hasAttr(RelocAttrBits::PCREL) != rel.r_pcrel)
-    error(message(Twine("must ") + (rel.r_pcrel ? "not " : "") +
-                  "be PC-relative"));
+    errors.push_back(message(Twine("must ") + (rel.r_pcrel ? "not " : "") +
+                             "be PC-relative"));
   if (isThreadLocalVariables(sec.flags) &&
       !relocAttrs.hasAttr(RelocAttrBits::UNSIGNED))
-    error(message("not allowed in thread-local section, must be UNSIGNED"));
+    errors.push_back(
+        message("not allowed in thread-local section, must be UNSIGNED"));
   if (!relocAttrs.hasAttr(static_cast<RelocAttrBits>(1 << rel.r_length))) {
-    error(message("has invalid width of " + std::to_string(1 << rel.r_length) +
-                  " bytes"));
+    errors.push_back(message("has invalid width of " +
+                             std::to_string(1 << rel.r_length) + " bytes"));
   }
   if (valid && relocAttrs.hasAttr(RelocAttrBits::AUTH)) {
     auto ptr = bit_cast<AuthEmbeddedPointer>(
         read64le(file->mb.getBufferStart() + sec.offset + rel.r_address));
     if (!ptr.auth)
-      error(message("requires bit 63 to be set"));
+      errors.push_back(message("requires bit 63 to be set"));
     if (ptr.reserved)
-      error(message("requires bits 51..62 to be zero"));
+      errors.push_back(message("requires bits 51..62 to be zero"));
   }
   return valid;
 }
@@ -588,26 +590,39 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
     runEnd = nextSlot;
     tail = nullptr;
   };
-  // Returns false if it appended r itself: unsorted relocations can return to
-  // a subsection whose run has ended.
-  auto startRun = [&](InputSection *subsec, const Relocation &r) {
+  auto startRun = [&](InputSection *subsec) {
     closeRun();
-    if (!subsec->relocs.empty()) {
-      subsec->relocs.emplace_back(r);
-      return false;
-    }
+    assert(subsec->relocs.empty() && "relocations are not sorted");
     tail = subsec;
-    return true;
-  };
-  // Keep this small enough to inline: it runs for every relocation.
-  auto append = [&](InputSection *subsec, const Relocation &r) {
-    if (subsec == tail || startRun(subsec, r))
-      new (--nextSlot) Relocation(r);
   };
 
   Subsections &subsections = section.subsections;
   auto subsecIt = subsections.rbegin();
+  // validateRelocationInfo's diagnostics, held back in case the walk restarts.
+  SmallVector<std::string, 0> errors;
+  SmallVector<relocation_info, 0> sortedInfos;
+  int32_t prevAddress = std::numeric_limits<int32_t>::max();
   for (size_t i = 0; i < relInfos.size(); i++) {
+    if (LLVM_UNLIKELY(relInfos[i].r_address > prevAddress)) {
+      // ld64 -r can emit relocations out of address order, and then a
+      // subsection's relocations are not one run. Start over with them sorted.
+      // Both entries of an ADDEND or SUBTRACTOR pair have the same address, so
+      // a stable sort keeps them adjacent and in order.
+      sortedInfos.assign(relInfos.begin(), relInfos.end());
+      llvm::stable_sort(sortedInfos,
+                        [](const relocation_info &a, const relocation_info &b) {
+                          return a.r_address > b.r_address;
+                        });
+      relInfos = sortedInfos;
+      for (Subsection &sub : subsections)
+        sub.isec->relocs.borrow({});
+      runEnd = nextSlot = section.relocBuf + relInfos.size();
+      tail = nullptr;
+      subsecIt = subsections.rbegin();
+      errors.clear();
+      i = 0;
+    }
+    prevAddress = relInfos[i].r_address;
     // Paired relocations serve as Mach-O's method for attaching a
     // supplemental datum to a primary relocation record. ELF does not
     // need them because the *_RELOC_RELA records contain the extra
@@ -641,7 +656,7 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
       relInfo = relInfos[++i];
     }
     assert(i < relInfos.size());
-    if (!validateRelocationInfo(this, sec, relInfo))
+    if (!validateRelocationInfo(this, sec, relInfo, errors))
       continue;
     if (relInfo.r_address & R_SCATTERED)
       fatal("TODO: Scattered relocations not supported");
@@ -690,25 +705,21 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
       r.setAddend(referentOffset);
     }
 
-    // Find the subsection that this relocation belongs to.
-    // Though not required by the Mach-O format, clang and gcc seem to emit
-    // relocations in order, so let's take advantage of it. However, ld64 emits
-    // unsorted relocations (in `-r` mode), so we have a fallback for that
-    // uncommon case.
+    // Find the subsection that this relocation belongs to. The relocations
+    // are in descending address order, so the subsections only move backward.
     InputSection *subsec;
     while (subsecIt != subsections.rend() && subsecIt->offset > r.offset)
       ++subsecIt;
     if (subsecIt == subsections.rend() ||
         subsecIt->offset + subsecIt->isec->getSize() <= r.offset) {
       subsec = findContainingSubsection(section, &r.offset);
-      // Now that we know the relocs are unsorted, avoid trying the 'fast path'
-      // for the other relocations.
-      subsecIt = subsections.rend();
     } else {
       subsec = subsecIt->isec;
       r.offset -= subsecIt->offset;
     }
-    append(subsec, r);
+    if (subsec != tail)
+      startRun(subsec);
+    new (--nextSlot) Relocation(r);
 
     if (isSubtrahend) {
       relocation_info minuendInfo = relInfos[++i];
@@ -731,10 +742,12 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
             *sections[minuendInfo.r_symbolnum - 1], &referentOffset);
         p.setAddend(referentOffset);
       }
-      append(subsec, p);
+      new (--nextSlot) Relocation(p);
     }
   }
   closeRun();
+  for (const std::string &msg : errors)
+    error(msg);
 }
 
 // ld64 never turns these labels into named atoms or symbol table entries.
