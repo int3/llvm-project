@@ -313,9 +313,9 @@ void TextOutputSection::finalize() {
     // FIXME: This property does not hold for object files produced by ld64's
     // `-r` mode.
     assert(is_sorted(isec->relocs, [](Relocation &a, Relocation &b) {
-      return a.offset > b.offset;
+      return a.offset < b.offset;
     }));
-    for (Relocation &r : reverse(isec->relocs)) {
+    for (Relocation &r : isec->relocs) {
       if (!target->hasAttr(r.type, RelocAttrBits::BRANCH))
         continue;
       if (isTargetKnownInRange(*isec, r))

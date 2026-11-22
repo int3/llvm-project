@@ -578,9 +578,9 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
   // first.
   //
   // The array is filled from its end. That puts the runs in subsection order,
-  // so that a pass over the subsections reads the array front to back. It also
-  // stores each run back to front, so a finished run is reversed to give its
-  // relocations the order they have in the file.
+  // so that a pass over the subsections reads the array front to back, and
+  // each run's relocations in ascending address order. A SUBTRACTOR still
+  // precedes its paired UNSIGNED.
   //
   // Every relocation_info yields at most one Relocation.
   Relocation *relocsEnd =
@@ -595,7 +595,6 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
   // Hands the current run to its subsection and makes next the current one.
   auto switchRun = [&](InputSection *next) {
     if (tail) {
-      std::reverse(nextSlot, runEnd);
       tail->relocs.borrow({nextSlot, runEnd});
       runEnd = nextSlot;
     }
@@ -728,9 +727,10 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
     }
     if (subsec != tail)
       switchRun(subsec);
-    new (--nextSlot) Relocation(r);
 
-    if (isSubtrahend) {
+    if (!isSubtrahend) {
+      new (--nextSlot) Relocation(r);
+    } else {
       relocation_info minuendInfo = relInfos[++i];
       // SUBTRACTOR relocations should always be followed by an UNSIGNED one
       // attached to the same address.
@@ -751,7 +751,9 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
             *sections[minuendInfo.r_symbolnum - 1], &referentOffset);
         p.setAddend(referentOffset);
       }
-      new (--nextSlot) Relocation(p);
+      nextSlot -= 2;
+      new (nextSlot) Relocation(r);
+      new (nextSlot + 1) Relocation(p);
     }
   }
   switchRun(nullptr);
@@ -1422,10 +1424,6 @@ void ObjFile::registerCompactUnwind(Section &compactUnwindSection) {
       // distinct functions (if the CUEs are otherwise identical).
       // UnwindInfoSection takes care of this by re-duplicating the CUEs so that
       // each one can hold a distinct functionAddress value.
-      //
-      // Given that clang emits relocations in reverse order of address, this
-      // relocation should be at the end of the vector for most of our input
-      // object files, so this erase() is typically an O(1) operation.
       it = isec->relocs.erase(it);
     }
   }
