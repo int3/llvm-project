@@ -531,34 +531,33 @@ static bool validateRelocationInfo(InputFile *file, const SectionHeader &sec,
                                    SmallVectorImpl<std::string> &errors) {
   const RelocAttrs &relocAttrs = target->getRelocAttrs(rel.r_type);
   bool valid = true;
-  auto message = [relocAttrs, file, sec, rel, &valid](const Twine &diagnostic) {
+  auto addError = [&](const Twine &diagnostic) {
     valid = false;
-    return (relocAttrs.name + " relocation " + diagnostic + " at offset " +
-            std::to_string(rel.r_address) + " of " + sec.segname + "," +
-            sec.sectname + " in " + toString(file))
-        .str();
+    errors.push_back((relocAttrs.name + " relocation " + diagnostic +
+                      " at offset " + std::to_string(rel.r_address) + " of " +
+                      sec.segname + "," + sec.sectname + " in " +
+                      toString(file))
+                         .str());
   };
 
   if (!relocAttrs.hasAttr(RelocAttrBits::LOCAL) && !rel.r_extern)
-    errors.push_back(message("must be extern"));
+    addError("must be extern");
   if (relocAttrs.hasAttr(RelocAttrBits::PCREL) != rel.r_pcrel)
-    errors.push_back(message(Twine("must ") + (rel.r_pcrel ? "not " : "") +
-                             "be PC-relative"));
+    addError(Twine("must ") + (rel.r_pcrel ? "not " : "") + "be PC-relative");
   if (isThreadLocalVariables(sec.flags) &&
       !relocAttrs.hasAttr(RelocAttrBits::UNSIGNED))
-    errors.push_back(
-        message("not allowed in thread-local section, must be UNSIGNED"));
+    addError("not allowed in thread-local section, must be UNSIGNED");
   if (!relocAttrs.hasAttr(static_cast<RelocAttrBits>(1 << rel.r_length))) {
-    errors.push_back(message("has invalid width of " +
-                             std::to_string(1 << rel.r_length) + " bytes"));
+    addError("has invalid width of " + std::to_string(1 << rel.r_length) +
+             " bytes");
   }
   if (valid && relocAttrs.hasAttr(RelocAttrBits::AUTH)) {
     auto ptr = bit_cast<AuthEmbeddedPointer>(
         read64le(file->mb.getBufferStart() + sec.offset + rel.r_address));
     if (!ptr.auth)
-      errors.push_back(message("requires bit 63 to be set"));
+      addError("requires bit 63 to be set");
     if (ptr.reserved)
-      errors.push_back(message("requires bits 51..62 to be zero"));
+      addError("requires bits 51..62 to be zero");
   }
   return valid;
 }
