@@ -562,6 +562,15 @@ static bool validateRelocationInfo(InputFile *file, const SectionHeader &sec,
   return valid;
 }
 
+// Parse relocations and assign them to their respective subsections.
+//
+// All of the section's relocations go into one array, and that array is sliced
+// into contiguous ranges, each containing one subsection's relocations. This is
+// cheaper than allocating one array per subsection. Moreover, we store the
+// relocations in ascending address order, just like the subsections are
+// ordered. Operations like scanRelocations and thunk emission iterate through
+// relocations in subsection order, and this layout ensures that these
+// operations can take advantage of the prefetcher.
 template <class SectionHeader>
 void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
                                const SectionHeader &sec, Section &section) {
@@ -571,32 +580,23 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
   if (relInfos.empty())
     return;
 
-  // All of the section's relocations go into one array, where each subsection
-  // gets one run: the contiguous range that holds its relocations. The file
-  // lists relocations by descending address (checked below), so a subsection's
-  // relocations arrive one after another, and the last subsection's come
-  // first.
-  //
-  // The array is filled from its end. That puts the runs in subsection order,
-  // so that a pass over the subsections reads the array front to back, and
-  // each run's relocations in ascending address order. A SUBTRACTOR still
-  // precedes its paired UNSIGNED.
-  //
-  // Every relocation_info yields at most one Relocation.
-  Relocation *relocsEnd =
-      bAllocThreadLocal().Allocate<Relocation>(relInfos.size()) +
-      relInfos.size();
-  // The slots from nextSlot to the end of the array are filled. The current
-  // run is [nextSlot, runEnd) and belongs to tail, which is null until the
-  // first relocation.
-  Relocation *runEnd = relocsEnd;
-  Relocation *nextSlot = relocsEnd;
+  // N relocation_infos generate at most N Relocations (fewer if there are
+  // ADDEND relocation_infos). Allocate a buffer big enough for all of them.
+  MutableArrayRef<Relocation> sectionRelocs(
+      bAllocThreadLocal().Allocate<Relocation>(relInfos.size()),
+      relInfos.size());
+  // Most object files list relocation_infos in descending address order, so we
+  // optimize for that case by filling in sectionRelocs from the back. We call
+  // each subsection's slice of the array a "run". `tail` is the subsection
+  // whose relocations are currently being parsed.
+  Relocation *runEnd = sectionRelocs.end();
+  Relocation *runBegin = sectionRelocs.end();
   InputSection *tail = nullptr;
-  // Hands the current run to its subsection and makes next the current one.
+  // Hands the current run to its subsection and makes `next` the current one.
   auto switchRun = [&](InputSection *next) {
     if (tail) {
-      tail->relocs.borrow({nextSlot, runEnd});
-      runEnd = nextSlot;
+      tail->relocs.borrow({runBegin, runEnd});
+      runEnd = runBegin;
     }
     assert((!next || next->relocs.empty()) && "relocations are not sorted");
     tail = next;
@@ -604,17 +604,13 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
 
   Subsections &subsections = section.subsections;
   auto subsecIt = subsections.rbegin();
-  // validateRelocationInfo's errors, reported once the walk can no longer
-  // start over.
   SmallVector<std::string, 0> errors;
   SmallVector<relocation_info, 0> sortedInfos;
   int32_t prevAddress = std::numeric_limits<int32_t>::max();
   for (size_t i = 0; i < relInfos.size(); i++) {
     if (LLVM_UNLIKELY(relInfos[i].r_address > prevAddress)) {
-      // ld64 -r can emit relocations out of address order, and then a
-      // subsection's relocations do not arrive as one run. Sort them and start
-      // over. Both entries of an ADDEND or SUBTRACTOR pair have the same
-      // address, so a stable sort keeps them adjacent and in order.
+      // ld64 -r can emit relocations out of address order; sort them and start
+      // over.
       sortedInfos.assign(relInfos.begin(), relInfos.end());
       llvm::stable_sort(sortedInfos,
                         [](const relocation_info &a, const relocation_info &b) {
@@ -623,10 +619,10 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
       relInfos = sortedInfos;
       for (Subsection &sub : subsections)
         sub.isec->relocs.borrow({});
-      runEnd = nextSlot = relocsEnd;
+      runEnd = runBegin = sectionRelocs.end();
       tail = nullptr;
       subsecIt = subsections.rbegin();
-      errors.clear();
+      errors.clear(); // We don't want duplicate errors for a given relocation.
       i = 0;
     }
     prevAddress = relInfos[i].r_address;
@@ -729,7 +725,7 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
       switchRun(subsec);
 
     if (!isSubtrahend) {
-      new (--nextSlot) Relocation(r);
+      new (--runBegin) Relocation(r);
     } else {
       relocation_info minuendInfo = relInfos[++i];
       // SUBTRACTOR relocations should always be followed by an UNSIGNED one
@@ -751,9 +747,10 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
             *sections[minuendInfo.r_symbolnum - 1], &referentOffset);
         p.setAddend(referentOffset);
       }
-      nextSlot -= 2;
-      new (nextSlot) Relocation(r);
-      new (nextSlot + 1) Relocation(p);
+      // Ensure parsed relocations still have SUBTRACTOR preceding UNSIGNED.
+      runBegin -= 2;
+      new (runBegin) Relocation(r);
+      new (runBegin + 1) Relocation(p);
     }
   }
   switchRun(nullptr);
