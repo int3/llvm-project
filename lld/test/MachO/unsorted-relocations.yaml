@@ -7,7 +7,7 @@
 ## before each subsection can take one contiguous run.
 
 # RUN: yaml2obj %s -o %t.o
-# RUN: %lld -dylib -o %t %t.o
+# RUN: %lld -dylib -install_name @rpath/libfoo.dylib -o %t %t.o
 # RUN: llvm-objdump --macho -d %t | FileCheck %s
 
 # CHECK:      _foo:
@@ -29,12 +29,12 @@
 # RUN: llvm-objdump --macho --syms %t | FileCheck %s --check-prefix=SYMS
 # RUN: llvm-objdump --macho -s --section=__DATA,__data %t | FileCheck %s --check-prefix=DATA
 
-# SYMS:      000000000000037d l F __TEXT,__text _bar
-# SYMS-NEXT: 0000000000000392 l F __TEXT,__text _baz
+# SYMS:      0000000000000325 l F __TEXT,__text _bar
+# SYMS-NEXT: 000000000000033a l F __TEXT,__text _baz
 # SYMS-NEXT: 0000000000001000 l O __DATA,__data _qux
 # SYMS-NEXT: 0000000000001008 l O __DATA,__data _quux
 
-# DATA: 0000000000001000 92 f3 ff ff ff ff ff ff 75 f3 ff ff ff ff ff ff
+# DATA: 0000000000001000 3a f3 ff ff ff ff ff ff 1d f3 ff ff ff ff ff ff
 
 --- !mach-o
 IsLittleEndian:  true
