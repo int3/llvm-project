@@ -22,10 +22,12 @@ class Symbol;
 class TrieBuilder {
 public:
   ~TrieBuilder();
-  void setImageBase(uint64_t addr) { imageBase = addr; }
   void addSymbol(const Symbol &sym) { exported.push_back(&sym); }
+  // Builds the trie's nodes and edges. This doesn't read any addresses, so it
+  // can run before they are assigned.
+  void buildNodes();
   // Returns the size in bytes of the serialized trie.
-  size_t build();
+  size_t assignOffsets(uint64_t imageBase);
   void writeTo(uint8_t *buf) const;
 
 private:
@@ -33,7 +35,6 @@ private:
   void sortAndBuild(llvm::MutableArrayRef<const Symbol *> vec, TrieNode *node,
                     size_t lastPos, size_t pos);
 
-  uint64_t imageBase = 0;
   std::vector<const Symbol *> exported;
   std::vector<TrieNode *> nodes;
 };

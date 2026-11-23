@@ -1312,8 +1312,7 @@ uint32_t LazyBindingSection::encode(const Symbol &sym) {
 ExportSection::ExportSection()
     : LinkEditSection(segment_names::linkEdit, section_names::export_) {}
 
-void ExportSection::finalizeContents() {
-  trieBuilder.setImageBase(in.header->addr);
+void ExportSection::prepare() {
   for (const Symbol *sym : symtab->getSymbols()) {
     if (const auto *defined = dyn_cast<Defined>(sym)) {
       if (defined->privateExtern || !defined->isLive())
@@ -1325,7 +1324,11 @@ void ExportSection::finalizeContents() {
         trieBuilder.addSymbol(*dysym);
     }
   }
-  size = trieBuilder.build();
+  trieBuilder.buildNodes();
+}
+
+void ExportSection::finalizeContents() {
+  size = trieBuilder.assignOffsets(in.header->addr);
 }
 
 void ExportSection::writeTo(uint8_t *buf) const { trieBuilder.writeTo(buf); }
@@ -1399,9 +1402,7 @@ void DataInCodeSection::writeTo(uint8_t *buf) const {
 FunctionStartsSection::FunctionStartsSection()
     : LinkEditSection(segment_names::linkEdit, section_names::functionStarts) {}
 
-void FunctionStartsSection::finalizeContents() {
-  raw_svector_ostream os{contents};
-  std::vector<uint64_t> addrs;
+void FunctionStartsSection::prepare() {
   for (const InputFile *file : inputFiles) {
     if (auto *objFile = dyn_cast<ObjFile>(file)) {
       for (const Symbol *sym : objFile->symbols) {
@@ -1409,11 +1410,20 @@ void FunctionStartsSection::finalizeContents() {
           if (!defined->isec() || !isCodeSection(defined->isec()) ||
               !defined->isLive())
             continue;
-          addrs.push_back(defined->getVA());
+          starts.push_back(defined);
         }
       }
     }
   }
+}
+
+void FunctionStartsSection::finalizeContents() {
+  raw_svector_ostream os{contents};
+  std::vector<uint64_t> addrs;
+  addrs.reserve(starts.size());
+  for (const Defined *d : starts)
+    addrs.push_back(d->getVA());
+  starts = {};
   llvm::sort(addrs);
   uint64_t addr = in.header->addr;
   for (uint64_t nextAddr : addrs) {
@@ -1585,38 +1595,34 @@ void SymtabSection::emitStabs() {
     emitEndSourceStab();
 }
 
-void SymtabSection::finalizeContents() {
-  auto addSymbol = [&](std::vector<SymtabEntry> &symbols, Symbol *sym) {
-    uint32_t strx = stringTableSection.addString(sym->getName());
-    symbols.push_back({sym, strx});
-  };
+void SymtabSection::addSymbol(std::vector<SymtabEntry> &symbols, Symbol *sym) {
+  uint32_t strx = stringTableSection.addString(sym->getName());
+  symbols.push_back({sym, strx});
+}
 
-  std::function<void(Symbol *)> localSymbolsHandler;
+void SymtabSection::addLocalSymbol(Symbol *sym) {
   switch (config->localSymbolsPresence) {
   case SymtabPresence::All:
-    localSymbolsHandler = [&](Symbol *sym) { addSymbol(localSymbols, sym); };
+    addSymbol(localSymbols, sym);
     break;
   case SymtabPresence::None:
-    localSymbolsHandler = [&](Symbol *) { /* Do nothing*/ };
     break;
   case SymtabPresence::SelectivelyIncluded:
-    localSymbolsHandler = [&](Symbol *sym) {
-      if (config->localSymbolPatterns.match(sym->getName()))
-        addSymbol(localSymbols, sym);
-    };
+    if (config->localSymbolPatterns.match(sym->getName()))
+      addSymbol(localSymbols, sym);
     break;
   case SymtabPresence::SelectivelyExcluded:
-    localSymbolsHandler = [&](Symbol *sym) {
-      if (!config->localSymbolPatterns.match(sym->getName()))
-        addSymbol(localSymbols, sym);
-    };
+    if (!config->localSymbolPatterns.match(sym->getName()))
+      addSymbol(localSymbols, sym);
     break;
   }
+}
 
+void SymtabSection::prepare() {
   // Local symbols aren't in the SymbolTable, so we walk the list of object
   // files to gather them.
-  // But if `-x` is set, then we don't need to. localSymbolsHandler() will do
-  // the right thing regardless, but this check is a perf optimization because
+  // But if `-x` is set, then we don't need to. addLocalSymbol() will do the
+  // right thing regardless, but this check is a perf optimization because
   // iterating through all the input files and their symbols is expensive.
   if (config->localSymbolsPresence != SymtabPresence::None) {
     for (const InputFile *file : inputFiles) {
@@ -1626,7 +1632,7 @@ void SymtabSection::finalizeContents() {
             if (defined->isExternal() || !defined->isLive() ||
                 !defined->includeInSymtab)
               continue;
-            localSymbolsHandler(sym);
+            addLocalSymbol(sym);
           }
         }
       }
@@ -1636,7 +1642,7 @@ void SymtabSection::finalizeContents() {
   // __dyld_private is a local symbol too. It's linker-created and doesn't
   // exist in any object file.
   if (in.stubHelper && in.stubHelper->dyldPrivate)
-    localSymbolsHandler(in.stubHelper->dyldPrivate);
+    addLocalSymbol(in.stubHelper->dyldPrivate);
 
   for (Symbol *sym : symtab->getSymbols()) {
     if (!sym->isLive())
@@ -1646,7 +1652,7 @@ void SymtabSection::finalizeContents() {
         continue;
       assert(defined->isExternal());
       if (defined->privateExtern)
-        localSymbolsHandler(defined);
+        addLocalSymbol(defined);
       else
         addSymbol(externalSymbols, defined);
     } else if (auto *dysym = dyn_cast<DylibSymbol>(sym)) {
@@ -1654,7 +1660,9 @@ void SymtabSection::finalizeContents() {
         addSymbol(undefinedSymbols, sym);
     }
   }
+}
 
+void SymtabSection::finalizeContents() {
   // Branch-range extension thunks are linker-created local symbols too.
   for (const OutputSegment *seg : outputSegments)
     for (const OutputSection *osec : seg->getSections())
@@ -1662,7 +1670,7 @@ void SymtabSection::finalizeContents() {
         for (const ConcatInputSection *thunk : textOsec->getThunks())
           for (Defined *sym : thunk->symbols)
             if (sym->includeInSymtab)
-              localSymbolsHandler(sym);
+              addLocalSymbol(sym);
 
   emitStabs();
   uint32_t symtabIndex = stabs.size();
