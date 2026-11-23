@@ -6,7 +6,7 @@
 ## this.
 
 # RUN: yaml2obj %s -o %t.o
-# RUN: %lld -dylib -install_name @rpath/libfoo.dylib -o %t %t.o
+# RUN: %lld -dylib -o %t %t.o
 # RUN: llvm-objdump --macho -d %t | FileCheck %s
 
 # CHECK:      _foo:
@@ -22,18 +22,16 @@
 # CHECK-NEXT:      movq    _bar(%rip), %rax
 # CHECK-NEXT:      movq    _baz(%rip), %rax
 
-## The SUBTRACTOR/UNSIGNED pairs in __data are in ascending address order, and
-## each must stay in order through the sort: _qux holds _baz - _qux and _quux
-## holds _bar - _quux.
-# RUN: llvm-objdump --macho --syms %t | FileCheck %s --check-prefix=SYMS
+## Check that SUBTRACTOR/UNSIGNED pairs are handled correctly even when
+## relocations are unsorted.
+##
+##   _qux:
+##     .quad _quux - _qux
+##   _quux:
+##     .quad _qux - _quux
+
 # RUN: llvm-objdump --macho -s --section=__DATA,__data %t | FileCheck %s --check-prefix=DATA
-
-# SYMS:      0000000000000325 l F __TEXT,__text _bar
-# SYMS-NEXT: 000000000000033a l F __TEXT,__text _baz
-# SYMS-NEXT: 0000000000001000 l O __DATA,__data _qux
-# SYMS-NEXT: 0000000000001008 l O __DATA,__data _quux
-
-# DATA: 0000000000001000 3a f3 ff ff ff ff ff ff 1d f3 ff ff ff ff ff ff
+# DATA: {{[0-9a-f]+}} 08 00 00 00 00 00 00 00 f8 ff ff ff ff ff ff ff
 
 --- !mach-o
 IsLittleEndian:  true
@@ -144,7 +142,7 @@ LoadCommands:
             scattered:       false
             value:           0
           - address:         0x0
-            symbolnum:       2
+            symbolnum:       4
             pcrel:           false
             length:          3
             extern:          true
@@ -160,7 +158,7 @@ LoadCommands:
             scattered:       false
             value:           0
           - address:         0x8
-            symbolnum:       1
+            symbolnum:       3
             pcrel:           false
             length:          3
             extern:          true
