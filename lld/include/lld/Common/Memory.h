@@ -24,7 +24,6 @@
 #include "llvm/Support/Allocator.h"
 
 namespace lld {
-
 inline llvm::BumpPtrAllocator &bAllocThreadLocal() {
   thread_local llvm::BumpPtrAllocator alloc;
   return alloc;
