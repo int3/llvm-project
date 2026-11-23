@@ -530,7 +530,9 @@ static bool validateRelocationInfo(InputFile *file, const SectionHeader &sec,
                                    relocation_info rel,
                                    SmallVectorImpl<std::string> &errors) {
   const RelocAttrs &relocAttrs = target->getRelocAttrs(rel.r_type);
+  bool valid = true;
   auto addError = [&](const Twine &diagnostic) {
+    valid = false;
     errors.push_back((relocAttrs.name + " relocation " + diagnostic +
                       " at offset " + std::to_string(rel.r_address) + " of " +
                       sec.segname + "," + sec.sectname + " in " +
@@ -549,7 +551,7 @@ static bool validateRelocationInfo(InputFile *file, const SectionHeader &sec,
     addError("has invalid width of " + std::to_string(1 << rel.r_length) +
              " bytes");
   }
-  if (errors.empty() && relocAttrs.hasAttr(RelocAttrBits::AUTH)) {
+  if (valid && relocAttrs.hasAttr(RelocAttrBits::AUTH)) {
     auto ptr = bit_cast<AuthEmbeddedPointer>(
         read64le(file->mb.getBufferStart() + sec.offset + rel.r_address));
     if (!ptr.auth)
@@ -557,7 +559,7 @@ static bool validateRelocationInfo(InputFile *file, const SectionHeader &sec,
     if (ptr.reserved)
       addError("requires bits 51..62 to be zero");
   }
-  return errors.empty();
+  return valid;
 }
 
 // Parse relocations and assign them to their respective subsections.
