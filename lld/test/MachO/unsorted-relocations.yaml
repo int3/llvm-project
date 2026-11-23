@@ -3,8 +3,7 @@
 ## This tests that we can handle relocations that are not sorted by address.
 ## llvm-mc isn't able to emit such a file, hence the use of yaml2obj. ld64
 ## may emit files with unsorted relocations in `-r` mode, so we need to support
-## this. The relocations return to earlier subsections, so they must be sorted
-## before each subsection can take one contiguous run.
+## this.
 
 # RUN: yaml2obj %s -o %t.o
 # RUN: %lld -dylib -install_name @rpath/libfoo.dylib -o %t %t.o
