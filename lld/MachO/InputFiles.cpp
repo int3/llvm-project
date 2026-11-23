@@ -711,16 +711,11 @@ void ObjFile::parseRelocations(ArrayRef<SectionHeader> sectionHeaders,
     // Find the subsection that this relocation belongs to. Addresses only
     // descend, so the search continues from the previous relocation's
     // subsection.
-    InputSection *subsec;
     while (subsecIt != subsections.rend() && subsecIt->offset > r.offset)
       ++subsecIt;
-    if (subsecIt == subsections.rend() ||
-        subsecIt->offset + subsecIt->isec->getSize() <= r.offset) {
-      subsec = findContainingSubsection(section, &r.offset);
-    } else {
-      subsec = subsecIt->isec;
-      r.offset -= subsecIt->offset;
-    }
+    assert(subsecIt != subsections.rend());
+    InputSection *subsec = subsecIt->isec;
+    r.offset -= subsecIt->offset;
     if (subsec != tail)
       switchRun(subsec);
 
