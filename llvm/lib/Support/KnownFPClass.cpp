@@ -624,6 +624,32 @@ KnownFPClass KnownFPClass::fadd(const KnownFPClass &KnownLHS_,
   return applyOutputDenormalMode(Known, Mode);
 }
 
+KnownFPClass KnownFPClass::fadd(const KnownFPClass &KnownLHS_,
+                                const APFloat &RHS, RoundingMode RM,
+                                DenormalMode Mode) {
+  const auto &Semantics = RHS.getSemantics();
+
+  // Only handle fcNormal constants, and bail out for PPCDoubleDouble.
+  if (!RHS.isNormal() || &Semantics == &APFloat::PPCDoubleDouble())
+    return fadd(KnownLHS_, KnownFPClass(RHS), RM, Mode);
+
+  KnownFPClass KnownLHS = applyInputDenormalMode(KnownLHS_, Mode);
+  KnownFPClass Known =
+      fadd(KnownLHS, KnownFPClass(RHS), RM, DenormalMode::getIEEE());
+
+  int MinExp = APFloat::semanticsMinExponent(Semantics);
+  int Precision = static_cast<int>(APFloat::semanticsPrecision(Semantics));
+  int ThresholdExp = MinExp + Precision - 1;
+
+  // If |C| > T, X + C cannot be subnormal under any rounding mode.
+  int Exponent = ilogb(RHS);
+  if (Exponent > ThresholdExp ||
+      (Exponent == ThresholdExp && RHS.getExactLog2Abs() == INT_MIN))
+    Known.knownNot(fcSubnormal);
+
+  return applyOutputDenormalMode(Known, Mode);
+}
+
 KnownFPClass KnownFPClass::fadd_self(const KnownFPClass &KnownSrc_,
                                      RoundingMode RM, DenormalMode Mode) {
   KnownFPClass KnownSrc = applyInputDenormalMode(KnownSrc_, Mode);
@@ -1298,7 +1324,8 @@ KnownFPClass KnownFPClass::atan2(const KnownFPClass &KnownY_,
 
 static KnownFPClass fpconvert(const KnownFPClass &KnownSrc_,
                               const fltSemantics &DstSem,
-                              const fltSemantics &SrcSem, DenormalMode Mode) {
+                              const fltSemantics &SrcSem, RoundingMode RM,
+                              DenormalMode Mode) {
   KnownFPClass Known;
   APFloatBase::Semantics DstType = APFloatBase::SemanticsToEnum(DstSem);
   APFloatBase::Semantics SrcType = APFloatBase::SemanticsToEnum(SrcSem);
@@ -1323,12 +1350,16 @@ static KnownFPClass fpconvert(const KnownFPClass &KnownSrc_,
 
   KnownFPClass KnownSrc = KnownFPClass::applyInputDenormalMode(KnownSrc_, Mode);
 
-  // TODO: Until we pass the rounding mode into fpconvert, the rounding mode is
-  // assumed to be dynamic. This includes potential future rounding modes such
-  // as roundAwayZero (not the same as roundNearestTiesAway) and roundToOdd
-  // (jamming).
+  // We shall assume that RoundingMode::Dynamic also includes potential future
+  // rounding modes such as roundAwayZero (not the same as roundNearestTiesAway)
+  // and roundToOdd (jamming).
 
   Known.propagateNonNaN(KnownSrc);
+
+  const bool PosOverflowIsNeverPosInf =
+      RM == RoundingMode::TowardZero || RM == RoundingMode::TowardNegative;
+  const bool NegOverflowIsNeverNegInf =
+      RM == RoundingMode::TowardZero || RM == RoundingMode::TowardPositive;
 
   const bool NormalSrcIsFiniteDst = DstSem.maxExponent > SrcSem.maxExponent ||
                                     (DstSem.maxExponent == SrcSem.maxExponent &&
@@ -1348,10 +1379,12 @@ static KnownFPClass fpconvert(const KnownFPClass &KnownSrc_,
   // Rule out infinity.
   // We are assuming that subnormal values have a magnitude less than 1.0.
   if (KnownSrc.isKnownNever(fcPosInf) &&
-      (KnownSrc.isKnownNever(fcPosNormal) || NormalSrcIsFiniteDst))
+      (KnownSrc.isKnownNever(fcPosNormal) || NormalSrcIsFiniteDst ||
+       PosOverflowIsNeverPosInf))
     Known.knownNot(fcPosInf);
   if (KnownSrc.isKnownNever(fcNegInf) &&
-      (KnownSrc.isKnownNever(fcNegNormal) || NormalSrcIsFiniteDst))
+      (KnownSrc.isKnownNever(fcNegNormal) || NormalSrcIsFiniteDst ||
+       NegOverflowIsNeverNegInf))
     Known.knownNot(fcNegInf);
 
   // Rule out non-zero finite.
@@ -1421,16 +1454,15 @@ KnownFPClass KnownFPClass::fpext(const KnownFPClass &KnownSrc,
   // ieee_binary256 in the future. PPCDoubleDouble can represent values such as
   // DBL_MAX + DBL_TRUE_MIN which would normally require 2098 bits of precision
   // to represent.
-  return fpconvert(KnownSrc, DstTy, SrcTy,
+  return fpconvert(KnownSrc, DstTy, SrcTy, RoundingMode::Dynamic,
                    getConvertDenormalMode(DstMode, SrcMode));
 }
 
 KnownFPClass KnownFPClass::fptrunc(const KnownFPClass &KnownSrc,
                                    const fltSemantics &DstTy,
-                                   const fltSemantics &SrcTy,
+                                   const fltSemantics &SrcTy, RoundingMode RM,
                                    DenormalMode DstMode, DenormalMode SrcMode) {
-  // TODO: pass rounding mode from fptrunc_round
-  return fpconvert(KnownSrc, DstTy, SrcTy,
+  return fpconvert(KnownSrc, DstTy, SrcTy, RM,
                    getConvertDenormalMode(DstMode, SrcMode));
 }
 
