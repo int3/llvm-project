@@ -1069,11 +1069,13 @@ static void sortSegmentsAndSections() {
             merged->inputs.begin(), merged->inputs.end(),
             [](InputSection *isec) { return !isec->isCold; });
         if (!isecPriorities.empty()) {
-          std::stable_sort(merged->inputs.begin(), coldIt,
-                           [&](InputSection *a, InputSection *b) {
-                             return isecPriorities.lookup(a) <
-                                    isecPriorities.lookup(b);
-                           });
+          // Look up each priority once instead of at every comparison.
+          SmallVector<std::pair<int, ConcatInputSection *>, 0> keyed;
+          for (ConcatInputSection *isec :
+               make_range(merged->inputs.begin(), coldIt))
+            keyed.emplace_back(isecPriorities.lookup(isec), isec);
+          llvm::stable_sort(keyed, llvm::less_first());
+          llvm::copy(llvm::make_second_range(keyed), merged->inputs.begin());
         }
       }
     }
