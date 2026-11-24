@@ -1071,8 +1071,9 @@ static void sortSegmentsAndSections() {
         if (!isecPriorities.empty()) {
           // Look up each priority once instead of at every comparison.
           SmallVector<std::pair<int, ConcatInputSection *>, 0> keyed;
+          keyed.reserve(coldIt - merged->inputs.begin());
           for (ConcatInputSection *isec :
-               make_range(merged->inputs.begin(), coldIt))
+               llvm::make_range(merged->inputs.begin(), coldIt))
             keyed.emplace_back(isecPriorities.lookup(isec), isec);
           llvm::stable_sort(keyed, llvm::less_first());
           llvm::copy(llvm::make_second_range(keyed), merged->inputs.begin());
