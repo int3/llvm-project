@@ -520,8 +520,6 @@ public:
 private:
   void emitBeginSourceStab(StringRef);
   void emitEndSourceStab();
-  void emitObjectFileStab(ObjFile *);
-  void emitEndFunStab(Defined *);
   Defined *getFuncBodySym(Defined *);
   void emitStabs();
 

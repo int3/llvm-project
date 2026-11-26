@@ -24,6 +24,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/LEB128.h"
 #include "llvm/Support/Parallel.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/xxhash.h"
 
 #include <limits>
@@ -1447,33 +1448,6 @@ void SymtabSection::emitEndSourceStab() {
   stabs.emplace_back(std::move(stab));
 }
 
-void SymtabSection::emitObjectFileStab(ObjFile *file) {
-  StabsEntry stab(N_OSO);
-  stab.sect = target->cpuSubtype;
-  SmallString<261> path(!file->archiveName.empty() ? file->archiveName
-                                                   : file->getName());
-  std::error_code ec = sys::fs::make_absolute(path);
-  if (ec)
-    fatal("failed to get absolute path for " + path);
-
-  if (!file->archiveName.empty())
-    path.append({"(", file->getName(), ")"});
-
-  StringRef adjustedPath = saver().save(path.str());
-  adjustedPath.consume_front(config->osoPrefix);
-
-  stab.strx = stringTableSection.addString(adjustedPath);
-  stab.desc = 1;
-  stab.value = file->modTime;
-  stabs.emplace_back(std::move(stab));
-}
-
-void SymtabSection::emitEndFunStab(Defined *defined) {
-  StabsEntry stab(N_FUN);
-  stab.value = defined->size;
-  stabs.emplace_back(std::move(stab));
-}
-
 void SymtabSection::emitStabs() {
   if (config->omitDebugInfo)
     return;
@@ -1525,73 +1499,101 @@ void SymtabSection::emitStabs() {
                       return a.fileId < b.fileId;
                     });
 
-  llvm::MapVector<ObjFile *, std::string> stabFiles;
-  for (const auto &[defined, fileId, strx] : symbolsNeedingStabs) {
-    ObjFile *file = cast<ObjFile>(defined->originalIsec->getFile());
-    stabFiles[file] = "";
+  struct FileStabs {
+    ObjFile *file;
+    size_t begin;
+    size_t end;
+    std::string source;
+    std::string object;
+    std::vector<StabsEntry> entries;
+  };
+  std::vector<FileStabs> files;
+  for (size_t begin = 0, end; begin < symbolsNeedingStabs.size(); begin = end) {
+    end = begin + 1;
+    int id = symbolsNeedingStabs[begin].fileId;
+    while (end < symbolsNeedingStabs.size() &&
+           symbolsNeedingStabs[end].fileId == id)
+      ++end;
+    ObjFile *file = cast<ObjFile>(
+        symbolsNeedingStabs[begin].defined->originalIsec->getFile());
+    files.push_back({file, begin, end, {}, {}, {}});
   }
-  parallelForEach(stabFiles,
-                  [&](auto &it) { it.second = it.first->sourceFile(); });
 
-  // Emit STABS symbols so that dsymutil and/or the debugger can map address
-  // regions in the final binary to the source and object files from which they
-  // originated.
-  InputFile *lastFile = nullptr;
-  for (const StabSymbol &symbol : symbolsNeedingStabs) {
-    Defined *defined = symbol.defined;
-    // When emitting STABS entries for a symbol, always use the original
-    // InputSection of the defined symbol, not the section of the function body
-    // (which might be a different function entirely if ICF folded this
-    // function). This ensures STABS entries point back to the original object
-    // file.
-    InputSection *isec = defined->originalIsec;
-    ObjFile *file = cast<ObjFile>(isec->getFile());
+  SmallString<261> cwd;
+  bool needsCwd = llvm::any_of(files, [](const FileStabs &fileStabs) {
+    ObjFile *file = fileStabs.file;
+    return !sys::path::is_absolute(!file->archiveName.empty()
+                                       ? StringRef(file->archiveName)
+                                       : file->getName());
+  });
+  if (needsCwd)
+    if (std::error_code ec = sys::fs::current_path(cwd))
+      fatal("failed to get current directory: " + ec.message());
 
-    if (lastFile == nullptr || lastFile != file) {
-      if (lastFile != nullptr)
-        emitEndSourceStab();
-      lastFile = file;
+  parallelForEach(files, [&](FileStabs &fileStabs) {
+    ObjFile *file = fileStabs.file;
+    fileStabs.source = file->sourceFile();
+    SmallString<261> path(!file->archiveName.empty() ? file->archiveName
+                                                     : file->getName());
+    sys::path::make_absolute(cwd, path);
+    if (!file->archiveName.empty())
+      path.append({"(", file->getName(), ")"});
+    fileStabs.object = path.str().str();
 
-      emitBeginSourceStab(stabFiles[file]);
-      emitObjectFileStab(file);
-    }
-
-    StabsEntry symStab;
-    symStab.sect = isec->parent->index;
-    symStab.strx = config->dedupSymbolStrings
-                       ? symbol.strx
-                       : stringTableSection.addString(defined->getName());
-
-    // When using --keep-icf-stabs, we need to use the VA of the actual function
-    // body that the linker will place in the binary. This is the function that
-    // the symbol refers to after ICF folding.
-    if (defined->identicalCodeFoldingKind == Symbol::ICFFoldKind::Thunk) {
-      // For thunks, we need to get the function they point to
-      Defined *target = getBodyForThunkFoldedSym(defined);
-      symStab.value = target->getVA();
-    } else {
-      symStab.value = defined->getVA();
-    }
-
-    if (isCodeSection(isec)) {
-      symStab.type = N_FUN;
-      stabs.emplace_back(std::move(symStab));
-      // For the end function marker in STABS, we need to use the size of the
-      // actual function body that exists in the output binary
-      if (defined->identicalCodeFoldingKind == Symbol::ICFFoldKind::Thunk) {
-        // For thunks, we use the target's size
-        Defined *target = getBodyForThunkFoldedSym(defined);
-        emitEndFunStab(target);
+    fileStabs.entries.reserve(2 * (fileStabs.end - fileStabs.begin));
+    for (size_t i = fileStabs.begin; i < fileStabs.end; ++i) {
+      const StabSymbol &symbol = symbolsNeedingStabs[i];
+      Defined *defined = symbol.defined;
+      // Preserve ICF source attribution while describing the emitted body.
+      InputSection *isec = defined->originalIsec;
+      Defined *body = defined;
+      if (defined->identicalCodeFoldingKind == Symbol::ICFFoldKind::Thunk)
+        body = getBodyForThunkFoldedSym(defined);
+      StabsEntry stab;
+      stab.sect = isec->parent->index;
+      stab.strx = symbol.strx;
+      stab.value = body->getVA();
+      if (isCodeSection(isec)) {
+        stab.type = N_FUN;
+        fileStabs.entries.push_back(stab);
+        StabsEntry end(N_FUN);
+        end.value = body->size;
+        fileStabs.entries.push_back(end);
       } else {
-        emitEndFunStab(defined);
+        stab.type = defined->isExternal() ? N_GSYM : N_STSYM;
+        fileStabs.entries.push_back(stab);
       }
-    } else {
-      symStab.type = defined->isExternal() ? N_GSYM : N_STSYM;
-      stabs.emplace_back(std::move(symStab));
     }
-  }
+  });
 
-  if (!stabs.empty())
+  size_t size = stabs.size();
+  for (const FileStabs &file : files)
+    size += file.entries.size() + 3;
+  stabs.reserve(size);
+  // String insertion order is part of the output layout.
+  for (FileStabs &file : files) {
+    emitBeginSourceStab(file.source);
+    StabsEntry oso(N_OSO);
+    oso.sect = target->cpuSubtype;
+    StringRef object = saver().save(file.object);
+    object.consume_front(config->osoPrefix);
+    oso.strx = stringTableSection.addString(object);
+    oso.desc = 1;
+    oso.value = file.file->modTime;
+    stabs.push_back(oso);
+    if (!config->dedupSymbolStrings) {
+      size_t entry = 0;
+      for (size_t i = file.begin; i < file.end; ++i) {
+        Defined *defined = symbolsNeedingStabs[i].defined;
+        file.entries[entry].strx =
+            stringTableSection.addString(defined->getName());
+        entry += isCodeSection(defined->originalIsec) ? 2 : 1;
+      }
+    }
+    stabs.insert(stabs.end(), file.entries.begin(), file.entries.end());
+    emitEndSourceStab();
+  }
+  if (files.empty() && !stabs.empty())
     emitEndSourceStab();
 }
 

@@ -21,6 +21,17 @@
 # RUN: FileCheck %s -DDIR=%t -DFOO_PATH=%t/foo.o \
 # RUN:   -D#TEST_TIME=0x10 -D#FOO_TIME=0x20 --input-file %t.out
 
+# RUN: mkdir -p %t/serial %t/parallel
+# RUN: %lld -lSystem %t/test.o %t/foo.a %t/no-debug.o --threads=1 -o %t/serial/out
+# RUN: %lld -lSystem %t/test.o %t/foo.a %t/no-debug.o --threads=8 -o %t/parallel/out
+# RUN: cmp %t/serial/out %t/parallel/out
+# RUN: %lld -lSystem %t/test.o %t/foo.a %t/no-debug.o -no-deduplicate-symbol-strings --threads=1 -o %t/serial/out
+# RUN: %lld -lSystem %t/test.o %t/foo.a %t/no-debug.o -no-deduplicate-symbol-strings --threads=8 -o %t/parallel/out
+# RUN: cmp %t/serial/out %t/parallel/out
+# RUN: %lld -lSystem %t/test.o %t/foo.a %t/no-debug.o -x --threads=1 -o %t/serial/out
+# RUN: %lld -lSystem %t/test.o %t/foo.a %t/no-debug.o -x --threads=8 -o %t/parallel/out
+# RUN: cmp %t/serial/out %t/parallel/out
+
 ## Check that we emit the right modtime even when the object file is in an
 ## archive.
 # RUN: env ZERO_AR_DATE=0 %lld -lSystem %t/test.o %t/foo.a %t/no-debug.o -o %t/test
