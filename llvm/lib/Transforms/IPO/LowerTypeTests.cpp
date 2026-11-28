@@ -2634,10 +2634,15 @@ bool LowerTypeTestsModule::lower() {
     if (CfiFunctionsMD) {
       // A set of all functions that are address taken by a live global object.
       DenseSet<GlobalValue::GUID> AddressTaken;
+      // Repeated references to linkonce_odr values can otherwise make this
+      // walk quadratic in the number of defining modules.
+      DenseSet<GlobalValue::GUID> VisitedRefs;
       for (auto &I : *ExportSummary)
         for (auto &GVS : I.second.getSummaryList())
           if (GVS->isLive())
             for (const auto &Ref : GVS->refs()) {
+              if (!VisitedRefs.insert(Ref.getGUID()).second)
+                continue;
               AddressTaken.insert(Ref.getGUID());
               for (auto &RefGVS : Ref.getSummaryList())
                 if (auto Alias = dyn_cast<AliasSummary>(RefGVS.get()))
