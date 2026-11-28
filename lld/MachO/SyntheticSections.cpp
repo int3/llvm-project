@@ -26,6 +26,7 @@
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/xxhash.h"
 
+#include <cstring>
 #include <limits>
 
 #if defined(__APPLE__)
@@ -2159,13 +2160,15 @@ void WordLiteralSection::finalizeContents() {
     // We do all processing of the InputSection here, so it will be effectively
     // finalized.
     isec->isFinal = true;
+    // Input section data need not be aligned for the literal type.
     const uint8_t *buf = isec->data.data();
     switch (sectionType(isec->getFlags())) {
     case S_4BYTE_LITERALS: {
       for (size_t off = 0, e = isec->data.size(); off < e; off += 4) {
         if (!isec->isLive(off))
           continue;
-        uint32_t value = *reinterpret_cast<const uint32_t *>(buf + off);
+        uint32_t value;
+        memcpy(&value, buf + off, sizeof(value));
         literal4Map.try_emplace(value, literal4Map.size());
       }
       break;
@@ -2174,7 +2177,8 @@ void WordLiteralSection::finalizeContents() {
       for (size_t off = 0, e = isec->data.size(); off < e; off += 8) {
         if (!isec->isLive(off))
           continue;
-        uint64_t value = *reinterpret_cast<const uint64_t *>(buf + off);
+        uint64_t value;
+        memcpy(&value, buf + off, sizeof(value));
         literal8Map.try_emplace(value, literal8Map.size());
       }
       break;
@@ -2183,7 +2187,8 @@ void WordLiteralSection::finalizeContents() {
       for (size_t off = 0, e = isec->data.size(); off < e; off += 16) {
         if (!isec->isLive(off))
           continue;
-        UInt128 value = *reinterpret_cast<const UInt128 *>(buf + off);
+        UInt128 value;
+        memcpy(&value, buf + off, sizeof(value));
         literal16Map.try_emplace(value, literal16Map.size());
       }
       break;
